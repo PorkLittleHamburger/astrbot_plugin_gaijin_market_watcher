@@ -1,0 +1,29 @@
+name: astrbot_plugin_gaijin_market_watcher
+display_name: Gaijin 市场行情监控
+help: 发送 /login 登录；发送 /gjm help 查看全部指令。
+short_desc: Gaijin 市场行情监控：/login 登录，按 UID 订阅，价格变化时 @ 推送
+desc: |
+  监控 Gaijin Market（trade.gaijin.net）上物品的实时最低售价、最高求购价与挂单量，
+  变化时推送到群聊或私聊，可 @ 到订阅者本人。
+
+  特性：
+  - 多用户订阅：每个用户一条配置（UID、刷新间隔、物品链接列表），同一用户的物品共用一个间隔
+  - 推送合并：同一时间窗内多件物品的变化合成一条消息，件与件之间空一行
+  - 自定义输出模板：用 $字段 占位渲染推送正文（字段见 docs/PAYLOAD_FIELDS.md）
+  - 商品页快照：价格变化时可截取商品页，等渲染完成后与正文一起发出
+  - 多平台适配：QQ 官方机器人使用文本内嵌 @ 标记；微信等不支持 At 的平台自动降级为纯文本 @
+version: 2.9.0
+author: porklittlehamburger
+repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
+support_platforms:
+  - qq_official
+  - qq_official_webhook
+  - aiocqhttp
+  - weixin_oc
+  - weixin_official_account
+tags:
+  - gaijin
+  - war-thunder
+  - market
+  - price-monitor
+  - notification

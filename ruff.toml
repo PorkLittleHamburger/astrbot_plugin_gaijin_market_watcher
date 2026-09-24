@@ -1,0 +1,12 @@
+# 代码风格配置（AstrBot 官方开发原则要求提交前用 ruff 格式化）
+# 行宽放宽到 120：本项目含大量中文文案与描述，100 会造成无意义折行。
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+
+[lint.per-file-ignores]
+# main.py 需要先把插件目录加入 sys.path 以支持"以文件路径加载插件"的兜底路径，
+# 因此这些迟到的导入是刻意为之。
+"main.py" = ["E402"]
