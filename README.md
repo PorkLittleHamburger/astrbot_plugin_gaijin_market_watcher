@@ -29,7 +29,12 @@
 
 ### 1. 安装
 
-解压到 `AstrBot/data/plugins/`，在 WebUI 里重载插件。依赖：`httpx`（AstrBot 已内置）；
+需要 AstrBot ≥ 4.23.6、Python ≥ 3.10。
+
+在 AstrBot 插件市场搜索 Skills & MCP 管理器，或通过以下仓库地址安装：
+
+https://github.com/piexian/astrbot_plugin_skills_mcp_manager
+安装、更新、删除等操作需要 AstrBot 管理员权限，请先在管理面板配置管理员。
 商品页快照需要 `playwright` 与 chromium。
 
 ### 2. 登录 Gaijin 账号
