@@ -34,7 +34,7 @@
 https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 ```
 安装、更新、删除等操作需要 AstrBot 管理员权限，请先在管理面板配置管理员。
-商品页快照需要 `playwright` 与 chromium。
+商品页快照需要 `playwright` 与 `chromium`。
 
 ### 2. 登录 Gaijin 账号
 
