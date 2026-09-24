@@ -407,9 +407,11 @@ class Notifier:
         多件物品逐件渲染后拼接；任一份渲染失败都整体回退到 text。
         """
         platform_type = await self._platform_type(umo) if umo else ""
-        # @ 的方式由 core.platforms 统一裁决（各平台适配器差异都写在那里）
-        plan = platforms.mention_plan(platform_type, mention_uid, mention_name) if mention_uid else None
-        token = plan.text if plan else ""
+        # @ 的方式由 core.platforms 统一裁决（各平台适配器差异都写在那里）。
+        # 会话类型也很关键：QQ 官方私聊（C2C）不支持群聊 @ 标记，发了整条消息会被拒。
+        plan = platforms.mention_plan_for(platform_type, mention_uid, mention_name, umo=umo) if mention_uid else None
+        mention_ok = bool(plan and plan.style != platforms.STYLE_NONE)
+        token = plan.text if mention_ok else ""
         at_unsupported = bool(plan and plan.style == platforms.STYLE_PLAIN_TEXT)
 
         body, used_mention = text, False
@@ -463,11 +465,16 @@ class Notifier:
             # 这些平台会丢弃“没有文字”的消息，补一句兜底文字
             body = (events[0].quote.title if events else "") or "Gaijin 行情"
 
+        if plan is not None and plan.style == platforms.STYLE_NONE:
+            # 私聊等不支持 @ 标记的会话：模板里若自带群聊标记，必须剔除，
+            # 否则平台会拒绝整条消息（C2C消息不支持qqbot-at-user）。
+            body = platforms.strip_group_mention_tags(body)
+
         # 模板自己放了 @ 标记就不要再叠加
         if used_mention:
             needs_md = bool(plan and plan.style == platforms.STYLE_MARKDOWN_TEXT)
             return await self._send_plain(umo, body, markdown=True if needs_md else None, images=images)
-        if mention_uid and self.config.mention_users:
+        if mention_ok and self.config.mention_users:
             if plan and plan.style == platforms.STYLE_MARKDOWN_TEXT:
                 # 实测结论：必须走 markdown 通道，纯文本会把标记原样显示出来
                 return await self._send_plain(umo, f"{token}\n{body}", markdown=True, images=images)

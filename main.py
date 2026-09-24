@@ -94,7 +94,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.9.2",
+    "2.9.3",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -795,12 +795,11 @@ class GaijinMarketWatcher(Star):
         pending = self.auth.get_pending_login()
         umo = event.unified_msg_origin or ""
         platform_type = await self.notifier._platform_type(umo)
-        plan = platforms.mention_plan(platform_type, str(event.get_sender_id()), event.get_sender_name() or "")
-        mention_note = {
-            platforms.STYLE_MARKDOWN_TEXT: f"文本内嵌标记（markdown 通道）：{plan.text}",
-            platforms.STYLE_PLAIN_TEXT: f"纯文本 @（该平台不认 At 组件）：{plan.text}",
-            platforms.STYLE_AT_COMPONENT: "标准 At 组件",
-        }[plan.style]
+        session_type = platforms.session_type_of(umo)
+        plan = platforms.mention_plan_for(
+            platform_type, str(event.get_sender_id()), event.get_sender_name() or "", umo=umo
+        )
+        mention_note = platforms.mention_style_text(plan)
         yield event.plain_result(
             "【排障信息】\n"
             f"配置文件：{self._config_path}\n"
@@ -813,7 +812,7 @@ class GaijinMarketWatcher(Star):
             f"账号密码：{'已填' if self.cfg.account_password else '未填'}\n"
             f"JWT 账号：{describe_jwt(self.auth.jwt).get('nick') or '无'}\n"
             "\n【@ 适配】\n"
-            f"本会话平台类型：{platform_type or '（未匹配到）'}\n"
+            f"本会话平台类型：{platform_type or '（未匹配到）'}（会话类型 {session_type or '未知'}）\n"
             f"mention_users：{self.cfg.mention_users}\n"
             f"将采用：{mention_note}\n"
             f"拥有者 UID / 已识别会话：{self.cfg.owner_uids or '（未配置）'} / "
