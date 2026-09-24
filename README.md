@@ -18,10 +18,8 @@
 | 平台 | @ 订阅者 | 图片（快照） | 主动推送 |
 | --- | --- | --- | --- |
 | QQ 官方机器人（`qq_official` / `qq_official_webhook`） | 文本内嵌标记（走 markdown 通道） | 支持 | 支持 |
-| OneBot / aiocqhttp | At 组件 | 支持 | 支持 |
-| Telegram / Discord / Slack 等 | At 组件 | 支持 | 支持 |
 | 个人微信（`weixin_oc`） | 纯文本 @昵称（该平台不认 At 组件） | 支持（消息必须带文字） | 需用户先给机器人发过消息 |
-| 微信公众号 / 企业微信 | 纯文本 @昵称 | 支持 | 受平台限制（企业微信客服模式不支持主动推送） |
+其余平台未做测试
 
 平台差异（@ 的方式、是否要求带文字、主动推送前提）集中写在 `core/platforms.py`，增改支持只需改这一个文件。
 
@@ -31,15 +29,17 @@
 
 需要 AstrBot ≥ 4.23.6、Python ≥ 3.10。
 
-在 AstrBot 插件市场搜索 Skills & MCP 管理器，或通过以下仓库地址安装：
-
-https://github.com/piexian/astrbot_plugin_skills_mcp_manager
+在 AstrBot 插件市场搜索Gaijin 市场行情监控，或通过以下仓库地址安装：
+```text
+https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
+```
 安装、更新、删除等操作需要 AstrBot 管理员权限，请先在管理面板配置管理员。
 商品页快照需要 `playwright` 与 chromium。
 
 ### 2. 登录 Gaijin 账号
 
 在插件配置里填 `account_email` / `account_password`，并把你的 UID 填进 `owner_uids`（发 `/gjm id` 可查看）。
+请注意，插件只会将密码和账户储存在本地。
 然后在聊天里：
 
 ```
