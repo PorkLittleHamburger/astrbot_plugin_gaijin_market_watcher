@@ -18,9 +18,7 @@ repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watche
 support_platforms:
   - qq_official
   - qq_official_webhook
-  - aiocqhttp
   - weixin_oc
-  - weixin_official_account
 tags:
   - gaijin
   - war-thunder
