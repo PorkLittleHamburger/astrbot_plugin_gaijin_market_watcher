@@ -32,12 +32,9 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
-
-logger = logging.getLogger("astrbot")
 
 #: 这些键会被当作**图片附件**而不是文字
 IMAGE_KEYS = frozenset({"image", "icon", "img", "picture", "photo", "pic", "cover", "thumbnail"})

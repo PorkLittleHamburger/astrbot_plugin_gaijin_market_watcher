@@ -1,5 +1,14 @@
 # 更新日志
 
+## 2.9.1
+
+### 修复
+
+- 日志记录器全部改为从 `astrbot.api` 导入（上架规范硬性要求）：
+  删除 `core/payload.py` 里未被使用的模块级 `logging.getLogger("astrbot")`；
+  `core/snapshot.py` 在未传入 `logger` 时的缺省值改为 `from astrbot.api import logger`，
+  不再使用标准库 `logging`。
+
 ## 2.9.0
 
 首个公开版本。

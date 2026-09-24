@@ -12,7 +12,7 @@ desc: |
   - 自定义输出模板：用 $字段 占位渲染推送正文（字段见 docs/PAYLOAD_FIELDS.md）
   - 商品页快照：价格变化时可截取商品页，等渲染完成后与正文一起发出
   - 多平台适配：QQ 官方机器人使用文本内嵌 @ 标记；微信等不支持 At 的平台自动降级为纯文本 @
-version: 2.9.0
+version: 2.9.1
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 support_platforms:

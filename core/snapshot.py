@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger as astrbot_logger
 
 LOCAL_STORAGE_KEY = "MarketApp,auth,tokenPair"
 COOKIE_BUTTON_TEXTS = ("Accept all", "Accept All", "接受全部", "Принять все")
@@ -70,7 +71,7 @@ class PageSnapshotter:
         self.timeout_ms = int(timeout_ms)
         self.settle_ms = int(settle_ms)
         self.keep_files = max(1, int(keep_files))
-        self.logger = logger or logging.getLogger("astrbot")
+        self.logger = logger if logger is not None else astrbot_logger
         self._lock = asyncio.Semaphore(1)
 
     async def capture(self, url: str, jwt: str, *, tag: str = "item") -> Path:
@@ -170,7 +171,7 @@ class SnapshotDispatcher:
         self.storage = storage
         self.jwt_provider = jwt_provider
         self.appid_provider = appid_provider
-        self.logger = logger or logging.getLogger("astrbot")
+        self.logger = logger if logger is not None else astrbot_logger
         self.snapshotter = PageSnapshotter(Path(data_dir) / "snapshots", logger=self.logger)
         self._cooldown_until: dict[str, float] = {}
         self._tasks: set[asyncio.Task] = set()
