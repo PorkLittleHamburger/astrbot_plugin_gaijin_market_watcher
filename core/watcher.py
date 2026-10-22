@@ -5,8 +5,9 @@
   轮询：`config.watched_market_names` 是「全局监控清单」与「用户订阅」的并集，
         每件物品**只抓一次**，避免多人订阅同一物品时重复打接口。
 
-  投递：只投递两类 ——
-        * 用户订阅（user_subscriptions）-> 订阅者本人，群聊里会 @ 到他。
+  投递：
+        * 私聊订阅 -> 按个人模式和间隔推送；
+        * 群聊 -> 固定间隔强制刷新全群订阅，并合并成一条完整快照。
 
 其它设计要点：
   * 单个 asyncio.Task 串行轮询，物品之间插入小间隔，避免并发打爆接口 / 触发风控；
@@ -20,10 +21,11 @@ import asyncio
 import time
 from contextlib import suppress
 
+from . import platforms
 from .api_client import AuthExpiredError, MarketApiError
 from .auth import LoginRequiredError
 from .constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
-from .models import Quote, TriggerEvent
+from .models import Quote, SnapshotItem, TriggerEvent
 
 #: 令牌失效后的重试间隔（秒），避免反复打扰用户
 AUTH_BACKOFF_SECONDS = 600
@@ -64,14 +66,20 @@ class MarketWatcher:
         #: 物品 -> 下次到点时间（抓取频率 = 该物品所有订阅里的最小值）
         self._next_due: dict[str, float] = {}
         #: (用户, 物品) -> 他上次成功收到推送时的行情，作为下次对比基准
-        self._last_pushed: dict[tuple[str, str], Quote] = {}
+        self._last_pushed: dict[tuple[str, str, str], Quote] = {}
         #: (用户, 物品) -> 当前用于比较的基线；发送失败时保持旧值以支持下一轮重试
-        self._comparison_base: dict[tuple[str, str], Quote | None] = {}
+        self._comparison_base: dict[tuple[str, str, str], Quote | None] = {}
         #: (用户, 物品) -> 他下一次允许收到推送的时间（推送频率 = 他自己设的 interval）
-        self._next_notify: dict[tuple[str, str], float] = {}
+        self._next_notify: dict[tuple[str, str, str], float] = {}
         #: 物品元数据（图标/标签）后台补齐，失败不影响主流程
         self._meta_pending: set[str] = set()
         self._meta_tasks: set[asyncio.Task] = set()
+        #: 群聊会话 -> 下一次全量快照时间
+        self._next_group_push: dict[str, float] = {}
+        #: 物品 -> 最近一次抓取错误；成功后立即清除
+        self._latest_errors: dict[str, str] = {}
+        #: 物品 -> 最近一次实际发起抓取的时间，避免普通轮询与群快照同轮重复请求
+        self._last_attempt_at: dict[str, float] = {}
 
     # ------------------------------------------------------------ 生命周期
 
@@ -84,6 +92,7 @@ class MarketWatcher:
         if self.running:
             return False
         self._running = True
+        self._sync_group_schedule(time.time())
         self._task = asyncio.create_task(self._loop(), name="gaijin-market-watcher")
         self.logger.info(
             f"行情监控已启动：{len(self.config.watched_market_names)} 个物品、"
@@ -110,7 +119,7 @@ class MarketWatcher:
     def reconfigure(self) -> None:
         """让新的订阅间隔即时约束现有调度窗口。"""
         now = time.time()
-        watched = set(self.config.watched_market_names)
+        watched = set(self._private_market_names())
         for market_name in watched:
             proposed = now + max(MIN_POLL_INTERVAL, self.config.interval_of(market_name))
             current = self._next_due.get(market_name)
@@ -129,6 +138,7 @@ class MarketWatcher:
             self._next_notify[key] = proposed if current is None else min(current, proposed)
         for key in [key for key in self._next_notify if key not in active]:
             self._next_notify.pop(key, None)
+        self._sync_group_schedule(now)
         self._wake.set()
 
     # ------------------------------------------------------------ 主循环
@@ -139,6 +149,7 @@ class MarketWatcher:
         while self._running:
             try:
                 await self.poll_due()
+                await self.poll_due_groups()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # 兜底：任何异常都不允许终结循环
@@ -159,10 +170,44 @@ class MarketWatcher:
         now = time.time()
         backoff_remaining = self._auth_backoff_remaining(now)
         if backoff_remaining > 0:
+            group_waits = [deadline - now for deadline in self._next_group_push.values()]
+            if group_waits:
+                return max(1.0, min(backoff_remaining, min(group_waits), MAX_SLEEP_SECONDS))
             return max(1.0, backoff_remaining)
-        waits = [self._next_due[mn] - now for mn in self.config.watched_market_names if mn in self._next_due]
+        waits = [self._next_due[mn] - now for mn in self._private_market_names() if mn in self._next_due]
+        waits.extend(deadline - now for deadline in self._next_group_push.values())
         wait = min(waits) if waits else 1.0
         return max(1.0, min(wait, MAX_SLEEP_SECONDS))
+
+    def _group_targets(self) -> list[str]:
+        groups: list[str] = []
+        for sub in self.config.enabled_subscriptions:
+            target = self._target_of(sub)
+            if target and platforms.is_group_session(platforms.session_type_of(target)) and target not in groups:
+                groups.append(target)
+        return groups
+
+    def _private_market_names(self) -> list[str]:
+        names: list[str] = []
+        for sub in self.config.enabled_subscriptions:
+            target = self._target_of(sub)
+            if not platforms.is_group_session(platforms.session_type_of(target)) and sub.market_name not in names:
+                names.append(sub.market_name)
+        return names
+
+    def _target_of(self, sub) -> str:
+        if sub.target_umo:
+            return sub.target_umo
+        resolver = getattr(self.notifier, "session_of", None)
+        return str(resolver(sub.uid) or "") if callable(resolver) else ""
+
+    def _sync_group_schedule(self, now: float) -> None:
+        groups = set(self._group_targets())
+        interval = max(1, int(self.config.group_push_interval))
+        for target in groups:
+            self._next_group_push.setdefault(target, now + interval)
+        for target in [target for target in self._next_group_push if target not in groups]:
+            self._next_group_push.pop(target, None)
 
     # ------------------------------------------------------------ 单次轮询
 
@@ -173,10 +218,43 @@ class MarketWatcher:
     async def poll_due(self) -> list[TriggerEvent]:
         """只轮询已到点的物品（间隔由各自订阅者决定）。"""
         now = time.time()
-        due = [mn for mn in self.config.watched_market_names if now >= self._next_due.get(mn, 0.0)]
+        due = [mn for mn in self._private_market_names() if now >= self._next_due.get(mn, 0.0)]
         if not due:
             return []
         return await self.poll_items(due)
+
+    async def poll_due_groups(self) -> dict[str, bool]:
+        """到期群统一刷新物品并发送完整快照。"""
+        now = time.time()
+        self._sync_group_schedule(now)
+        due = [target for target, deadline in self._next_group_push.items() if now >= deadline]
+        if not due:
+            return {}
+        interval = max(1, int(self.config.group_push_interval))
+        for target in due:
+            self._next_group_push[target] = now + interval
+
+        due_set = set(due)
+        markets: list[str] = []
+        for sub in self.config.enabled_subscriptions:
+            target = self._target_of(sub)
+            if target in due_set and sub.market_name not in markets:
+                markets.append(sub.market_name)
+        fresh_after = now - 1.0
+        markets_to_fetch = [name for name in markets if self._last_attempt_at.get(name, 0.0) < fresh_after]
+        if markets_to_fetch:
+            await self.poll_items(markets_to_fetch)
+
+        results: dict[str, bool] = {}
+        for target in due:
+            snapshot = self._build_group_snapshot(target)
+            if not snapshot:
+                results[target] = False
+                continue
+            results[target] = await self.notifier.push_group_snapshot(target, snapshot)
+        success = sum(1 for delivered in results.values() if delivered)
+        self.logger.info(f"群聊全量推送：到期 {len(due)} 个群，成功 {success} 个。")
+        return results
 
     async def poll_items(self, names: list[str]) -> list[TriggerEvent]:
         """抓取指定物品 -> 判定 -> 推送给订阅者。
@@ -198,6 +276,8 @@ class MarketWatcher:
         try:
             token = await self.auth.get_token()
         except LoginRequiredError as exc:
+            for market_name in watched:
+                self._latest_errors[market_name] = str(exc)
             await self._handle_auth_failure(str(exc))
             return []
         self._auth_backoff_until = 0.0
@@ -219,6 +299,7 @@ class MarketWatcher:
                 await asyncio.sleep(self.config.item_interval)
             # 先排下一次：无论本次成功失败都不会陷入紧凑重试
             self._next_due[market_name] = time.time() + self.config.interval_of(market_name)
+            self._last_attempt_at[market_name] = time.time()
 
             display = self.config.display_name_of(market_name) or self.storage.get_item_name(market_name)
             try:
@@ -228,10 +309,12 @@ class MarketWatcher:
                     token = await self.auth.get_token(force_refresh=True)
                 except LoginRequiredError as refresh_exc:
                     auth_error = str(refresh_exc)
+                    self._latest_errors[market_name] = auth_error
                     failures.append(Quote(market_name=market_name, display_name=display, error=str(refresh_exc)))
                     break
                 except Exception as refresh_exc:
                     auth_error = f"{exc}; 刷新令牌异常: {refresh_exc}"
+                    self._latest_errors[market_name] = auth_error
                     failures.append(Quote(market_name=market_name, display_name=display, error=auth_error))
                     break
 
@@ -241,34 +324,42 @@ class MarketWatcher:
                     )
                 except AuthExpiredError as retry_exc:
                     auth_error = f"{exc}; 刷新令牌后仍被拒绝: {retry_exc}"
+                    self._latest_errors[market_name] = auth_error
                     failures.append(Quote(market_name=market_name, display_name=display, error=auth_error))
                     break
                 except MarketApiError as retry_exc:
+                    self._latest_errors[market_name] = str(retry_exc)
                     failures.append(Quote(market_name=market_name, display_name=display, error=str(retry_exc)))
                     continue
                 except Exception as retry_exc:
+                    error = f"刷新令牌后抓取失败: {retry_exc}"
+                    self._latest_errors[market_name] = error
                     failures.append(
                         Quote(
                             market_name=market_name,
                             display_name=display,
-                            error=f"刷新令牌后抓取失败: {retry_exc}",
+                            error=error,
                         )
                     )
                     continue
             except MarketApiError as exc:
+                self._latest_errors[market_name] = str(exc)
                 failures.append(Quote(market_name=market_name, display_name=display, error=str(exc)))
                 continue
             except Exception as exc:
+                error = f"未知错误: {exc}"
+                self._latest_errors[market_name] = error
                 failures.append(
                     Quote(
                         market_name=market_name,
                         display_name=display,
-                        error=f"未知错误: {exc}",
+                        error=error,
                     )
                 )
                 continue
 
             quotes[market_name] = quote
+            self._latest_errors.pop(market_name, None)
             self.storage.set_last_quote(quote)
             self._ensure_item_meta(market_name, quote.title)
 
@@ -346,9 +437,63 @@ class MarketWatcher:
 
     # ------------------------------------------------------------ 判定
 
+    def _build_group_snapshot(self, target_umo: str) -> list[SnapshotItem]:
+        """构造某个群的完整订阅快照，同物多人只保留一个物品块。"""
+        grouped: dict[str, list] = {}
+        for sub in self.config.enabled_subscriptions:
+            target = self._target_of(sub)
+            if target == target_umo:
+                grouped.setdefault(sub.market_name, []).append(sub)
+
+        items: list[SnapshotItem] = []
+        for market_name, subscribers in grouped.items():
+            first = subscribers[0]
+            display = self.config.display_name_of(market_name) or self.storage.get_item_name(market_name)
+            quote = self.storage.get_last_quote(market_name)
+            if quote is not None and (not quote.ok or (quote.sell_min is None and quote.buy_max is None)):
+                quote = None
+            history = self.storage.get_price_history(
+                market_name,
+                limit=max(2, self.config.chart_history_points + 1),
+            )
+            previous = None
+            if history:
+                prior = [
+                    point
+                    for point in history
+                    if quote is None or float(point.get("t") or 0) < float(quote.timestamp) - 1e-6
+                ]
+                point = prior[-1] if prior else (history[-2] if len(history) > 1 else None)
+                if point is not None:
+                    previous = Quote(
+                        market_name=market_name,
+                        sell_min=point.get("sell"),
+                        buy_max=point.get("buy"),
+                        timestamp=float(point.get("t") or 0),
+                        display_name=display,
+                    )
+            mentions: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for sub in subscribers:
+                if sub.uid in seen:
+                    continue
+                seen.add(sub.uid)
+                mentions.append((sub.uid, self.storage.get_user_name(sub.uid)))
+            items.append(
+                SnapshotItem(
+                    market_name=market_name,
+                    display_name=display or first.display_name or market_name,
+                    quote=quote,
+                    previous=previous,
+                    mentions=mentions,
+                    error=self._latest_errors.get(market_name, ""),
+                )
+            )
+        return items
+
     def _evaluate_subscribers(
         self, quotes: dict[str, Quote], previous_map: dict[str, Quote | None]
-    ) -> tuple[dict[str, list[TriggerEvent]], dict[str, str]]:
+    ) -> tuple[dict[tuple[str, str], list[TriggerEvent]], dict[tuple[str, str], str]]:
         """按用户聚合判定结果：每个人只拿到自己订阅物品的事件。
 
         **两层节流**（两者不可混为一谈）：
@@ -359,13 +504,16 @@ class MarketWatcher:
 
         这里只生成事件，不推进推送状态；基线必须由推送层确认送达后更新。
         """
-        per_user: dict[str, list[TriggerEvent]] = {}
-        user_names: dict[str, str] = {}
+        per_user: dict[tuple[str, str], list[TriggerEvent]] = {}
+        user_names: dict[tuple[str, str], str] = {}
         now = time.time()
-        alive: set[tuple[str, str]] = set()
+        alive: set[tuple[str, str, str]] = set()
 
         for sub in self.config.enabled_subscriptions:
-            key = (sub.uid, sub.market_name)
+            target_umo = self._target_of(sub)
+            if platforms.is_group_session(platforms.session_type_of(target_umo)):
+                continue
+            key = (target_umo, sub.uid, sub.market_name)
             alive.add(key)
             quote = quotes.get(sub.market_name)
             if quote is None:
@@ -381,8 +529,9 @@ class MarketWatcher:
             event = self.notifier.evaluate_subscription(sub, quote, baseline)
             if event is None:
                 continue
-            per_user.setdefault(sub.uid, []).append(event)
-            user_names.setdefault(sub.uid, self.storage.get_user_name(sub.uid))
+            delivery_key = (target_umo, sub.uid)
+            per_user.setdefault(delivery_key, []).append(event)
+            user_names.setdefault(delivery_key, self.storage.get_user_name(sub.uid))
 
         # 订阅被删掉后不留垃圾
         for stale in [k for k in self._last_pushed if k not in alive]:
@@ -393,16 +542,18 @@ class MarketWatcher:
             self._comparison_base.pop(stale, None)
         return per_user, user_names
 
-    def _mark_delivered(self, uid: str, events: list[TriggerEvent]) -> None:
+    def _mark_delivered(self, target_umo: str, uid: str, events: list[TriggerEvent]) -> None:
         """推送确认送达后，推进该用户的对比基准与安静窗口。"""
         now = time.time()
         latest: dict[str, Quote] = {}
         for event in events:
             latest[event.quote.market_name] = event.quote
 
-        subscriptions = {(sub.uid, sub.market_name): sub for sub in self.config.enabled_subscriptions}
+        subscriptions = {
+            (self._target_of(sub), sub.uid, sub.market_name): sub for sub in self.config.enabled_subscriptions
+        }
         for market_name, quote in latest.items():
-            key = (uid, market_name)
+            key = (target_umo, uid, market_name)
             sub = subscriptions.get(key)
             if sub is None:
                 continue
@@ -447,4 +598,6 @@ class MarketWatcher:
             "intervals": self.config.intervals,
             "subscriptions": len(self.config.enabled_subscriptions),
             "watched": len(self.config.watched_market_names),
+            "groups": len(self._group_targets()),
+            "group_push_interval": self.config.group_push_interval,
         }

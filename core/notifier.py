@@ -9,8 +9,10 @@
   若价格持续低于阈值，不会每轮重复刷屏（刻意设计，避免打扰）。
   判定无需额外状态：把上一轮行情重新算一遍阈值，比对差集即可。
 
-投递对象：**只有订阅者本人**（user_subscriptions）。
-  抓取失败等异常则通知拥有者（owner_uids 解析出的会话）。
+投递对象：
+  * 私聊按订阅者发送；
+  * 群聊按物品聚合并 @ 群内全部订阅者；
+  * 抓取失败等异常仍通知拥有者。
 
 @ 的实现（2026-09-24 真机验证，已固化为唯一策略，不再暴露配置项）：
   * **QQ 官方机器人（qq_official）不支持 At 组件** —— AstrBot 该适配器出站只取
@@ -24,15 +26,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from . import platforms
+from .charts import render_price_chart
 from .constants import PUSH_ALWAYS, PUSH_ON_TRIGGER
-from .models import MonitorSpec, Quote, Subscription, TriggerEvent, fmt_delta, fmt_price
+from .models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent, fmt_delta, fmt_price
 from .payload import render_message
 
 #: 分隔行：真正的空行会被 QQ 的 markdown 渲染折叠掉，
@@ -40,6 +44,17 @@ from .payload import render_message
 #: 渲染出来就是一行空白。
 _BLANK_LINE = "\u200b"
 BLOCK_SEPARATOR = f"\n{_BLANK_LINE}\n"
+
+
+@dataclass(slots=True)
+class DeliveryBlock:
+    """一条聚合消息中的单个物品文本块。"""
+
+    text: str
+    title: str = ""
+    mentions: list[tuple[str, str]] = field(default_factory=list)
+    images: list[str | bytes] = field(default_factory=list)
+    used_mention: bool = False
 
 
 def threshold_hits(spec: MonitorSpec, quote: Quote | None) -> dict[str, str]:
@@ -116,6 +131,7 @@ class Notifier:
         #: 群聊中多个订阅者共享 UMO，必须继续按 UID 分开，否则会丢失 @。
         self._pending: dict[tuple[str, str], dict] = {}
         self._flush_task: asyncio.Task | None = None
+        self._chart_cache: dict[tuple[str, int, float, int, str], bytes] = {}
 
     # ------------------------------------------------------------ 会话解析
 
@@ -335,8 +351,231 @@ class Notifier:
 
     # ------------------------------------------------------------ 发送
 
+    async def _chart_for(self, market_name: str, display_name: str) -> bytes | None:
+        limit = max(1, int(getattr(self.config, "chart_history_points", 5) or 5))
+        try:
+            points = self.storage.get_price_history(market_name, limit=limit)
+        except Exception as exc:
+            self.logger.debug(f"[GJM] 读取图表历史失败（{market_name}）：{exc}")
+            return None
+        if not points:
+            return None
+        cache_key = (
+            market_name,
+            int(points[-1].get("t") or 0),
+            float(points[-1].get("sell") or 0),
+            limit,
+            display_name,
+        )
+        cached = self._chart_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            image = await asyncio.to_thread(render_price_chart, display_name or market_name, points)
+        except Exception as exc:
+            self.logger.warning(f"[GJM] 价格图生成失败（{market_name}）：{exc}")
+            return None
+        if len(self._chart_cache) > 256:
+            self._chart_cache.clear()
+        self._chart_cache[cache_key] = image
+        return image
+
+    def _mention_plans(
+        self,
+        platform_type: str,
+        mentions: list[tuple[str, str]],
+        umo: str,
+    ):
+        if not self.config.mention_users:
+            return []
+        seen: set[str] = set()
+        result = []
+        for uid, name in mentions:
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            result.append((uid, name, platforms.mention_plan_for(platform_type, uid, name, umo=umo)))
+        return result
+
+    def _template_mention_text(self, plans) -> str:
+        tokens = [
+            plan.text
+            for _, _, plan in plans
+            if plan.style in (platforms.STYLE_MARKDOWN_TEXT, platforms.STYLE_PLAIN_TEXT)
+        ]
+        return "\n".join(token for token in tokens if token)
+
+    async def _render_event_blocks(
+        self,
+        events: list[TriggerEvent],
+        failures: list[Quote] | None,
+        *,
+        umo: str,
+        uid: str,
+        user_name: str,
+        platform_type: str,
+        mentions_by_event: dict[int, list[tuple[str, str]]] | None = None,
+    ) -> list[DeliveryBlock]:
+        mention_map = mentions_by_event or {}
+        template = (self.config.payload or "").strip()
+        base = self.build_payload_context(
+            events,
+            failures,
+            umo=umo,
+            uid=uid,
+            user_name=user_name,
+            mention="",
+            platform=platform_type,
+            total_items=len(events),
+        )
+        rendered: list[DeliveryBlock] = []
+        item_blocks: list[DeliveryBlock] = []
+        problem = ""
+        unknown: list[str] = []
+
+        if template:
+            for index, event in enumerate(events):
+                mentions = mention_map.get(index, [])
+                plans = self._mention_plans(platform_type, mentions, umo)
+                context = dict(base)
+                context.update(self._item_context(event))
+                context["mention"] = self._template_mention_text(plans)
+                piece = render_message(template, context)
+                if not piece.ok:
+                    problem = piece.error
+                    break
+                unknown = piece.unknown_fields or unknown
+                text = piece.text or self._render_item(event)
+                block = DeliveryBlock(
+                    text=text,
+                    title=event.quote.title,
+                    mentions=mentions,
+                    images=list(piece.images),
+                    used_mention=piece.used_mention,
+                )
+                item_blocks.append(block)
+                rendered.append(block)
+
+        if not template or problem or len(rendered) != len(events):
+            rendered = [
+                DeliveryBlock(
+                    text=f"Gaijin 行情 · {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    title="Gaijin 行情",
+                )
+            ]
+            item_blocks = [
+                DeliveryBlock(
+                    text=self._render_item(event),
+                    title=event.quote.title,
+                    mentions=mention_map.get(index, []),
+                )
+                for index, event in enumerate(events)
+            ]
+            rendered.extend(item_blocks)
+            if problem and not self._payload_warned:
+                self._payload_warned = True
+                self.logger.warning(f"[GJM] payload 渲染失败，已回退为可读文本：{problem}")
+        elif unknown and not self._payload_warned:
+            self._payload_warned = True
+            self.logger.warning("[GJM] payload 含未知字段（已按空值处理）：" + "、".join(unknown))
+
+        for block in rendered:
+            if block.mentions and not block.text:
+                block.text = "Gaijin 行情"
+
+        for event, block in zip(events, item_blocks, strict=False):
+            chart = await self._chart_for(event.quote.market_name, event.quote.title)
+            if chart is not None:
+                block.images.append(chart)
+
+        for quote in failures or []:
+            rendered.append(DeliveryBlock(text=f"{quote.title}\n  抓取失败：{quote.error}", title=quote.title))
+        return rendered
+
+    def _append_image(self, chain, source: str | bytes) -> None:
+        from astrbot.api.message_components import Image
+
+        if isinstance(source, bytes):
+            maker = getattr(Image, "fromBytes", None)
+            if callable(maker):
+                chain.chain.append(maker(source))
+            else:
+                chain.chain.append(Image.fromBase64(base64.b64encode(source).decode()))
+            return
+        if source.startswith(("http://", "https://")):
+            chain.chain.append(Image.fromURL(source))
+        else:
+            chain.chain.append(Image.fromFileSystem(source))
+
+    async def _send_blocks(self, umo: str, blocks: list[DeliveryBlock]) -> bool:
+        """按物品顺序发送文本、@ 与图片。"""
+        if not blocks:
+            return False
+        from astrbot.api.event import MessageChain
+        from astrbot.api.message_components import At, Plain
+
+        platform_type = await self._platform_type(umo) if umo else ""
+        total_images = sum(len(block.images) for block in blocks)
+        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and total_images > 1
+        chain = MessageChain()
+        use_markdown = False
+        for index, block in enumerate(blocks):
+            if index > 0:
+                chain.chain.append(Plain(BLOCK_SEPARATOR))
+            plans = self._mention_plans(platform_type, block.mentions, umo)
+            if any(plan.style == platforms.STYLE_MARKDOWN_TEXT for _, _, plan in plans):
+                use_markdown = True
+            if plans and all(plan.style == platforms.STYLE_AT_COMPONENT for _, _, plan in plans):
+                for uid, name, _plan in plans:
+                    chain.chain.append(At(qq=uid, name=name or None))
+                    chain.chain.append(Plain(" "))
+            elif plans and not block.used_mention:
+                mention_text = self._template_mention_text(plans)
+                if mention_text:
+                    block.text = f"{mention_text}\n{block.text}"
+            if block.text:
+                chain.chain.append(Plain(block.text))
+            if not defer_images:
+                for source in block.images:
+                    try:
+                        self._append_image(chain, source)
+                    except Exception as exc:
+                        self.logger.debug(f"[GJM] 附加图片失败（{source!r}）：{exc}")
+        if use_markdown:
+            setter = getattr(chain, "use_markdown", None)
+            if callable(setter):
+                setter(True)
+            else:
+                chain.use_markdown_ = True
+        try:
+            sent = bool(await self.context.send_message(umo, chain))
+        except Exception as exc:
+            self.logger.warning(f"推送到 {umo} 失败: {exc}")
+            return False
+        if sent and defer_images:
+            for block in blocks:
+                for source in block.images:
+                    if not await self._send_block_image(umo, block.title, source):
+                        self.logger.warning(f"[GJM] 图表补发失败（{block.title or umo}）")
+        return sent
+
+    async def _send_block_image(self, umo: str, title: str, source: str | bytes) -> bool:
+        """QQ 官方单消息只支持一张图时，为物品单独补发图片。"""
+        from astrbot.api.event import MessageChain
+        from astrbot.api.message_components import Plain
+
+        chain = MessageChain()
+        if title:
+            chain.chain.append(Plain(title))
+        self._append_image(chain, source)
+        try:
+            return bool(await self.context.send_message(umo, chain))
+        except Exception as exc:
+            self.logger.warning(f"图片补发到 {umo} 失败: {exc}")
+            return False
+
     def _build_chain(self, text: str, mention_uid: str = "", mention_name: str = ""):
-        """构造消息链；需要 @ 时把 At 放在最前面（适用于支持 At 的平台）。"""
+        """构造单段纯文本消息链，供 owner 通知和兼容路径使用。"""
         from astrbot.api.event import MessageChain
         from astrbot.api.message_components import At, Plain
 
@@ -400,98 +639,20 @@ class Notifier:
         配置了 payload 时正文改由模板渲染：JSON 骨架按书写顺序逐行取值，
         多件物品逐件渲染后拼接；任一份渲染失败都整体回退到 text。
         """
-        platform_type = await self._platform_type(umo) if umo else ""
-        # @ 的方式由 core.platforms 统一裁决（各平台适配器差异都写在那里）。
-        # 会话类型也很关键：QQ 官方私聊（C2C）不支持群聊 @ 标记，发了整条消息会被拒。
-        plan = platforms.mention_plan_for(platform_type, mention_uid, mention_name, umo=umo) if mention_uid else None
-        mention_ok = bool(plan and plan.style != platforms.STYLE_NONE)
-        token = plan.text if mention_ok else ""
-        at_unsupported = bool(plan and plan.style == platforms.STYLE_PLAIN_TEXT)
-        # 标准 At 组件无法通过字符串插值放入正文位置；模板中的 $mention 置空，
-        # 后面统一把真正的 At 组件加到消息链最前面。
-        template_mention = "" if plan and plan.style == platforms.STYLE_AT_COMPONENT else token
-
-        body, used_mention = text, False
-        template = (self.config.payload or "").strip()
-        images: list[str] = []
-        if events and template:
-            blocks: list[str] = []
-            problem = ""
-            unknown: list[str] = []
-            base = self.build_payload_context(
+        if events:
+            platform_type = await self._platform_type(umo) if umo else ""
+            mentions_by_event = {0: [(mention_uid, mention_name)]} if mention_uid else {}
+            blocks = await self._render_event_blocks(
                 events,
                 failures,
                 umo=umo,
                 uid=uid or mention_uid,
                 user_name=mention_name,
-                mention=template_mention,
-                platform=platform_type,
-                total_items=len(events),
+                platform_type=platform_type,
+                mentions_by_event=mentions_by_event,
             )
-            for index, event in enumerate(events):
-                context = dict(base)
-                context.update(self._item_context(event))
-                if index > 0:
-                    # @ 只放在第一份里，多件时不会重复 @
-                    context["mention"] = ""
-                piece = render_message(template, context)
-                if not piece.ok:
-                    problem = piece.error
-                    break
-                if piece.used_mention:
-                    used_mention = True
-                unknown = piece.unknown_fields or unknown
-                if piece.text:
-                    blocks.append(piece.text)
-                images.extend(piece.images)
-            if blocks and not problem:
-                # 多件之间空一行（用零宽空格行，避免被客户端渲染折叠）
-                body = BLOCK_SEPARATOR.join(blocks)
-                # 多件合并时同一张图只附一次
-                images = list(dict.fromkeys(images))
-            if not self._payload_warned:
-                if problem:
-                    self._payload_warned = True
-                    self.logger.warning(f"[GJM] payload 渲染失败，已回退为可读文本：{problem}")
-                elif unknown:
-                    self._payload_warned = True
-                    self.logger.warning("[GJM] payload 含未知字段（已按空值处理）：" + "、".join(unknown))
-
-        if not body.strip() and platforms.requires_text(platform_type):
-            # 这些平台会丢弃“没有文字”的消息，补一句兜底文字
-            body = (events[0].quote.title if events else "") or "Gaijin 行情"
-
-        if plan is not None and plan.style == platforms.STYLE_NONE:
-            # 私聊等不支持 @ 标记的会话：模板里若自带群聊标记，必须剔除，
-            # 否则平台会拒绝整条消息（C2C消息不支持qqbot-at-user）。
-            body = platforms.strip_group_mention_tags(body)
-
-        # 模板自己放了 @ 标记就不要再叠加
-        if used_mention:
-            needs_md = bool(plan and plan.style == platforms.STYLE_MARKDOWN_TEXT)
-            return await self._send_plain(umo, body, markdown=True if needs_md else None, images=images)
-        if mention_ok and self.config.mention_users:
-            if plan and plan.style == platforms.STYLE_MARKDOWN_TEXT:
-                # 实测结论：必须走 markdown 通道，纯文本会把标记原样显示出来
-                return await self._send_plain(umo, f"{token}\n{body}", markdown=True, images=images)
-            if at_unsupported:
-                # 该平台的适配器会静默忽略 At 组件，改用纯文本 @
-                return await self._send_plain(umo, f"{token}\n{body}", images=images)
-            try:
-                chain = self._build_chain(body, mention_uid, mention_name)
-                for source in images:
-                    with suppress(Exception):
-                        from astrbot.api.message_components import Image
-
-                        url = str(source)
-                        chain.chain.append(
-                            Image.fromURL(url) if url.startswith(("http://", "https://")) else Image.fromFileSystem(url)
-                        )
-                if await self.context.send_message(umo, chain):
-                    return True
-            except Exception as exc:
-                self.logger.debug(f"@ 推送失败（{umo}），降级为纯文本: {exc}")
-        return await self._send_plain(umo, body, images=images)
+            return await self._send_blocks(umo, blocks)
+        return await self._send_plain(umo, text)
 
     async def _notify_send_failure(self, umo: str) -> None:
         """出站失败时告知拥有者（同一会话限频 30 分钟），避免推送悄悄丢失。"""
@@ -550,6 +711,119 @@ class Notifier:
             await self._notify_send_failure(umo)
         return sent
 
+    async def push_group_snapshot(self, umo: str, items: list[SnapshotItem]) -> bool:
+        """向一个群发送完整行情快照；每件物品单独 @、正文和图表。"""
+        if not items:
+            return False
+        platform_type = await self._platform_type(umo) if umo else ""
+        template = (self.config.payload or "").strip()
+        events = [
+            TriggerEvent(
+                spec=MonitorSpec(
+                    market_name=item.market_name,
+                    display_name=item.display_name,
+                    enabled=True,
+                ),
+                quote=item.quote,
+                previous=item.previous,
+                mode=PUSH_ALWAYS,
+            )
+            for item in items
+            if item.quote is not None
+        ]
+        base = self.build_payload_context(
+            events,
+            None,
+            umo=umo,
+            platform=platform_type,
+            total_items=len(items),
+        )
+        blocks: list[DeliveryBlock] = []
+        problem = ""
+        unknown: list[str] = []
+        for item in items:
+            plans = self._mention_plans(platform_type, item.mentions, umo)
+            mention_text = self._template_mention_text(plans)
+            text = ""
+            images: list[str] = []
+            used_mention = False
+            if item.quote is not None:
+                event = TriggerEvent(
+                    spec=MonitorSpec(item.market_name, item.display_name, enabled=True),
+                    quote=item.quote,
+                    previous=item.previous,
+                    mode=PUSH_ALWAYS,
+                )
+                if template:
+                    context = dict(base)
+                    context.update(self._item_context(event))
+                    context["mention"] = mention_text
+                    piece = render_message(template, context)
+                    if piece.ok:
+                        text = piece.text or self._render_item(event)
+                        images = list(piece.images)
+                        used_mention = piece.used_mention
+                        unknown = piece.unknown_fields or unknown
+                    else:
+                        problem = piece.error
+                        text = self._render_item(event)
+                else:
+                    text = self._render_item(event)
+                if item.error:
+                    text += f"\n  >> 本次刷新失败：{item.error}"
+            else:
+                text = f"{item.display_name or item.market_name}\n  暂无行情"
+                if item.error:
+                    text += f"（本次刷新失败：{item.error}）"
+            chart = await self._chart_for(item.market_name, item.display_name)
+            if chart is not None:
+                images.append(chart)
+            blocks.append(
+                DeliveryBlock(
+                    text=text,
+                    title=item.display_name or item.market_name,
+                    mentions=item.mentions,
+                    images=images,
+                    used_mention=used_mention,
+                )
+            )
+        if problem:
+            fallback_blocks: list[DeliveryBlock] = []
+            for item, old_block in zip(items, blocks, strict=True):
+                if item.quote is not None:
+                    event = TriggerEvent(
+                        spec=MonitorSpec(item.market_name, item.display_name, enabled=True),
+                        quote=item.quote,
+                        previous=item.previous,
+                        mode=PUSH_ALWAYS,
+                    )
+                    text = self._render_item(event)
+                    if item.error:
+                        text += f"\n  >> 本次刷新失败：{item.error}"
+                else:
+                    text = f"{item.display_name or item.market_name}\n  暂无行情"
+                    if item.error:
+                        text += f"（本次刷新失败：{item.error}）"
+                fallback_blocks.append(
+                    DeliveryBlock(
+                        text=text,
+                        title=item.display_name or item.market_name,
+                        mentions=item.mentions,
+                        images=[image for image in old_block.images if isinstance(image, bytes)],
+                    )
+                )
+            blocks = fallback_blocks
+        if problem and not self._payload_warned:
+            self._payload_warned = True
+            self.logger.warning(f"[GJM] payload 渲染失败，已回退为可读文本：{problem}")
+        elif unknown and not self._payload_warned:
+            self._payload_warned = True
+            self.logger.warning("[GJM] payload 含未知字段（已按空值处理）：" + "、".join(unknown))
+        sent = await self._send_blocks(umo, blocks)
+        if not sent:
+            await self._notify_send_failure(umo)
+        return sent
+
     # ------------------------------------------------------------ 推送合并
 
     @staticmethod
@@ -574,7 +848,7 @@ class Notifier:
         failures: list[Quote] | None,
         user_name: str,
         window: int,
-        on_delivered: Callable[[str, list[TriggerEvent]], None] | None = None,
+        on_delivered: Callable[[str, str, list[TriggerEvent]], None] | None = None,
     ) -> None:
         """把本次事件并入缓冲，等窗口到点后合成一条消息发出。"""
         key = (umo, uid)
@@ -599,7 +873,8 @@ class Notifier:
 
     def _report_delivered(
         self,
-        callback: Callable[[str, list[TriggerEvent]], None] | None,
+        callback: Callable[[str, str, list[TriggerEvent]], None] | None,
+        target_umo: str,
         uid: str,
         events: list[TriggerEvent],
     ) -> None:
@@ -607,7 +882,7 @@ class Notifier:
         if callback is None:
             return
         try:
-            callback(uid, list(events))
+            callback(target_umo, uid, list(events))
         except Exception as exc:
             self.logger.warning(f"[GJM] 更新推送送达状态失败（{uid}）：{exc}")
 
@@ -638,7 +913,7 @@ class Notifier:
                     try:
                         delivered = await self._deliver(uid, umo, events, failures, entry["name"])
                         if delivered:
-                            self._report_delivered(entry.get("on_delivered"), uid, events)
+                            self._report_delivered(entry.get("on_delivered"), umo, uid, events)
                     except Exception as exc:
                         self.logger.warning(f"[GJM] 合并推送失败（{umo}）：{exc}")
         except asyncio.CancelledError:
@@ -663,18 +938,18 @@ class Notifier:
                             entry["name"],
                         )
                         if delivered:
-                            self._report_delivered(entry.get("on_delivered"), uid, events)
+                            self._report_delivered(entry.get("on_delivered"), umo, uid, events)
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
 
     async def push_to_subscribers(
         self,
-        per_user: dict[str, list[TriggerEvent]],
-        user_names: dict[str, str] | None = None,
+        per_user: dict[tuple[str, str], list[TriggerEvent]],
+        user_names: dict[tuple[str, str], str] | None = None,
         failures: list[Quote] | None = None,
         *,
-        on_delivered: Callable[[str, list[TriggerEvent]], None] | None = None,
+        on_delivered: Callable[[str, str, list[TriggerEvent]], None] | None = None,
     ) -> int:
         """把各自的事件推送给对应订阅者，群聊里会 @ 到本人。
 
@@ -684,24 +959,29 @@ class Notifier:
         names = user_names or {}
         window = max(0, int(getattr(self.config, "push_batch_seconds", 0) or 0))
         sent = 0
-        for uid, events in per_user.items():
+        for (target_umo, uid), events in per_user.items():
             if not events:
                 continue
+            if platforms.is_group_session(platforms.session_type_of(target_umo)):
+                # 群聊由 watcher 的周期快照统一发送，不能在私聊事件路径重复投递。
+                continue
             user_markets = {
-                sub.market_name for sub in getattr(self.config, "enabled_subscriptions", ()) if sub.uid == uid
+                sub.market_name
+                for sub in getattr(self.config, "enabled_subscriptions", ())
+                if sub.uid == uid and sub.target_umo == target_umo
             }
             user_failures = [quote for quote in (failures or []) if quote.market_name in user_markets]
-            umo = self.session_of(uid)
+            umo = target_umo or self.session_of(uid)
             if not umo:
                 self.logger.warning(f"订阅者 {uid} 尚未解析到会话，本轮无法推送。")
                 continue
-            user_name = names.get(uid, "")
+            user_name = names.get((target_umo, uid), "")
             if window > 0:
                 self._buffer_push(uid, umo, events, user_failures, user_name, window, on_delivered)
                 sent += 1
                 continue
             if await self._deliver(uid, umo, events, user_failures or None, user_name):
-                self._report_delivered(on_delivered, uid, events)
+                self._report_delivered(on_delivered, target_umo or umo, uid, events)
                 sent += 1
         if window > 0 and self._pending:
             self._ensure_flush_task()

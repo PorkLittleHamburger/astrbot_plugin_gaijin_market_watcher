@@ -17,11 +17,17 @@ from typing import Any
 
 from .constants import (
     DEFAULT_APPID,
+    DEFAULT_CHART_HISTORY_POINTS,
+    DEFAULT_GROUP_PUSH_INTERVAL,
     DEFAULT_LANGUAGE,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
+    MAX_CHART_HISTORY_POINTS,
+    MAX_GROUP_PUSH_INTERVAL,
     MAX_POLL_INTERVAL,
+    MIN_CHART_HISTORY_POINTS,
+    MIN_GROUP_PUSH_INTERVAL,
     MIN_POLL_INTERVAL,
     ONLY_CHANGE_INTERVAL,
     PUSH_BATCH_SECONDS,
@@ -137,6 +143,20 @@ class PluginConfig:
         # ---------- 推送合并 ----------
         #: 同一时间窗内多件物品的变化合并成一条消息（0 = 每件单独发）
         self.push_batch_seconds: int = max(0, min(120, _as_int(self.raw.get("push_batch_seconds"), PUSH_BATCH_SECONDS)))
+        self.group_push_interval: int = max(
+            MIN_GROUP_PUSH_INTERVAL,
+            min(
+                MAX_GROUP_PUSH_INTERVAL,
+                _as_int(self.raw.get("group_push_interval"), DEFAULT_GROUP_PUSH_INTERVAL),
+            ),
+        )
+        self.chart_history_points: int = max(
+            MIN_CHART_HISTORY_POINTS,
+            min(
+                MAX_CHART_HISTORY_POINTS,
+                _as_int(self.raw.get("chart_history_points"), DEFAULT_CHART_HISTORY_POINTS),
+            ),
+        )
 
         # ---------- 用户订阅（每用户每物品一条） ----------
         #: 解析订阅时若没写 interval，沿用旧的全局 poll_interval（兼容），再退回默认值
@@ -182,6 +202,7 @@ class PluginConfig:
             "enabled": _as_bool(entry.get("enabled"), True),
             "interval": _clamp_interval(entry.get("interval"), self._default_interval),
             "mode": self._refresh_mode(entry.get("mode"), self.default_refresh_mode),
+            "target_umo": _as_str(entry.get("target") or entry.get("target_umo")),
         }
 
         out: list[Subscription] = []
@@ -203,6 +224,7 @@ class PluginConfig:
                         enabled=_as_bool(item.get("enabled"), shared["enabled"]),
                         interval=_clamp_interval(item.get("interval"), shared["interval"]),
                         mode=self._refresh_mode(item.get("mode"), shared["mode"]),
+                        target_umo=shared["target_umo"],
                     )
                 )
                 continue
@@ -298,16 +320,45 @@ class PluginConfig:
                 names.append(sub.market_name)
         return names
 
-    def subscriptions_of(self, uid: str, market_name: str = "") -> list[Subscription]:
-        """查某个 UID 的订阅（可按物品过滤）。"""
-        result = [s for s in self.subscriptions if s.uid == uid]
+    def subscriptions_of(self, uid: str, market_name: str = "", target_umo: str | None = None) -> list[Subscription]:
+        """查某个 UID 的订阅，可按会话和物品过滤。"""
+        result = [s for s in self.subscriptions if s.uid == uid and (target_umo is None or s.target_umo == target_umo)]
         if market_name:
             result = [s for s in result if s.market_name == market_name]
         return result
 
-    def subscribers_of(self, market_name: str) -> list[Subscription]:
+    def subscribers_of(self, market_name: str, target_umo: str | None = None) -> list[Subscription]:
         """查订阅了某物品的所有用户。"""
-        return [s for s in self.enabled_subscriptions if s.market_name == market_name]
+        return [
+            s
+            for s in self.enabled_subscriptions
+            if s.market_name == market_name and (target_umo is None or s.target_umo == target_umo)
+        ]
+
+    def hydrate_subscription_targets(self, resolver) -> int:
+        """给旧版没有 target_umo 的订阅补上最近已知会话。"""
+        hydrated: list[Subscription] = []
+        changed = 0
+        for sub in self.subscriptions:
+            target = sub.target_umo
+            if not target:
+                target = str(resolver(sub.uid) or "")
+            if target != sub.target_umo:
+                sub = Subscription(
+                    uid=sub.uid,
+                    market_name=sub.market_name,
+                    display_name=sub.display_name,
+                    sell_below=sub.sell_below,
+                    buy_above=sub.buy_above,
+                    enabled=sub.enabled,
+                    interval=sub.interval,
+                    mode=sub.mode,
+                    target_umo=target,
+                )
+                changed += 1
+            hydrated.append(sub)
+        self.subscriptions = hydrated
+        return changed
 
     def display_name_of(self, market_name: str) -> str:
         """物品显示名。

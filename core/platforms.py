@@ -70,6 +70,9 @@ PROACTIVE_NOTES: dict[str, str] = {
 #: 出站必须带文字的平台（只发图片会被整条丢弃）。
 TEXT_REQUIRED_PLATFORMS: frozenset[str] = frozenset({"weixin_oc", "weixin_official_account", "wecom"})
 
+#: 一次 send_message 只能带一张图片的平台；多图需拆分补发。
+ONE_IMAGE_PLATFORMS: frozenset[str] = frozenset({"qq_official", "qq_official_webhook"})
+
 STYLE_MARKDOWN_TEXT = "markdown_text"
 STYLE_PLAIN_TEXT = "plain_text"
 STYLE_AT_COMPONENT = "at_component"

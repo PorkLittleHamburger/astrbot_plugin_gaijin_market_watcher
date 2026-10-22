@@ -101,10 +101,12 @@ class Subscription:
     interval: int = DEFAULT_POLL_INTERVAL
     #: always=按 interval 推送；only_change=固定 5 秒检查，变化时推送。
     mode: str = REFRESH_ONLY_CHANGE
+    #: 发起订阅的会话 UMO；旧配置为空时由会话映射自动补齐。
+    target_umo: str = ""
 
     @property
-    def key(self) -> tuple[str, str]:
-        return (self.uid, self.market_name)
+    def key(self) -> tuple[str, str, str]:
+        return (self.target_umo, self.uid, self.market_name)
 
     def to_spec(self) -> MonitorSpec:
         """复用全局监控的阈值判定逻辑（推送目标不同，判定规则一致）。"""
@@ -143,3 +145,19 @@ class TriggerEvent:
     active_hits: dict[str, str] = field(default_factory=dict)
     #: 该事件所属订阅的刷新模式。
     mode: str = ""
+
+
+@dataclass(slots=True)
+class SnapshotItem:
+    """群聊周期快照中的一件物品。
+
+    quote 为 None 表示当前没有可用行情；error 记录最近一次抓取错误。
+    mentions 是该群内订阅此物品的 (UID, 昵称) 列表。
+    """
+
+    market_name: str
+    display_name: str
+    quote: Quote | None
+    previous: Quote | None
+    mentions: list[tuple[str, str]] = field(default_factory=list)
+    error: str = ""

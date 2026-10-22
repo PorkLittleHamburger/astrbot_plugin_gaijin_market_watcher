@@ -58,7 +58,7 @@
     "hint": "JSON 骨架：键名不出现，按书写顺序逐行输出值；数组值一行一项。留空=可读文本；字段见 docs/PAYLOAD_FIELDS.md。"
   },
   "push_batch_seconds": {
-    "description": "推送合并窗口（秒）",
+    "description": "私聊推送合并窗口（秒）",
     "type": "int",
     "default": 10,
     "slider": {
@@ -66,7 +66,29 @@
       "max": 120,
       "step": 1
     },
-    "hint": "窗口内多件物品的变化合并成一条消息；0=每件单独发。"
+    "hint": "仅用于私聊；窗口内多件物品的变化合并成一条消息，0=每件单独发。群聊使用下方的固定全量推送间隔。"
+  },
+  "group_push_interval": {
+    "description": "群聊全量推送间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "slider": {
+      "min": 5,
+      "max": 3600,
+      "step": 1
+    },
+    "hint": "每隔该时间主动抓取该群全部订阅物品，并合并成一条行情快照；首次从插件加载后开始计时。"
+  },
+  "chart_history_points": {
+    "description": "价格图采样次数",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 2,
+      "max": 50,
+      "step": 1
+    },
+    "hint": "每次自动行情推送按物品生成折线图，展示最近 N 次成功抓取的最低售价和最高求购。"
   },
   "request_timeout": {
     "description": "请求超时（秒）",
@@ -124,6 +146,12 @@
             "default": "",
             "hint": "可发送 AstrBot 内置命令 /sid 查看。"
           },
+          "target": {
+            "description": "订阅所属会话",
+            "type": "string",
+            "default": "",
+            "hint": "由插件在用户执行订阅命令时自动填写；旧配置留空时会根据 UID 的最近会话自动迁移。"
+          },
           "note": {
             "description": "备注",
             "type": "string",
@@ -139,7 +167,7 @@
               "max": 3600,
               "step": 1
             },
-            "hint": "always 模式使用的默认刷新间隔；单个物品可在下方覆盖。"
+            "hint": "always 模式使用，且仅对私聊订阅生效；群聊统一使用 group_push_interval。"
           },
           "mode": {
             "description": "刷新模式",
@@ -149,7 +177,7 @@
               "always",
               "only_change"
             ],
-            "hint": "always=按间隔推送且无变化也发送；only_change=每 5 秒检查，变化时发送。"
+            "hint": "控制私聊推送；群聊统一周期性发送全量快照，不使用这里的模式。"
           },
           "items": {
             "description": "订阅物品",

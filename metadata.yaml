@@ -7,10 +7,11 @@ desc: |
   变化时推送到群聊或私聊。
 
   特性：
-  - 多用户订阅：支持群聊场景下的多用户订阅推送
-  - 推送合并：同一时间窗内多件物品的变化合成一条消息
+  - 会话级多用户订阅：同一用户可在不同群聊或私聊独立订阅
+  - 群聊全量快照：按固定间隔合并群内全部物品并分别 @ 订阅者
+  - 价格折线图：自动推送最近 N 次最低售价与最高求购
   - 多平台适配：适配微信/qq平台
-version: 2.16.2
+version: 2.17.0
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.23.6,<5"
