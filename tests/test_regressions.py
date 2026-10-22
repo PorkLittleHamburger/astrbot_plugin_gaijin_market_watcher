@@ -7,7 +7,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from core.api_client import GaijinMarketClient
+from core.api_client import AuthExpiredError, GaijinMarketClient, MarketApiError, TransportError
 from core.auth import AuthManager
 from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, Subscription, TriggerEvent
@@ -47,6 +47,15 @@ class _Storage:
 
     def get_item_meta(self, _market_name: str) -> dict:
         return {}
+
+    def get_item_name(self, _market_name: str) -> str:
+        return ""
+
+    def get_last_quote(self, _market_name: str):
+        return None
+
+    def set_last_quote(self, _quote) -> None:
+        pass
 
 
 class _NotifierConfig:
@@ -102,13 +111,19 @@ class _WatcherConfig:
         self.subscription = Subscription("user", "item", interval=interval)
         self.enabled_subscriptions = [self.subscription]
         self.watched_market_names = ["item"]
+        self.item_interval = 0
+        self.appid = "1067"
 
     def interval_of(self, _market_name: str) -> int:
         return self.subscription.interval
 
+    def display_name_of(self, _market_name: str) -> str:
+        return "item"
+
 
 class _WatcherNotifier:
-    pass
+    def owner_sessions(self) -> list[str]:
+        return []
 
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -138,6 +153,27 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(body["ok"], 1)
         self.assertEqual(client.fake_http.calls, 2)
+
+    async def test_http_401_is_auth_error_and_400_is_not_success(self) -> None:
+        class _StatusHttp:
+            def __init__(self, status_code: int) -> None:
+                self.status_code = status_code
+
+            async def post(self, *_args, **_kwargs) -> _Response:
+                return _Response(self.status_code, {"message": "error"})
+
+        class _StatusClient(GaijinMarketClient):
+            def __init__(self, status_code: int) -> None:
+                super().__init__(min_interval=0, retries=0)
+                self.status_code = status_code
+
+            async def _get_client(self):
+                return _StatusHttp(self.status_code)
+
+        with self.assertRaises(AuthExpiredError):
+            await _StatusClient(401)._post("https://example.invalid", "test", {}, with_token="bad")
+        with self.assertRaises(MarketApiError):
+            await _StatusClient(400)._post("https://example.invalid", "test", {}, with_token="bad")
 
     def test_command_link_parser_rejects_bare_market_name(self) -> None:
         self.assertEqual(extract_link_reference("id50381_f_16xl_usa"), (None, None))
@@ -189,6 +225,20 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Second", message)
         self.assertEqual([sub.market_name for sub in store.all()], ["first", "other-item"])
         self.assertFalse(store.remove_by_index("user", 9)[0])
+
+    def test_failed_subscription_save_rolls_back_memory(self) -> None:
+        config = _SubscriptionConfig()
+
+        def fail_persist(_subs) -> None:
+            raise OSError("read-only")
+
+        store = SubscriptionStore(config, fail_persist)
+
+        ok, message = store.remove_by_index("user", 1)
+
+        self.assertFalse(ok)
+        self.assertIn("失败", message)
+        self.assertEqual([sub.market_name for sub in store.all()], ["id50381_f_16xl_usa"])
 
     def test_refresh_commands_support_global_and_per_item_targets(self) -> None:
         config = _SubscriptionConfig()
@@ -374,6 +424,35 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await watcher.poll_items(["item"]), [])
         self.assertEqual(watcher.poll_count, 0)
 
+    async def test_non_auth_error_after_token_refresh_does_not_trigger_backoff(self) -> None:
+        class _Auth:
+            async def get_token(self, **_kwargs) -> str:
+                return "token"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def fetch_quote(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AuthExpiredError("fetch", "INVALID_TOKEN")
+                raise TransportError("fetch", "HTTP 503")
+
+        watcher = MarketWatcher(
+            client=_Client(),
+            auth=_Auth(),
+            storage=_Storage(),
+            config=_WatcherConfig(interval=5),
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+
+        await watcher.poll_items(["item"])
+
+        self.assertEqual(watcher._auth_backoff_remaining(), 0)
+        self.assertIn("503", watcher.last_poll_error)
+
     def test_empty_mention_is_not_treated_as_rendered(self) -> None:
         text, used_mention, _unknown = substitute("$mention", {"mention": ""})
 
@@ -444,6 +523,31 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(context.sent.chain[0], _At)
         self.assertEqual(context.sent.chain[0].qq, "alice")
         self.assertTrue(any(isinstance(item, _Plain) and item.text == "Item" for item in context.sent.chain))
+
+    async def test_subscriber_only_receives_own_failure_details(self) -> None:
+        class _FilterConfig(_NotifierConfig):
+            enabled_subscriptions = [Subscription("bob", "item-b")]
+            push_batch_seconds = 0
+
+        class _CaptureNotifier(Notifier):
+            def __init__(self, *args) -> None:
+                super().__init__(*args)
+                self.seen_failures: list[str] = []
+
+            async def _deliver(self, _uid, _umo, _events, failures, _name) -> bool:
+                self.seen_failures = [quote.market_name for quote in (failures or [])]
+                return True
+
+        notifier = _CaptureNotifier(None, _Storage(), _FilterConfig(), _Logger())
+        event = TriggerEvent(spec=MonitorSpec("item-b"), quote=Quote("item-b", sell_min=10.0))
+        failures = [
+            Quote("item-a", error="private failure"),
+            Quote("item-b", error="own failure"),
+        ]
+
+        await notifier.push_to_subscribers({"bob": [event]}, {"bob": "Bob"}, failures)
+
+        self.assertEqual(notifier.seen_failures, ["item-b"])
 
     def test_config_token_sync_updates_cached_refresh_token(self) -> None:
         class Config:

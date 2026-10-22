@@ -687,16 +687,20 @@ class Notifier:
         for uid, events in per_user.items():
             if not events:
                 continue
+            user_markets = {
+                sub.market_name for sub in getattr(self.config, "enabled_subscriptions", ()) if sub.uid == uid
+            }
+            user_failures = [quote for quote in (failures or []) if quote.market_name in user_markets]
             umo = self.session_of(uid)
             if not umo:
                 self.logger.warning(f"订阅者 {uid} 尚未解析到会话，本轮无法推送。")
                 continue
             user_name = names.get(uid, "")
             if window > 0:
-                self._buffer_push(uid, umo, events, failures, user_name, window, on_delivered)
+                self._buffer_push(uid, umo, events, user_failures, user_name, window, on_delivered)
                 sent += 1
                 continue
-            if await self._deliver(uid, umo, events, failures, user_name):
+            if await self._deliver(uid, umo, events, user_failures or None, user_name):
                 self._report_delivered(on_delivered, uid, events)
                 sent += 1
         if window > 0 and self._pending:

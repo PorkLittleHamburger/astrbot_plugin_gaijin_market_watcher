@@ -224,16 +224,37 @@ class MarketWatcher:
             try:
                 quote = await self.client.fetch_quote(market_name, token, appid=self.config.appid, display_name=display)
             except AuthExpiredError as exc:
-                auth_error = str(exc)
                 try:
                     token = await self.auth.get_token(force_refresh=True)
+                except LoginRequiredError as refresh_exc:
+                    auth_error = str(refresh_exc)
+                    failures.append(Quote(market_name=market_name, display_name=display, error=str(refresh_exc)))
+                    break
+                except Exception as refresh_exc:
+                    auth_error = f"{exc}; 刷新令牌异常: {refresh_exc}"
+                    failures.append(Quote(market_name=market_name, display_name=display, error=auth_error))
+                    break
+
+                try:
                     quote = await self.client.fetch_quote(
                         market_name, token, appid=self.config.appid, display_name=display
                     )
-                    auth_error = ""
-                except Exception as inner:
-                    failures.append(Quote(market_name=market_name, display_name=display, error=str(inner)))
+                except AuthExpiredError as retry_exc:
+                    auth_error = f"{exc}; 刷新令牌后仍被拒绝: {retry_exc}"
+                    failures.append(Quote(market_name=market_name, display_name=display, error=auth_error))
                     break
+                except MarketApiError as retry_exc:
+                    failures.append(Quote(market_name=market_name, display_name=display, error=str(retry_exc)))
+                    continue
+                except Exception as retry_exc:
+                    failures.append(
+                        Quote(
+                            market_name=market_name,
+                            display_name=display,
+                            error=f"刷新令牌后抓取失败: {retry_exc}",
+                        )
+                    )
+                    continue
             except MarketApiError as exc:
                 failures.append(Quote(market_name=market_name, display_name=display, error=str(exc)))
                 continue
@@ -273,7 +294,13 @@ class MarketWatcher:
 
         if per_user or failures:
             self.logger.info(f"本轮：订阅推送 {len(per_user)} 人、失败 {len(failures)} 条。")
-        self.last_poll_error = ""
+        if auth_error:
+            # _handle_auth_failure 已记录具体原因，不能在本次轮询结束前清空。
+            pass
+        elif failures:
+            self.last_poll_error = failures[0].error
+        else:
+            self.last_poll_error = ""
         return [ev for evs in per_user.values() for ev in evs]
 
     # ------------------------------------------------------------ 物品元数据

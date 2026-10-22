@@ -121,9 +121,11 @@ class SubscriptionStore:
         )
         if existing is not None:
             subs = [sub if s.key == sub.key else s for s in self._items]
-            self._commit(subs)
+            if not self._commit(subs):
+                return False, "保存订阅失败，请检查 AstrBot 配置写入权限或日志。"
             return True, f"已更新订阅：{name}"
-        self._commit([*self._items, sub])
+        if not self._commit([*self._items, sub]):
+            return False, "保存订阅失败，请检查 AstrBot 配置写入权限或日志。"
         return True, f"订阅成功：{name}\n（{market_name}，刷新间隔 {interval} 秒）"
 
     def unsubscribe(self, uid: str, url: str) -> tuple[bool, str]:
@@ -138,7 +140,8 @@ class SubscriptionStore:
         remaining = [s for s in subs if not (s.uid == uid and s.market_name == market_name)]
         if len(remaining) == len(subs):
             return False, "你没有订阅这件物品。"
-        self._commit(remaining)
+        if not self._commit(remaining):
+            return False, "取消订阅失败，请检查 AstrBot 配置写入权限或日志。"
         return True, f"已取消订阅：{market_name}"
 
     def remove_by_index(self, uid: str, index: int) -> tuple[bool, str]:
@@ -151,7 +154,8 @@ class SubscriptionStore:
 
         target = own[index - 1]
         remaining = [s for s in self._items if s.key != target.key]
-        self._commit(remaining)
+        if not self._commit(remaining):
+            return False, "取消订阅失败，请检查 AstrBot 配置写入权限或日志。"
         name = target.display_name or target.market_name
         return True, f"已取消订阅：{name}（剩余 {len(own) - 1} 件）"
 
@@ -179,7 +183,8 @@ class SubscriptionStore:
                     interval=sub.interval,
                     mode=sub.mode,
                 )
-                self._commit(subs)
+                if not self._commit(subs):
+                    return False, "保存订阅失败，请检查 AstrBot 配置写入权限或日志。"
                 return True, "已保存。"
         return False, "未找到该订阅。"
 
@@ -210,7 +215,8 @@ class SubscriptionStore:
                 )
             else:
                 updated.append(sub)
-        self._commit(updated)
+        if not self._commit(updated):
+            return False, "保存刷新间隔失败，请检查 AstrBot 配置写入权限或日志。"
         if market_name:
             return True, f"已把该物品刷新间隔设为 {value} 秒。"
         return True, f"已把你的刷新间隔设为 {value} 秒（对你名下 {len(targets)} 件物品同时生效）。"
@@ -246,14 +252,21 @@ class SubscriptionStore:
             else sub
             for sub in self._items
         ]
-        self._commit(updated)
+        if not self._commit(updated):
+            return False, "保存刷新模式失败，请检查 AstrBot 配置写入权限或日志。"
         return True, f"已把刷新模式设为 {mode}（对你名下 {len(targets)} 件物品生效）。"
 
-    def _commit(self, subs: list[Subscription]) -> None:
-        """先更新本地权威列表，再落盘；保证后续读取立刻看到最新状态。"""
+    def _commit(self, subs: list[Subscription]) -> bool:
+        """先更新本地权威列表，再落盘；失败时回滚并返回 False。"""
+        previous = self._items
         self._items = list(subs)
         try:
-            self.persist(self._items)
+            persisted = self.persist(self._items)
+            if persisted is False:
+                raise RuntimeError("持久化回调返回失败")
         except Exception as exc:  # 落盘失败不应让内存状态与用户预期错位
+            self._items = previous
             if self.logger:
                 self.logger.error(f"保存订阅失败: {exc}")
+            return False
+        return True

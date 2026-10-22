@@ -24,12 +24,9 @@ class PluginStorage:
       sessions.json 用户 UID -> 会话 UMO 的映射（支持"用 UID 配置推送对象"）
       pending_login.json 待提交验证码的登录中间态（会话 Cookie + 表单字段，不含密码）
       quotes.json   每个物品"最近一次"的行情数据（用于比对价格变化）
-      history.json  每个物品最近 N 条行情（用于走势回溯）
-      subs.json     订阅会话（umo 列表）
+      items_meta.json 物品图标 / 标签 / 稀有度元数据缓存
       auth.json     鉴权状态（刷新后的最新 JWT / refresh_token）
     """
-
-    MAX_HISTORY = 200  # 每个物品最多保留的历史点数
 
     def __init__(self, data_dir: Path, logger) -> None:
         self.dir = Path(data_dir)
@@ -39,8 +36,6 @@ class PluginStorage:
         self._sessions_file = self.dir / "sessions.json"
         self._pending_login_file = self.dir / "pending_login.json"
         self._quotes_file = self.dir / "quotes.json"
-        self._history_file = self.dir / "history.json"
-        self._subs_file = self.dir / "subs.json"
         self._auth_file = self.dir / "auth.json"
         self._meta_file = self.dir / "items_meta.json"
 
@@ -79,37 +74,6 @@ class PluginStorage:
             data = {}
         data[quote.market_name] = quote.to_dict()
         self._save(self._quotes_file, data)
-        self.append_history(quote)
-
-    # ------------------------------------------------------------- 历史记录
-
-    def append_history(self, quote: Quote) -> None:
-        if not quote.ok:
-            return
-        data = self._load(self._history_file, {})
-        if not isinstance(data, dict):
-            data = {}
-        points = data.get(quote.market_name) or []
-        points.append(
-            {
-                "t": quote.timestamp,
-                "sell": quote.sell_min,
-                "buy": quote.buy_max,
-            }
-        )
-        data[quote.market_name] = points[-self.MAX_HISTORY :]
-        self._save(self._history_file, data)
-
-    def get_history(self, market_name: str) -> list[dict[str, Any]]:
-        data = self._load(self._history_file, {})
-        points = data.get(market_name) if isinstance(data, dict) else None
-        return points if isinstance(points, list) else []
-
-    # ------------------------------------------------------------- 订阅会话
-
-    def list_subscriptions(self) -> list[str]:
-        subs = self._load(self._subs_file, [])
-        return [s for s in subs if isinstance(s, str)] if isinstance(subs, list) else []
 
     # ------------------------------------------------------------- 登录中间态
 
@@ -234,9 +198,8 @@ class PluginStorage:
         self._save(self._auth_file, state)
 
     def stats(self) -> dict[str, int]:
-        history = self._load(self._history_file, {})
         return {
             "monitored_items": len(self._load(self._quotes_file, {}) or {}),
-            "history_points": sum(len(v) for v in (history or {}).values() if isinstance(v, list)),
-            "subscriptions": len(self.list_subscriptions()),
+            "item_metadata": len(self._load(self._meta_file, {}) or {}),
+            "known_sessions": len(self._load(self._sessions_file, {}) or {}),
         }
