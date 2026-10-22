@@ -86,8 +86,15 @@ class SubscriptionStore:
         if not market_name:
             return False, "只接受物品页链接。"
 
+        existing = self.find(uid, market_name)
         peers = [s for s in self._items if s.uid == uid]
-        if peers:
+        if existing is not None:
+            # 重复订阅同一物品应保持现有逐物品设置，不能被该用户第一条订阅覆盖。
+            interval = existing.interval
+            mode = existing.mode
+            sell_below = sell_below or existing.sell_below
+            buy_above = buy_above or existing.buy_above
+        elif peers:
             interval = peers[0].interval
             mode = peers[0].mode
             sell_below = sell_below or peers[0].sell_below
@@ -96,8 +103,12 @@ class SubscriptionStore:
             interval = self.config._default_interval  # noqa: SLF001
             mode = self.config.default_refresh_mode
 
-        existing = self.find(uid, market_name)
-        name = display_name or self.config.display_name_of(market_name) or prettify_market_name(market_name)
+        name = (
+            display_name
+            or (existing.display_name if existing is not None else "")
+            or self.config.display_name_of(market_name)
+            or prettify_market_name(market_name)
+        )
         sub = Subscription(
             uid=uid,
             market_name=market_name,

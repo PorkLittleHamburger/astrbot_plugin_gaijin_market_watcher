@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import time
 import unittest
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
@@ -89,6 +91,7 @@ class _SubscriptionConfig:
     def __init__(self, interval: int = 120) -> None:
         self.subscriptions = [Subscription("user", "id50381_f_16xl_usa", interval=interval)]
         self._default_interval = 30
+        self.default_refresh_mode = "only_change"
 
     def display_name_of(self, market_name: str) -> str:
         return market_name
@@ -109,6 +112,13 @@ class _WatcherNotifier:
 
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_webui_schema_does_not_expose_token_fields(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("jwt_token", schema)
+        self.assertNotIn("refresh_token", schema)
+
     def test_batching_is_keyed_by_umo_and_uid(self) -> None:
         notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
         umo = "test:GroupMessage:1"
@@ -145,6 +155,23 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertFalse(store.all()[0].enabled)
         self.assertEqual(store.all()[0].interval, 120)
+
+    def test_resubscribe_preserves_per_item_refresh_settings(self) -> None:
+        config = _SubscriptionConfig()
+        config.subscriptions = [
+            Subscription("user", "first", display_name="First", interval=30, mode="only_change"),
+            Subscription("user", "second", display_name="Second", interval=5, mode="always"),
+        ]
+        store = SubscriptionStore(config, lambda _subs: None)
+
+        ok, _ = store.subscribe("user", "https://trade.gaijin.net/market/1067/second")
+
+        self.assertTrue(ok)
+        updated = store.find("user", "second")
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.interval, 5)
+        self.assertEqual(updated.mode, "always")
+        self.assertEqual(updated.display_name, "Second")
 
     def test_remove_by_index_only_counts_current_users_subscriptions(self) -> None:
         config = _SubscriptionConfig()
@@ -266,6 +293,87 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(key, watcher._last_pushed)
         self.assertIn(key, watcher._next_notify)
 
+    def test_unconfirmed_delivery_does_not_advance_push_state(self) -> None:
+        config = _WatcherConfig(interval=5)
+        config.subscription.mode = "only_change"
+        notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
+        watcher = MarketWatcher(
+            client=object(),
+            auth=object(),
+            storage=_Storage(),
+            config=config,
+            notifier=notifier,
+            logger=_Logger(),
+        )
+        key = config.subscription.key
+        previous = Quote("item", sell_min=11.0, buy_max=8.0)
+        quote = Quote("item", sell_min=10.0, buy_max=9.0)
+
+        per_user, _ = watcher._evaluate_subscribers({"item": quote}, {"item": previous})
+
+        self.assertIn("user", per_user)
+        self.assertNotIn(key, watcher._last_pushed)
+        self.assertNotIn(key, watcher._next_notify)
+
+        # 第一次发送未送达后，即使最新缓存已经等于当前行情，也必须继续重试。
+        retry, _ = watcher._evaluate_subscribers({"item": quote}, {"item": quote})
+        self.assertIn("user", retry)
+
+        watcher._mark_delivered("user", per_user["user"])
+
+        self.assertIs(watcher._last_pushed[key], quote)
+        self.assertGreater(watcher._next_notify[key], time.time())
+
+    async def test_buffered_delivery_calls_ack_after_success(self) -> None:
+        class _DeliveringNotifier(Notifier):
+            async def _deliver(self, *_args, **_kwargs) -> bool:
+                return True
+
+        notifier = _DeliveringNotifier(None, _Storage(), _NotifierConfig(), _Logger())
+        event = TriggerEvent(
+            spec=MonitorSpec("item"),
+            quote=Quote("item", sell_min=10.0, buy_max=9.0),
+        )
+        delivered: list[tuple[str, list[TriggerEvent]]] = []
+        umo = "test:GroupMessage:1"
+
+        notifier._buffer_push(
+            "alice",
+            umo,
+            [event],
+            None,
+            "Alice",
+            10,
+            lambda uid, events: delivered.append((uid, events)),
+        )
+        notifier._pending[(umo, "alice")]["deadline"] = time.time() - 1
+        await notifier._flush_loop()
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0][0], "alice")
+        self.assertEqual(delivered[0][1][0].quote.market_name, "item")
+
+    async def test_auth_backoff_blocks_polling_for_full_duration(self) -> None:
+        class _UnexpectedAuth:
+            async def get_token(self, **_kwargs):
+                raise AssertionError("退避期内不应请求鉴权")
+
+        config = _WatcherConfig(interval=5)
+        watcher = MarketWatcher(
+            client=object(),
+            auth=_UnexpectedAuth(),
+            storage=_Storage(),
+            config=config,
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+        watcher._next_due["item"] = time.time()
+        watcher._auth_backoff_until = time.time() + 600
+
+        self.assertGreater(watcher._next_wait_seconds(), 500)
+        self.assertEqual(await watcher.poll_items(["item"]), [])
+        self.assertEqual(watcher.poll_count, 0)
+
     def test_empty_mention_is_not_treated_as_rendered(self) -> None:
         text, used_mention, _unknown = substitute("$mention", {"mention": ""})
 
@@ -360,10 +468,12 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         auth.bootstrap()
         config.refresh_token = "new-refresh-token"
 
-        auth.sync_config_tokens()
+        updated = auth.sync_config_tokens()
 
+        self.assertTrue(updated)
         self.assertEqual(auth.refresh_token, "new-refresh-token")
         self.assertEqual(auth.jwt, "")
+        self.assertFalse(auth.sync_config_tokens())
 
 
 if __name__ == "__main__":

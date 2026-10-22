@@ -63,8 +63,10 @@ class MarketWatcher:
         self.poll_count: int = 0
         #: 物品 -> 下次到点时间（抓取频率 = 该物品所有订阅里的最小值）
         self._next_due: dict[str, float] = {}
-        #: (用户, 物品) -> 他上次收到推送时的行情，作为下次对比基准
+        #: (用户, 物品) -> 他上次成功收到推送时的行情，作为下次对比基准
         self._last_pushed: dict[tuple[str, str], Quote] = {}
+        #: (用户, 物品) -> 当前用于比较的基线；发送失败时保持旧值以支持下一轮重试
+        self._comparison_base: dict[tuple[str, str], Quote | None] = {}
         #: (用户, 物品) -> 他下一次允许收到推送的时间（推送频率 = 他自己设的 interval）
         self._next_notify: dict[tuple[str, str], float] = {}
         #: 物品元数据（图标/标签）后台补齐，失败不影响主流程
@@ -155,10 +157,11 @@ class MarketWatcher:
         下限 1 秒；上限 MAX_SLEEP_SECONDS，保证配置改动能被及时感知。
         """
         now = time.time()
+        backoff_remaining = self._auth_backoff_remaining(now)
+        if backoff_remaining > 0:
+            return max(1.0, backoff_remaining)
         waits = [self._next_due[mn] - now for mn in self.config.watched_market_names if mn in self._next_due]
         wait = min(waits) if waits else 1.0
-        if now < self._auth_backoff_until:
-            wait = max(wait, self._auth_backoff_until - now)
         return max(1.0, min(wait, MAX_SLEEP_SECONDS))
 
     # ------------------------------------------------------------ 单次轮询
@@ -180,6 +183,10 @@ class MarketWatcher:
 
         返回值：本轮真正产生的事件（按用户聚合后展平），供调用方展示。
         """
+        if self._auth_backoff_remaining() > 0:
+            self.logger.debug("市场鉴权仍在退避期内，本轮跳过。")
+            return []
+
         self.poll_count += 1
         self.last_poll_at = time.time()
 
@@ -193,6 +200,7 @@ class MarketWatcher:
         except LoginRequiredError as exc:
             await self._handle_auth_failure(str(exc))
             return []
+        self._auth_backoff_until = 0.0
 
         # ---------- 0) 先读取上一轮行情 ----------
         # 必须在写入新行情之前读取，否则判定阶段拿到的"旧值"就是新值，
@@ -250,7 +258,12 @@ class MarketWatcher:
         per_user, user_names = self._evaluate_subscribers(quotes, previous_map)
 
         if per_user:
-            await self.notifier.push_to_subscribers(per_user, user_names, failures)
+            await self.notifier.push_to_subscribers(
+                per_user,
+                user_names,
+                failures,
+                on_delivered=self._mark_delivered,
+            )
 
         if failures:
             # 抓取失败也通知拥有者，便于排障（订阅者正文里也会带失败原因）
@@ -316,6 +329,8 @@ class MarketWatcher:
           * 推送频率由**订阅者自己**决定 = 每个 (用户, 物品) 有独立窗口，窗口内静默，
             窗口一开就把"相比他上次收到的变化"一次性汇报，因此慢订阅者不会被
             快订阅者的节奏带着刷屏。
+
+        这里只生成事件，不推进推送状态；基线必须由推送层确认送达后更新。
         """
         per_user: dict[str, list[TriggerEvent]] = {}
         user_names: dict[str, str] = {}
@@ -331,24 +346,45 @@ class MarketWatcher:
             if now < self._next_notify.get(key, 0.0):
                 # 还在他自己的安静窗口内：不打扰，也不推进窗口
                 continue
-            baseline = self._last_pushed.get(key) or previous_map.get(sub.market_name)
+            if key in self._comparison_base:
+                baseline = self._comparison_base[key]
+            else:
+                baseline = self._last_pushed.get(key) or previous_map.get(sub.market_name)
+                self._comparison_base[key] = baseline
             event = self.notifier.evaluate_subscription(sub, quote, baseline)
             if event is None:
                 continue
             per_user.setdefault(sub.uid, []).append(event)
             user_names.setdefault(sub.uid, self.storage.get_user_name(sub.uid))
-            # 只有真的推送了才消耗窗口，并以这条行情作为他下次的对比基准
-            self._last_pushed[key] = quote
-            notify_interval = (
-                ONLY_CHANGE_INTERVAL if sub.mode == REFRESH_ONLY_CHANGE else max(MIN_POLL_INTERVAL, sub.interval)
-            )
-            self._next_notify[key] = now + notify_interval
 
         # 订阅被删掉后不留垃圾
         for stale in [k for k in self._last_pushed if k not in alive]:
             self._last_pushed.pop(stale, None)
+            self._comparison_base.pop(stale, None)
             self._next_notify.pop(stale, None)
+        for stale in [k for k in self._comparison_base if k not in alive]:
+            self._comparison_base.pop(stale, None)
         return per_user, user_names
+
+    def _mark_delivered(self, uid: str, events: list[TriggerEvent]) -> None:
+        """推送确认送达后，推进该用户的对比基准与安静窗口。"""
+        now = time.time()
+        latest: dict[str, Quote] = {}
+        for event in events:
+            latest[event.quote.market_name] = event.quote
+
+        subscriptions = {(sub.uid, sub.market_name): sub for sub in self.config.enabled_subscriptions}
+        for market_name, quote in latest.items():
+            key = (uid, market_name)
+            sub = subscriptions.get(key)
+            if sub is None:
+                continue
+            self._last_pushed[key] = quote
+            self._comparison_base[key] = quote
+            notify_interval = (
+                ONLY_CHANGE_INTERVAL if sub.mode == REFRESH_ONLY_CHANGE else max(MIN_POLL_INTERVAL, sub.interval)
+            )
+            self._next_notify[key] = now + notify_interval
 
     # ------------------------------------------------------------ 错误处理
 
@@ -363,6 +399,14 @@ class MarketWatcher:
                 await self.on_auth_failure(reason)
             except Exception as exc:  # 通知失败不影响主循环
                 self.logger.warning(f"发送鉴权异常通知失败: {exc}")
+
+    def _auth_backoff_remaining(self, now: float | None = None) -> float:
+        """当前鉴权退避还剩多少秒；0 表示可以正常请求。"""
+        return max(0.0, self._auth_backoff_until - (time.time() if now is None else now))
+
+    def reset_auth_backoff(self) -> None:
+        """登录成功后立即解除退避，让下一次轮询可以马上继续。"""
+        self._auth_backoff_until = 0.0
 
     # ------------------------------------------------------------ 状态
 

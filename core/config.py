@@ -7,9 +7,8 @@ AstrBot 会依据 _conf_schema.json 生成配置文件并注入 __init__，
 【重要】账号密码字段说明：
   account_email / account_password 用于在 WebUI 里完成登录（含两步验证），
   它们会被写入插件配置文件（data/config/<插件名>_config.json）。
-  这是"把登录全部搬到配置界面"这一需求的必然结果 —— 配置项即持久化。
-  若你希望密码不落盘，把这两项留空并只填 refresh_token 即可（功能不受影响，
-  只是 refresh_token 失效后需要重新填写）。
+  登录成功后，JWT / refresh_token 仅由鉴权层写入 data/plugin_data，WebUI 不暴露
+  这两个字段；旧配置中残留的令牌键仍会被读取，以兼容已有安装。
 """
 
 from __future__ import annotations
@@ -238,7 +237,7 @@ class PluginConfig:
         has_token = bool(self.jwt_token or self.refresh_token)
         has_account = bool(self.account_email and self.account_password)
         if not has_token and not has_account:
-            hints.append("尚未配置任何凭据：请在 WebUI 插件配置完成登录，或填写 refresh_token / jwt_token。")
+            hints.append("尚未配置登录凭据：请在 WebUI 填写账号密码，然后在聊天中发送 /login。")
         if self.account_email and not self.account_password:
             hints.append("已填账号邮箱但未填密码，无法自动登录。")
 
