@@ -39,7 +39,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         return value
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on", "是")
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return bool(value)
     return default
 
@@ -75,7 +75,7 @@ def _as_str_list(value: Any) -> list[str]:
         return []
     if isinstance(value, str):
         parts = value.replace("\n", ",").split(",")
-    elif isinstance(value, (list, tuple, set)):
+    elif isinstance(value, list | tuple | set):
         parts = list(value)
     else:
         return []
@@ -167,7 +167,7 @@ class PluginConfig:
     def _entries(value: Any) -> list[Any]:
         if isinstance(value, dict):
             value = list(value.values())
-        return list(value) if isinstance(value, (list, tuple)) else []
+        return list(value) if isinstance(value, list | tuple) else []
 
     def _parse_entry(self, entry: Any) -> list[Subscription]:
         """把一条配置（用户组，或旧的单物品条）解析成若干 Subscription。"""
@@ -191,7 +191,7 @@ class PluginConfig:
         items = entry.get("items")
         if isinstance(items, dict):
             items = list(items.values())
-        for item in items if isinstance(items, (list, tuple)) else []:
+        for item in items if isinstance(items, list | tuple) else []:
             if isinstance(item, dict):  # 也容忍 [{item_url, sell_below, buy_above}]
                 _, market_name = extract_reference(
                     str(item.get("item_url") or item.get("url") or item.get("item") or "")

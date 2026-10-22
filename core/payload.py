@@ -207,11 +207,11 @@ def substitute(template: str, context: dict[str, Any]) -> tuple[str, bool, list[
         name = _resolve(raw_name)
         if name not in KNOWN_FIELDS:
             unknown.append(raw_name)
-        if name == "mention":
-            used_mention = True
         value = context.get(name, "")
         if value is None:
             return ""
+        if name == "mention" and str(value).strip():
+            used_mention = True
         if isinstance(value, bool):
             return "true" if value else "false"
         return str(value)

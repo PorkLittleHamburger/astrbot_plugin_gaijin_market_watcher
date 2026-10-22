@@ -16,6 +16,7 @@
     "description": "两步验证码（备用）",
     "type": "string",
     "default": "",
+    "secret": true,
     "hint": "平时用 /login <验证码> 提交；填这里保存也会自动提交并清空。"
   },
   "jwt_token": {

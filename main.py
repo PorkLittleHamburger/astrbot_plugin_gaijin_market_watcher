@@ -44,7 +44,7 @@ try:  # 常规：AstrBot 以包的形式加载插件
     from .core.constants import MIN_POLL_INTERVAL
     from .core.models import Subscription
     from .core.notifier import Notifier
-    from .core.resolver import extract_reference, prettify_market_name
+    from .core.resolver import extract_link_reference, prettify_market_name
     from .core.snapshot import SnapshotDispatcher
     from .core.storage import PluginStorage
     from .core.subscriptions import REJECT_HINT, SubscriptionStore
@@ -63,7 +63,7 @@ except ImportError:  # 兜底：以文件路径方式加载时
     from core.constants import MIN_POLL_INTERVAL
     from core.models import Subscription
     from core.notifier import Notifier
-    from core.resolver import extract_reference, prettify_market_name
+    from core.resolver import extract_link_reference, prettify_market_name
     from core.snapshot import SnapshotDispatcher
     from core.storage import PluginStorage
     from core.subscriptions import REJECT_HINT, SubscriptionStore
@@ -94,7 +94,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.9.3",
+    "2.9.4",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -239,8 +239,9 @@ class GaijinMarketWatcher(Star):
         self.client.language = self.cfg.language
         self.client.timeout = self.cfg.request_timeout
         self.client.retries = self.cfg.request_retries
+        self.auth.sync_config_tokens()
         # 各层持有的是同一个 cfg / storage 对象引用，无需重新注入
-        self.watcher.wake()
+        self.watcher.reconfigure()
 
     def _save_config(self, mutate=None) -> None:
         """把改动写回 AstrBot 配置，并热重载本插件的强类型配置。"""
@@ -422,7 +423,6 @@ class GaijinMarketWatcher(Star):
         """Gaijin 市场行情监控指令组。"""
 
     @gjm.command("help")
-    @gjm.command("help")
     async def gjm_help(self, event: AstrMessageEvent):
         """查看指令列表。"""
         self._remember(event)
@@ -443,7 +443,6 @@ class GaijinMarketWatcher(Star):
             "/gjm debug             排障信息"
         )
 
-    @gjm.command("id")
     @gjm.command("id")
     async def gjm_id(self, event: AstrMessageEvent):
         """查看本会话的 UID / UMO。"""
@@ -523,7 +522,7 @@ class GaijinMarketWatcher(Star):
         if not url:
             yield event.plain_result(f"用法：/gjm price <物品链接>\n{REJECT_HINT}")
             return
-        _, market_name = extract_reference(url)
+        _, market_name = extract_link_reference(url)
         if not market_name:
             yield event.plain_result(REJECT_HINT)
             return
@@ -561,11 +560,11 @@ class GaijinMarketWatcher(Star):
         arg = _args_after(event, "gjm", "shot")
         market_name = ""
         if arg:
-            _, market_name = extract_reference(arg)
+            _, market_name = extract_link_reference(arg)
         if not market_name:
             subs = self.cfg.subscriptions_of(str(event.get_sender_id()))
             if subs:
-                _, market_name = extract_reference(subs[0].item_url)
+                _, market_name = extract_link_reference(subs[0].item_url)
         if not market_name:
             yield event.plain_result(f"用法：/gjm shot <物品链接>\n{REJECT_HINT}")
             return
@@ -577,7 +576,6 @@ class GaijinMarketWatcher(Star):
             return
         yield event.image_result(str(path))
 
-    @gjm.command("status")
     @gjm.command("status")
     async def gjm_status(self, event: AstrMessageEvent):
         """查看运行与令牌状态。"""
@@ -664,7 +662,6 @@ class GaijinMarketWatcher(Star):
             yield event.plain_result(f"刷新失败：{exc}")
 
     @gjm.command("interval")
-    @gjm.command("interval")
     async def gjm_interval(self, event: AstrMessageEvent):
         """修改自己订阅的刷新间隔（秒）。"""
         self._remember(event)
@@ -682,7 +679,7 @@ class GaijinMarketWatcher(Star):
             return
         market_name = ""
         if len(parts) > 1:
-            _, market_name = extract_reference(" ".join(parts[1:]))
+            _, market_name = extract_link_reference(" ".join(parts[1:]))
             if not market_name:
                 yield event.plain_result(REJECT_HINT)
                 return
@@ -753,6 +750,8 @@ class GaijinMarketWatcher(Star):
     @gjm.command("token")
     async def gjm_token(self, event: AstrMessageEvent):
         """手动导入 refresh_token（正常用 /login 登录）。"""
+        # JWT / refresh_token 属于敏感凭据，必须在任何后续处理器之前截断传播。
+        event.stop_event()
         self._remember(event)
         if not self._is_owner(event):
             yield event.plain_result("仅插件拥有者可以设置令牌。")
@@ -763,26 +762,34 @@ class GaijinMarketWatcher(Star):
             return
 
         token = extract_refresh_token(arg)
-        if token:
-            self.auth.absorb(refresh_token=token)
-            self.save_refresh_token(token)
-        elif arg.startswith("eyJ") and arg.count(".") == 2:
-            self.auth.absorb(jwt=arg)
-            self._save_config(lambda raw: raw.__setitem__("jwt_token", arg))
-        else:
+        jwt_candidate = arg if arg.startswith("eyJ") and arg.count(".") == 2 else ""
+        if not token and not jwt_candidate:
             yield event.plain_result("无法识别输入，请提供含 refresh_token 的回跳链接或 JWT。")
             return
 
-        await event.send(event.plain_result("已保存，正在校验…"))
+        await event.send(event.plain_result("正在校验令牌…"))
         try:
-            await self.auth.try_refresh()
-            account = await self.auth.verify()
-            self.watcher.wake()
-            yield event.plain_result(
-                f"令牌有效，账号 {account.get('nick', '未知')}（uid {account.get('userId', '?')}）。"
-            )
+            if token:
+                jwt = await self.auth.validate_refresh_token(token)
+                account = await self.client.check_auth(jwt)
+            else:
+                jwt = jwt_candidate
+                account = await self.client.check_auth(jwt)
         except Exception as exc:
-            yield event.plain_result(f"令牌校验失败：{exc}")
+            yield event.plain_result(f"令牌校验失败，未修改现有配置：{exc}")
+            return
+
+        if token:
+            self.auth.absorb(jwt=jwt, refresh_token=token)
+            self.save_refresh_token(token)
+        else:
+            self.auth.absorb(jwt=jwt)
+            self._save_config(lambda raw: raw.__setitem__("jwt_token", jwt))
+
+        self.watcher.wake()
+        yield event.plain_result(
+            f"令牌有效并已保存，账号 {account.get('nick', '未知')}（uid {account.get('userId', '?')}）。"
+        )
 
     @gjm.command("debug")
     async def gjm_debug(self, event: AstrMessageEvent):

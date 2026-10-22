@@ -118,8 +118,9 @@ class Notifier:
         self.snapshot_provider = None
         #: 后台投递任务（等图的那些），避免拖住轮询循环
         self._tasks: set[asyncio.Task] = set()
-        #: 推送合并缓冲：umo -> {uid, name, events, failures, deadline}
-        self._pending: dict[str, dict] = {}
+        #: 推送合并缓冲：(umo, uid) -> {uid, name, events, failures, deadline}
+        #: 群聊中多个订阅者共享 UMO，必须继续按 UID 分开，否则会丢失 @。
+        self._pending: dict[tuple[str, str], dict] = {}
         self._flush_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ 会话解析
@@ -413,6 +414,9 @@ class Notifier:
         mention_ok = bool(plan and plan.style != platforms.STYLE_NONE)
         token = plan.text if mention_ok else ""
         at_unsupported = bool(plan and plan.style == platforms.STYLE_PLAIN_TEXT)
+        # 标准 At 组件无法通过字符串插值放入正文位置；模板中的 $mention 置空，
+        # 后面统一把真正的 At 组件加到消息链最前面。
+        template_mention = "" if plan and plan.style == platforms.STYLE_AT_COMPONENT else token
 
         body, used_mention = text, False
         template = (self.config.payload or "").strip()
@@ -427,7 +431,7 @@ class Notifier:
                 umo=umo,
                 uid=uid or mention_uid,
                 user_name=mention_name,
-                mention=token,
+                mention=template_mention,
                 platform=platform_type,
                 total_items=len(events),
                 snapshot_path=snapshot_path,
@@ -651,11 +655,12 @@ class Notifier:
         self, uid: str, umo: str, events: list[TriggerEvent], failures: list[Quote] | None, user_name: str, window: int
     ) -> None:
         """把本次事件并入缓冲，等窗口到点后合成一条消息发出。"""
-        entry = self._pending.get(umo)
+        key = (umo, uid)
+        entry = self._pending.get(key)
         now = time.time()
         if entry is None:
             entry = {"uid": uid, "name": user_name, "events": [], "failures": [], "deadline": now + window}
-            self._pending[umo] = entry
+            self._pending[key] = entry
         entry["uid"] = uid
         entry["name"] = user_name or entry.get("name", "")
         entry["events"].extend(events)
@@ -678,17 +683,18 @@ class Notifier:
                 if earliest > now:
                     await asyncio.sleep(min(earliest - now, 1.0))
                     continue
-                for umo in [u for u, e in self._pending.items() if e["deadline"] <= now]:
-                    entry = self._pending.pop(umo, None)
+                for key in [key for key, entry in self._pending.items() if entry["deadline"] <= now]:
+                    umo, uid = key
+                    entry = self._pending.pop(key, None)
                     if not entry or not entry["events"]:
                         continue
                     events = self._merge_events(entry["events"])
                     failures = entry["failures"] or None
                     try:
-                        if self._probe_needs_snapshot(events, umo, entry["uid"], entry["name"]):
-                            self._spawn_delivery(entry["uid"], umo, events, failures, entry["name"])
+                        if self._probe_needs_snapshot(events, umo, uid, entry["name"]):
+                            self._spawn_delivery(uid, umo, events, failures, entry["name"])
                         else:
-                            await self._deliver(entry["uid"], umo, events, failures, entry["name"])
+                            await self._deliver(uid, umo, events, failures, entry["name"])
                     except Exception as exc:
                         self.logger.warning(f"[GJM] 合并推送失败（{umo}）：{exc}")
         except asyncio.CancelledError:
@@ -699,12 +705,13 @@ class Notifier:
     async def shutdown(self) -> None:
         """停止插件时调用：先冲发缓冲，再取消任务。"""
         if self._pending:
-            for umo in list(self._pending):
-                entry = self._pending.pop(umo)
+            for key in list(self._pending):
+                umo, uid = key
+                entry = self._pending.pop(key)
                 if entry and entry["events"]:
                     with suppress(Exception):
                         await self._deliver(
-                            entry["uid"],
+                            uid,
                             umo,
                             self._merge_events(entry["events"]),
                             entry["failures"] or None,

@@ -236,14 +236,18 @@ class AuthManager:
         self._jwt: str = ""
         self._refresh_token: str = ""
         self._last_refresh_error: str = ""
+        self._config_jwt: str = ""
+        self._config_refresh_token: str = ""
 
     # ------------------------------------------------------------ 初始化
 
     def bootstrap(self) -> None:
         """合并「配置文件」与「落盘状态」；落盘的一定是插件刷新出来的最新值。"""
         state = self.storage.get_auth_state()
-        self._jwt = self.config.jwt_token or ""
-        self._refresh_token = self.config.refresh_token or ""
+        self._config_jwt = self.config.jwt_token or ""
+        self._config_refresh_token = self.config.refresh_token or ""
+        self._jwt = self._config_jwt
+        self._refresh_token = self._config_refresh_token
 
         stored_jwt = str(state.get("token") or "")
         stored_rt = str(state.get("refresh_token") or "")
@@ -253,6 +257,21 @@ class AuthManager:
             self._jwt = stored_jwt
         if stored_rt:
             self._refresh_token = stored_rt
+
+    def sync_config_tokens(self) -> None:
+        """应用 WebUI 中手动修改过的非空 JWT / refresh_token。
+
+        插件持久化状态通常会比配置文件里更晚，因此只在配置值确实变化时覆盖内存中的
+        令牌；未变化的空字段不会把已刷新令牌清掉。
+        """
+        config_jwt = self.config.jwt_token or ""
+        config_refresh = self.config.refresh_token or ""
+        if config_jwt and config_jwt != self._config_jwt:
+            self._jwt = config_jwt
+        if config_refresh and config_refresh != self._config_refresh_token:
+            self._refresh_token = config_refresh
+        self._config_jwt = config_jwt
+        self._config_refresh_token = config_refresh
 
     def absorb(self, jwt: str = "", refresh_token: str = "") -> None:
         """吸收新令牌并落盘（只写令牌，不写密码）。"""
@@ -339,6 +358,10 @@ class AuthManager:
         self._last_refresh_error = ""
         self.logger.info("已用 refresh_token 换取新的市场令牌。")
         return jwt
+
+    async def validate_refresh_token(self, refresh_token: str) -> str:
+        """验证候选 refresh_token 并返回 JWT，但不修改当前鉴权状态。"""
+        return await self.client.authorize_by_refresh_token(refresh_token)
 
     async def verify(self) -> dict:
         """校验当前令牌并返回账号信息。"""

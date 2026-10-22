@@ -105,6 +105,29 @@ class MarketWatcher:
         """立刻触发一轮轮询。"""
         self._wake.set()
 
+    def reconfigure(self) -> None:
+        """让新的订阅间隔即时约束现有调度窗口。"""
+        now = time.time()
+        watched = set(self.config.watched_market_names)
+        for market_name in watched:
+            proposed = now + max(MIN_POLL_INTERVAL, self.config.interval_of(market_name))
+            current = self._next_due.get(market_name)
+            self._next_due[market_name] = proposed if current is None else min(current, proposed)
+        for market_name in [name for name in self._next_due if name not in watched]:
+            self._next_due.pop(market_name, None)
+
+        active = {sub.key for sub in self.config.enabled_subscriptions}
+        for sub in self.config.enabled_subscriptions:
+            key = sub.key
+            if key not in self._last_pushed:
+                continue
+            proposed = now + max(MIN_POLL_INTERVAL, sub.interval)
+            current = self._next_notify.get(key)
+            self._next_notify[key] = proposed if current is None else min(current, proposed)
+        for key in [key for key in self._next_notify if key not in active]:
+            self._next_notify.pop(key, None)
+        self._wake.set()
+
     # ------------------------------------------------------------ 主循环
 
     async def _loop(self) -> None:
@@ -299,11 +322,11 @@ class MarketWatcher:
         alive: set[tuple[str, str]] = set()
 
         for sub in self.config.enabled_subscriptions:
+            key = (sub.uid, sub.market_name)
+            alive.add(key)
             quote = quotes.get(sub.market_name)
             if quote is None:
                 continue
-            key = (sub.uid, sub.market_name)
-            alive.add(key)
             if now < self._next_notify.get(key, 0.0):
                 # 还在他自己的安静窗口内：不打扰，也不推进窗口
                 continue

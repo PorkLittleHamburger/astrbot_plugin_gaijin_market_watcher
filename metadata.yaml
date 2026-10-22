@@ -11,9 +11,10 @@ desc: |
   - 推送合并：同一时间窗内多件物品的变化合成一条消息
   - 商品页快照：价格变化时可截取商品页，等渲染完成后与正文一起发出
   - 多平台适配：适配微信/qq平台
-version: 2.9.3
+version: 2.9.4
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
+astrbot_version: ">=4.23.6,<5"
 support_platforms:
   - qq_official
   - qq_official_webhook

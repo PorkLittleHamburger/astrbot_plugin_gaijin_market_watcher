@@ -75,6 +75,21 @@ def extract_reference(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def extract_link_reference(text: str) -> tuple[str | None, str | None]:
+    """只从 Gaijin 物品页链接中提取 (appid, market_name)。
+
+    配置兼容旧版裸 market_name 时仍使用 :func:`extract_reference`；聊天指令等
+    明确要求“物品页链接”的入口必须使用本函数。
+    """
+    text = clean_text(text)
+    if not text:
+        return None, None
+    matched = URL_RE.search(text)
+    if not matched:
+        return None, None
+    return (matched.group(1) or None), matched.group(2)
+
+
 def prettify_market_name(market_name: str) -> str:
     """把 ID 变成可读文本，作为显示名兜底。
 

@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 from .constants import MAX_POLL_INTERVAL, MIN_POLL_INTERVAL
 from .models import Subscription
-from .resolver import extract_reference, prettify_market_name
+from .resolver import extract_link_reference, prettify_market_name
 
 #: 给用户看的输入示例
 URL_EXAMPLE = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
@@ -61,7 +61,7 @@ class SubscriptionStore:
     @staticmethod
     def parse_url(url: str) -> str:
         """从用户输入中解析 market_name；非链接返回空串。"""
-        _, market_name = extract_reference(str(url or ""))
+        _, market_name = extract_link_reference(str(url or ""))
         return market_name
 
     def subscribe(
@@ -144,6 +144,7 @@ class SubscriptionStore:
                     sell_below=sub.sell_below if sell_below is None else max(0.0, sell_below),
                     buy_above=sub.buy_above if buy_above is None else max(0.0, buy_above),
                     enabled=sub.enabled if enabled is None else enabled,
+                    interval=sub.interval,
                 )
                 self._commit(subs)
                 return True, "已保存。"

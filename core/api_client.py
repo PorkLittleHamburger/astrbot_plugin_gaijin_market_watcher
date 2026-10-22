@@ -90,12 +90,16 @@ class GaijinMarketClient:
         self.logger = logger
 
         self._client: httpx.AsyncClient | None = None
+        self._client_timeout: float | None = None
         self._throttle_lock = asyncio.Lock()
         self._last_request_ts = 0.0
 
     # ------------------------------------------------------------ 生命周期
 
     async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is not None and not self._client.is_closed and self._client_timeout != self.timeout:
+            self._client.timeout = httpx.Timeout(self.timeout)
+            self._client_timeout = self.timeout
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout),
@@ -106,6 +110,7 @@ class GaijinMarketClient:
                     "Referer": "https://trade.gaijin.net/",
                 },
             )
+            self._client_timeout = self.timeout
         return self._client
 
     async def close(self) -> None:
@@ -161,10 +166,10 @@ class GaijinMarketClient:
             try:
                 client = await self._get_client()
                 response = await client.post(endpoint, data=payload)
-                if response.status_code >= 500:
+                if response.status_code >= 500 or response.status_code in (408, 429):
                     raise TransportError(action, f"HTTP {response.status_code}")
                 return self._unwrap(action, response.json())
-            except (httpx.HTTPError, ValueError) as exc:
+            except (httpx.HTTPError, ValueError, TransportError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
