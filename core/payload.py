@@ -10,8 +10,7 @@
             "买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)",
             "卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)",
             "买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)"
-        ],
-        "image": "$image"
+        ]
     }
 
 拼装规则（自上而下、逐行拼接成**一条**消息）：
@@ -21,12 +20,9 @@
   * **数组值 → 每个元素一行**；元素内部**禁止换行**（换行会被压成空格），
     所以把 `$content` 这种多行文本塞进数组元素也不会破坏“一行一项”；
   * 值为空的段（`$group` 在私聊、`$icon` 未缓存…）→ **自动省略**；
-  * 键名是 `image` / `icon` / `img` / `picture` / `photo` / `pic` / `cover` / `thumbnail` → 作为**图片附件**；
+  * 键名是 `icon` / `img` / `picture` / `photo` / `pic` / `cover` / `thumbnail` → 作为**图片附件**；
   * 键名是 `mention` / `at` → 输出 @ 标记（用了它插件就不再自动加 @）；
   * 多件物品：按“单件”逐件渲染后拼接。
-
-`$image` 特指**商品页快照**：需要现拍时插件会**等它渲染完**（约十几秒），
-然后把正文与图片**放在同一条消息**里发出；拍不了（没开快照 / 正在拍 / 失败）就只发正文。
 """
 
 from __future__ import annotations
@@ -37,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 #: 这些键会被当作**图片附件**而不是文字
-IMAGE_KEYS = frozenset({"image", "icon", "img", "picture", "photo", "pic", "cover", "thumbnail"})
+IMAGE_KEYS = frozenset({"icon", "img", "picture", "photo", "pic", "cover", "thumbnail"})
 
 #: 这些键会被当作 @ 标记
 MENTION_KEYS = frozenset({"mention", "at"})
@@ -78,7 +74,7 @@ ROUND_FIELDS: dict[str, str] = {
     "group": "群 ID（私聊为空串）",
     "platform": "平台类型，如 qq_official",
     "mention": "该平台的 @ 标记；用了它插件就不再自动加 @",
-    "mode": "推送模式 on_change / always / on_trigger",
+    "mode": "刷新模式 always / only_change",
     "failures": "本轮抓取失败的物品名（顿号分隔）",
     "failures_json": "失败明细 [{name, error}]",
     "appid": "游戏 appid",
@@ -106,7 +102,6 @@ ITEM_FIELDS: dict[str, str] = {
     "buy_count_change_amount": "求购挂单量变化量",
     "buy_count_change_rate": "求购挂单量变化率",
     "url": "商品页链接",
-    "image": "**商品页快照**（图片附件；需要现拍时会等它渲染完再一起发）",
     "icon": "物品图标 URL",
     "tags": "标签（顿号分隔，如 type:aircraft、quality:ultraRare）",
     "tags_json": "标签数组",
@@ -166,8 +161,6 @@ class RenderedMessage:
     lines: list[str] = field(default_factory=list)
     #: 直接可用的图片来源（本地路径或 URL）
     images: list[str] = field(default_factory=list)
-    #: 需要现拍一张商品页快照
-    needs_snapshot: bool = False
     used_mention: bool = False
     unknown_fields: list[str] = field(default_factory=list)
     error: str = ""
@@ -178,11 +171,11 @@ class RenderedMessage:
 
     @property
     def ok(self) -> bool:
-        return not self.error and bool(self.lines or self.images or self.needs_snapshot)
+        return not self.error and bool(self.lines or self.images)
 
     @property
     def empty(self) -> bool:
-        return not self.lines and not self.images and not self.needs_snapshot
+        return not self.lines and not self.images
 
 
 def single_line(text: str) -> str:
@@ -261,7 +254,7 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
     for key, raw_value in skeleton.items():
         lowered = str(key).lower()
 
-        # ---- 图片类键：附件（$image 特指商品页快照，需现拍）----
+        # ---- 图片类键：普通图片附件 ----
         if lowered in IMAGE_KEYS:
             if isinstance(raw_value, str):
                 value, used_mention, names = substitute(raw_value, context)
@@ -269,9 +262,6 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
                 value = value.strip()
                 if value:
                     result.images.append(value)
-                elif re.search(r"\$image(?![A-Za-z0-9_])", raw_value):
-                    # 还没拍到：告诉调用方“这一条需要现拍一张，拍完再一起发”
-                    result.needs_snapshot = True
             continue
 
         # ---- @ 类键 ----
@@ -341,7 +331,6 @@ def validate_payload(template: str) -> tuple[bool, str]:
             "sell_count_change_rate": "+1.8%",
             "buy_count_change_amount": "-5",
             "buy_count_change_rate": "-0.2%",
-            "image": "",
         }
     )
     for alias, target in ALIASES.items():
@@ -355,6 +344,4 @@ def validate_payload(template: str) -> tuple[bool, str]:
     kind = "JSON 骨架" if not model.error else "模板"
     if notes:
         return not model.error, f"{kind}；" + "；".join(notes)
-    return True, f"{kind}，可用（{len(model.lines)} 行" + (
-        "、含图片" if model.images or model.needs_snapshot else ""
-    ) + "）"
+    return True, f"{kind}，可用（{len(model.lines)} 行" + ("、含图片" if model.images else "") + "）"

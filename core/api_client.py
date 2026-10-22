@@ -187,7 +187,7 @@ class GaijinMarketClient:
         appid: str = DEFAULT_APPID,
         display_name: str = "",
     ) -> Quote:
-        """抓取某个物品的实时行情快照。"""
+        """抓取某个物品的实时行情数据。"""
         body = await self._post(
             EP_TRADE,
             ACT_BOOKS_BRIEF,

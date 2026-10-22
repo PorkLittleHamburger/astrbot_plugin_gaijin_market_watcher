@@ -31,7 +31,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "自动续期用，不需要密码；可用 /gjm token <回跳链接> 导入。"
+    "hint": "自动续期用，不需要密码；可在插件配置中手动填写。"
   },
   "appid": {
     "description": "游戏 appid",
@@ -51,46 +51,25 @@
     ]
   },
   "push_mode": {
-    "description": "推送时机",
+    "description": "默认刷新模式（兼容旧订阅）",
     "type": "string",
     "default": "on_change",
     "options": [
       "on_change",
       "always"
     ],
-    "hint": "on_change=价格变化时推（推荐）；always=每轮都推。"
+    "hint": "旧配置默认值；新订阅建议使用 /gjm refresh mode 设置。"
   },
   "mention_users": {
     "description": "推送时 @ 订阅者",
     "type": "bool",
     "default": true
   },
-  "snapshot_mode": {
-    "description": "网页快照",
-    "type": "string",
-    "default": "on_change",
-    "options": [
-      "off",
-      "on_change"
-    ],
-    "hint": "价格变化后补一张商品页截图（off=关闭；每张约 15 秒，受冷却限制）。"
-  },
-  "snapshot_cooldown": {
-    "description": "快照冷却（秒）",
-    "type": "int",
-    "default": 600,
-    "slider": {
-      "min": 0,
-      "max": 7200,
-      "step": 30
-    },
-    "hint": "同一会话两次截图的最小间隔（秒）。"
-  },
   "payload": {
     "description": "输出模板（payload）",
     "type": "text",
-    "default": "{\n    \"title\":\"$item_name行情报告\",\n    \"datetime\":\"时间：$datetime\",\n    \"content\":[\"卖单最低$sell_lowest_price，较上次变化$sell_change_amount($sell_change_rate)\",\n                \"买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)\",\n                \"卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)\",\n                \"买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)\"],\n    \"image\":\"$image\"\n}",
-    "hint": "JSON 骨架：键名不出现，按书写顺序逐行输出值；数组值一行一项；image 键=图片附件（会先拍快照再图文同发）。留空=可读文本；字段见 docs/PAYLOAD_FIELDS.md。"
+    "default": "{\n    \"title\":\"$item_name行情报告\",\n    \"datetime\":\"时间：$datetime\",\n    \"content\":[\"卖单最低$sell_lowest_price，较上次变化$sell_change_amount($sell_change_rate)\",\n                \"买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)\",\n                \"卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)\",\n                \"买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)\"]\n}",
+    "hint": "JSON 骨架：键名不出现，按书写顺序逐行输出值；数组值一行一项。留空=可读文本；字段见 docs/PAYLOAD_FIELDS.md。"
   },
   "push_batch_seconds": {
     "description": "推送合并窗口（秒）",
@@ -138,7 +117,7 @@
     "description": "拥有者 UID",
     "type": "list",
     "default": [],
-    "hint": "/login 与管理员指令的身份依据，发 /gjm id 查看；留空回退 AstrBot 管理员判定。"
+    "hint": "/login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空回退 AstrBot 管理员判定。"
   },
   "user_subscriptions": {
     "description": "用户订阅",
@@ -157,7 +136,7 @@
             "description": "订阅者 UID",
             "type": "string",
             "default": "",
-            "hint": "发 /gjm id 查看。"
+            "hint": "可发送 AstrBot 内置命令 /sid 查看。"
           },
           "note": {
             "description": "备注",
@@ -174,13 +153,46 @@
               "max": 3600,
               "step": 1
             },
-            "hint": "该用户名下所有物品共用；同一物品被多人订阅时按最小间隔抓取，但推送不会快于各自设定。"
+            "hint": "always 模式使用的默认刷新间隔；单个物品可在下方覆盖。"
+          },
+          "mode": {
+            "description": "刷新模式",
+            "type": "string",
+            "default": "only_change",
+            "options": [
+              "always",
+              "only_change"
+            ],
+            "hint": "always=按间隔推送且无变化也发送；only_change=每 5 秒检查，变化时发送。"
           },
           "items": {
-            "description": "订阅的物品",
-            "type": "list",
-            "default": [],
-            "hint": "每行一个物品页链接，如 https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+            "description": "订阅物品",
+            "type": "template_list",
+            "templates": {
+              "item_entry": {
+                "name": "物品",
+                "display_item": "url",
+                "items": {
+                  "url": {
+                    "description": "物品页链接",
+                    "type": "string",
+                    "default": "",
+                    "hint": "例如 https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+                  },
+                  "interval": {
+                    "description": "单独刷新间隔（秒）",
+                    "type": "int",
+                    "default": 30,
+                    "slider": {
+                      "min": 1,
+                      "max": 3600,
+                      "step": 1
+                    },
+                    "hint": "仅 always 模式使用；同一物品多人订阅时仍按最快策略抓取。"
+                  }
+                }
+              }
+            }
           }
         }
       }

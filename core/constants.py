@@ -63,13 +63,14 @@ PUSH_ALWAYS = "always"  # 每次轮询都推送
 PUSH_ON_TRIGGER = "on_trigger"  # 仅命中阈值时推送
 
 PUSH_MODES = (PUSH_ON_CHANGE, PUSH_ALWAYS)
+REFRESH_ONLY_CHANGE = "only_change"
+REFRESH_ALWAYS = "always"
+REFRESH_MODES = (REFRESH_ALWAYS, REFRESH_ONLY_CHANGE)
+ONLY_CHANGE_INTERVAL = 5
 #: 兜底模板（平台类型未知时使用）
 
 #: 数字格式化
 PRICE_DECIMALS = 2
-
-# 网页快照模式：关闭 / 价格变化后截 / 仅阈值触发时截
-SNAPSHOT_MODES = ("off", "on_change")
 
 #: 推送合并窗口（秒）：窗口内多件物品的变化合并成一条消息；0 = 不合并
 PUSH_BATCH_SECONDS = 10

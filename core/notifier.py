@@ -1,14 +1,13 @@
 """推送层：负责「判断要不要推」「渲染成人看的文本」「@ 到正确的人」。
 
-推送模式（push_mode）：
-  always      每次轮询都推送
-  on_change   仅当售价/求购价相对上一次发生变化时推送（首次观测会推一次作为基线）
-  on_trigger  仅当阈值**被触发**时推送
+刷新模式：
+  always       按订阅者设置的间隔轮询并推送，即使价格没有变化
+  only_change  固定每 5 秒轮询，只有售价/求购价变化时推送
 
 阈值采用「边沿触发」而非「电平触发」：
   只有当某个阈值从「不满足」变为「满足」的那一刻才告警；
   若价格持续低于阈值，不会每轮重复刷屏（刻意设计，避免打扰）。
-  判定无需额外状态：把上一轮快照重新算一遍阈值，比对差集即可。
+  判定无需额外状态：把上一轮行情重新算一遍阈值，比对差集即可。
 
 投递对象：**只有订阅者本人**（user_subscriptions）。
   抓取失败等异常则通知拥有者（owner_uids 解析出的会话）。
@@ -108,16 +107,10 @@ class Notifier:
         self.storage = storage
         self.config = config
         self.logger = logger
-        #: 推送成功后可选的“补一张网页快照”回调（由主插件注入，非阻塞）
-        self.snapshot_hook = None
         #: payload 模板的问题只提醒一次，避免刷屏
         self._payload_warned = False
         #: 出站失败通知限频（umo -> 上次通知时间）
         self._send_failure_at: dict[str, float] = {}
-        #: 现拍快照并等待完成的提供者（由主插件注入）
-        self.snapshot_provider = None
-        #: 后台投递任务（等图的那些），避免拖住轮询循环
-        self._tasks: set[asyncio.Task] = set()
         #: 推送合并缓冲：(umo, uid) -> {uid, name, events, failures, deadline}
         #: 群聊中多个订阅者共享 UMO，必须继续按 UID 分开，否则会丢失 @。
         self._pending: dict[tuple[str, str], dict] = {}
@@ -170,7 +163,9 @@ class Notifier:
 
     # ------------------------------------------------------------ 推送判定
 
-    def evaluate(self, spec: MonitorSpec, quote: Quote, previous: Quote | None) -> TriggerEvent | None:
+    def evaluate(
+        self, spec: MonitorSpec, quote: Quote, previous: Quote | None, *, mode: str = ""
+    ) -> TriggerEvent | None:
         """判断这条监控是否应该推送，返回事件对象或 None。"""
         if not quote.ok:
             return None
@@ -184,12 +179,12 @@ class Notifier:
             quote.buy_max, previous.buy_max if previous else None
         )
 
-        mode = self.config.push_mode
-        if mode == PUSH_ALWAYS:
+        effective_mode = mode or self.config.push_mode
+        if effective_mode == PUSH_ALWAYS:
             should_push = True
-        elif mode == PUSH_ON_TRIGGER:
+        elif effective_mode == PUSH_ON_TRIGGER:
             should_push = bool(new_hits)
-        else:  # PUSH_ON_CHANGE
+        else:  # PUSH_ON_CHANGE / REFRESH_ONLY_CHANGE
             should_push = changed or bool(new_hits)
 
         if not should_push:
@@ -201,11 +196,12 @@ class Notifier:
             previous=previous,
             reasons=list(new_hits.values()),
             active_hits=hits_now,
+            mode=effective_mode,
         )
 
     def evaluate_subscription(self, sub: Subscription, quote: Quote, previous: Quote | None) -> TriggerEvent | None:
         """用户订阅的判定：复用全局规则，但阈值来自订阅记录本身。"""
-        return self.evaluate(sub.to_spec(), quote, previous)
+        return self.evaluate(sub.to_spec(), quote, previous, mode=sub.mode)
 
     # ------------------------------------------------------------ 文本渲染
 
@@ -235,7 +231,7 @@ class Notifier:
             return ""
         return parts[2].rsplit("_", 1)[-1]
 
-    def _item_context(self, event: TriggerEvent, snapshot_path: str = "") -> dict:
+    def _item_context(self, event: TriggerEvent) -> dict:
         """单件物品在 payload 模板里的字段（含变化量与变化率）。"""
         quote, previous = event.quote, event.previous
         old_sell = previous.sell_min if previous else None
@@ -266,7 +262,6 @@ class Notifier:
             "sell_count_change_rate": _change_rate(old_sell_depth, quote.sell_depth),
             "buy_count_change_rate": _change_rate(old_buy_depth, quote.buy_depth),
             "url": f"https://trade.gaijin.net/market/{quote.app_id or self.config.appid}/{quote.market_name}",
-            "image": snapshot_path,
             "icon": icon,
             "tags": "、".join(tags),
             "tags_json": tags,
@@ -292,11 +287,10 @@ class Notifier:
         mention: str = "",
         platform: str = "",
         total_items: int | None = None,
-        snapshot_path: str = "",
     ) -> dict:
         """组装 payload 模板可用到的全部字段（整轮 + 本轮主物品的快捷字段）。"""
         now = time.time()
-        items = [self._item_context(event, snapshot_path) for event in events]
+        items = [self._item_context(event) for event in events]
         context: dict = {
             "title": "Gaijin 行情",
             #: 按你示例：2026-09-24-17-32-33（全横线）
@@ -312,15 +306,14 @@ class Notifier:
             "group": self._group_of(umo),
             "platform": platform,
             "mention": mention,
-            "mode": self.config.push_mode,
+            "mode": events[0].mode if events else self.config.push_mode,
             "failures": "、".join(quote.title for quote in (failures or [])),
             "failures_json": [{"name": q.title, "error": q.error} for q in (failures or [])],
             "appid": self.config.appid,
-            "image": snapshot_path,
         }
         primary = next((event for event in events if event.reasons), events[0] if events else None)
         if primary is not None:
-            context.update(self._item_context(primary, snapshot_path))
+            context.update(self._item_context(primary))
         return context
 
     def _render_item(self, event: TriggerEvent) -> str:
@@ -400,7 +393,6 @@ class Notifier:
         events: list[TriggerEvent] | None = None,
         failures: list[Quote] | None = None,
         uid: str = "",
-        snapshot_path: str = "",
     ) -> bool:
         """向单个会话发送，并按平台选择正确的 @ 方式（策略已固化，无配置项）。
 
@@ -434,11 +426,10 @@ class Notifier:
                 mention=template_mention,
                 platform=platform_type,
                 total_items=len(events),
-                snapshot_path=snapshot_path,
             )
             for index, event in enumerate(events):
                 context = dict(base)
-                context.update(self._item_context(event, snapshot_path))
+                context.update(self._item_context(event))
                 if index > 0:
                     # @ 只放在第一份里，多件时不会重复 @
                     context["mention"] = ""
@@ -521,20 +512,6 @@ class Notifier:
             with suppress(Exception):
                 await self._send_plain(owner, text)
 
-    def set_snapshot_hook(self, hook) -> None:
-        """注入网页快照回调；签名 (umo, market_names, *, triggered) -> bool。"""
-        self.snapshot_hook = hook
-
-    def _fire_snapshot(self, umo: str, events: list[TriggerEvent]) -> None:
-        """本轮推送成功后，按配置决定是否补一张商品页快照。"""
-        if self.snapshot_hook is None or not events:
-            return
-        target = next((ev for ev in events if ev.reasons), events[0])
-        try:
-            self.snapshot_hook(umo, [target.quote.market_name], triggered=bool(target.reasons))
-        except Exception as exc:
-            self.logger.debug(f"网页快照回调异常：{exc}")
-
     async def push(self, text: str, umos: list[str] | None = None) -> int:
         """向指定会话列表推送，返回成功条数。
 
@@ -549,13 +526,6 @@ class Notifier:
             sent += 1 if await self._send(umo, text) else 0
         return sent
 
-    def set_snapshot_provider(self, provider) -> None:
-        """注入“现拍快照并等待完成”的提供者。
-
-        签名：async def (umo, market_name, *, triggered) -> str（返回图片路径，失败返回空串）
-        """
-        self.snapshot_provider = provider
-
     async def _deliver(
         self,
         uid: str,
@@ -564,31 +534,7 @@ class Notifier:
         failures: list[Quote] | None,
         user_name: str,
     ) -> bool:
-        """投递给单个订阅者。
-
-        配置了 payload 且模板里带图片时：**先拍快照、等它渲染完**，再把正文与图片
-        放在同一条消息里发出（不再另外补发一张图片）。
-        """
-        template = (self.config.payload or "").strip()
-        want_snapshot = False
-        if template:
-            probe = render_message(
-                template,
-                self.build_payload_context(events, failures, umo=umo, uid=uid, user_name=user_name),
-            )
-            want_snapshot = probe.needs_snapshot
-
-        snapshot_path = ""
-        if want_snapshot and self.snapshot_provider is not None and events:
-            target = next((event for event in events if event.reasons), events[0])
-            try:
-                snapshot_path = await self.snapshot_provider(
-                    umo, target.quote.market_name, triggered=bool(target.reasons)
-                )
-            except Exception as exc:
-                self.logger.warning(f"[GJM] 快照拍摄失败（{target.quote.market_name}）：{exc}")
-                snapshot_path = ""
-
+        """投递给单个订阅者。"""
         text = self.render_digest(events, failures, title="Gaijin 行情")
         sent = await self._send(
             umo,
@@ -598,42 +544,10 @@ class Notifier:
             events=events,
             failures=failures,
             uid=uid,
-            snapshot_path=snapshot_path,
         )
         if not sent:
             await self._notify_send_failure(umo)
-        if sent and not (template and want_snapshot):
-            # 没有 payload（或模板不含图片）时沿用旧行为：推送后单独补一张快照
-            self._fire_snapshot(umo, events)
         return sent
-
-    def _probe_needs_snapshot(self, events: list[TriggerEvent], umo: str, uid: str, user_name: str) -> bool:
-        """这次投递是否需要现拍一张图（模板里有图片占位且还没拍到）。"""
-        template = (self.config.payload or "").strip()
-        if not template or not events:
-            return False
-        probe = render_message(
-            template,
-            self.build_payload_context(events, None, umo=umo, uid=uid, user_name=user_name),
-        )
-        return probe.needs_snapshot
-
-    def _spawn_delivery(
-        self,
-        uid: str,
-        umo: str,
-        events: list[TriggerEvent],
-        failures: list[Quote] | None,
-        user_name: str,
-    ) -> None:
-        """把一次投递丢到后台（等图要十几秒，不能卡住轮询循环）。"""
-        try:
-            task = asyncio.create_task(self._deliver(uid, umo, events, failures, user_name))
-        except RuntimeError as exc:
-            self.logger.debug(f"[GJM] 当前上下文无法调度投递任务：{exc}")
-            return
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------ 推送合并
 
@@ -691,10 +605,7 @@ class Notifier:
                     events = self._merge_events(entry["events"])
                     failures = entry["failures"] or None
                     try:
-                        if self._probe_needs_snapshot(events, umo, uid, entry["name"]):
-                            self._spawn_delivery(uid, umo, events, failures, entry["name"])
-                        else:
-                            await self._deliver(uid, umo, events, failures, entry["name"])
+                        await self._deliver(uid, umo, events, failures, entry["name"])
                     except Exception as exc:
                         self.logger.warning(f"[GJM] 合并推送失败（{umo}）：{exc}")
         except asyncio.CancelledError:
@@ -717,9 +628,6 @@ class Notifier:
                             entry["failures"] or None,
                             entry["name"],
                         )
-        for task in list(self._tasks):
-            task.cancel()
-        self._tasks.clear()
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
@@ -748,10 +656,6 @@ class Notifier:
             user_name = names.get(uid, "")
             if window > 0:
                 self._buffer_push(uid, umo, events, failures, user_name, window)
-                sent += 1
-                continue
-            if self._probe_needs_snapshot(events, umo, uid, user_name):
-                self._spawn_delivery(uid, umo, events, failures, user_name)
                 sent += 1
                 continue
             if await self._deliver(uid, umo, events, failures, user_name):

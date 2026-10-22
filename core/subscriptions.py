@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .constants import MAX_POLL_INTERVAL, MIN_POLL_INTERVAL
+from .constants import MAX_POLL_INTERVAL, MIN_POLL_INTERVAL, REFRESH_MODES
 from .models import Subscription
 from .resolver import extract_link_reference, prettify_market_name
 
@@ -53,6 +53,10 @@ class SubscriptionStore:
     def subscribers_of(self, market_name: str) -> list[Subscription]:
         return [s for s in self._items if s.market_name == market_name and s.enabled]
 
+    def subscriptions_of(self, uid: str) -> list[Subscription]:
+        """按配置展示顺序返回某个用户的全部订阅。"""
+        return [s for s in self._items if s.uid == uid]
+
     def find(self, uid: str, market_name: str) -> Subscription | None:
         return next((s for s in self._items if s.uid == uid and s.market_name == market_name), None)
 
@@ -85,10 +89,12 @@ class SubscriptionStore:
         peers = [s for s in self._items if s.uid == uid]
         if peers:
             interval = peers[0].interval
+            mode = peers[0].mode
             sell_below = sell_below or peers[0].sell_below
             buy_above = buy_above or peers[0].buy_above
         else:
             interval = self.config._default_interval  # noqa: SLF001
+            mode = self.config.default_refresh_mode
 
         existing = self.find(uid, market_name)
         name = display_name or self.config.display_name_of(market_name) or prettify_market_name(market_name)
@@ -100,6 +106,7 @@ class SubscriptionStore:
             buy_above=max(0.0, buy_above),
             enabled=True,
             interval=interval,
+            mode=mode,
         )
         if existing is not None:
             subs = [sub if s.key == sub.key else s for s in self._items]
@@ -123,6 +130,20 @@ class SubscriptionStore:
         self._commit(remaining)
         return True, f"已取消订阅：{market_name}"
 
+    def remove_by_index(self, uid: str, index: int) -> tuple[bool, str]:
+        """按 ``/gjm my`` 显示的编号删除当前用户的一条订阅。"""
+        own = self.subscriptions_of(uid)
+        if not own:
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+        if index < 1 or index > len(own):
+            return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
+
+        target = own[index - 1]
+        remaining = [s for s in self._items if s.key != target.key]
+        self._commit(remaining)
+        name = target.display_name or target.market_name
+        return True, f"已取消订阅：{name}（剩余 {len(own) - 1} 件）"
+
     def update(
         self,
         uid: str,
@@ -145,6 +166,7 @@ class SubscriptionStore:
                     buy_above=sub.buy_above if buy_above is None else max(0.0, buy_above),
                     enabled=sub.enabled if enabled is None else enabled,
                     interval=sub.interval,
+                    mode=sub.mode,
                 )
                 self._commit(subs)
                 return True, "已保存。"
@@ -153,13 +175,16 @@ class SubscriptionStore:
     def set_interval(self, uid: str, seconds: int, market_name: str = "") -> tuple[bool, str]:
         """设置某用户订阅的刷新间隔；market_name 为空则作用于其全部订阅。"""
         value = max(MIN_POLL_INTERVAL, min(MAX_POLL_INTERVAL, int(seconds)))
-        # 间隔是“用户级”的：同一个用户的所有订阅共用同一个间隔
-        targets = [s for s in self._items if s.uid == uid]
+        targets = [s for s in self._items if s.uid == uid and (not market_name or s.market_name == market_name)]
         if not targets:
+            if market_name:
+                return False, "你没有订阅这件物品。"
             return False, "你还没有订阅任何物品，先用 /gjm sub <物品链接> 订阅。"
+
+        target_keys = {s.key for s in targets}
         updated: list[Subscription] = []
         for sub in self._items:
-            if sub in targets:
+            if sub.key in target_keys:
                 updated.append(
                     Subscription(
                         uid=sub.uid,
@@ -169,12 +194,49 @@ class SubscriptionStore:
                         buy_above=sub.buy_above,
                         enabled=sub.enabled,
                         interval=value,
+                        mode=sub.mode,
                     )
                 )
             else:
                 updated.append(sub)
         self._commit(updated)
+        if market_name:
+            return True, f"已把该物品刷新间隔设为 {value} 秒。"
         return True, f"已把你的刷新间隔设为 {value} 秒（对你名下 {len(targets)} 件物品同时生效）。"
+
+    def set_interval_by_index(self, uid: str, seconds: int, index: int) -> tuple[bool, str]:
+        own = self.subscriptions_of(uid)
+        if not own:
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+        if index < 1 or index > len(own):
+            return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
+        return self.set_interval(uid, seconds, own[index - 1].market_name)
+
+    def set_refresh_mode(self, uid: str, mode: str) -> tuple[bool, str]:
+        """设置当前用户全部订阅的刷新模式。"""
+        if mode not in REFRESH_MODES:
+            return False, "刷新模式只能是 always 或 only_change。"
+        targets = [s for s in self._items if s.uid == uid]
+        if not targets:
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+
+        updated = [
+            Subscription(
+                uid=sub.uid,
+                market_name=sub.market_name,
+                display_name=sub.display_name,
+                sell_below=sub.sell_below,
+                buy_above=sub.buy_above,
+                enabled=sub.enabled,
+                interval=sub.interval,
+                mode=mode,
+            )
+            if sub.uid == uid
+            else sub
+            for sub in self._items
+        ]
+        self._commit(updated)
+        return True, f"已把刷新模式设为 {mode}（对你名下 {len(targets)} 件物品生效）。"
 
     def _commit(self, subs: list[Subscription]) -> None:
         """先更新本地权威列表，再落盘；保证后续读取立刻看到最新状态。"""

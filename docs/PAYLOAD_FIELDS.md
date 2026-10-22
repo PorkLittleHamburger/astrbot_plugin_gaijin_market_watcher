@@ -1,6 +1,6 @@
 # payload 输出模板 · 字段清单
 
-> 插件版本 `v2.8.5`　|　共 **48** 个字段 + **19** 个别名
+> 插件版本 `v2.16.0`
 
 配置项 `payload` 决定一条推送**长什么样**。**出厂已预填下面的模板**；清空该项 = 回到默认可读文本。
 
@@ -13,8 +13,7 @@
     "content":["卖单最低$sell_lowest_price，较上次变化$sell_change_amount($sell_change_rate)",
                 "买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)",
                 "卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)",
-                "买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)"],
-    "image":"$image"
+                "买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)"]
 }
 ```
 
@@ -28,7 +27,6 @@ F-16XL（美国）行情报告
 买单最高43.00，较上次变化+2.00(+4.9%)
 卖单数33,较上次变化+2(+6.5%)
 买单数21,较上次变化-6(-22.2%)
-[图片]
 ```
 
 ## 拼装规则
@@ -39,21 +37,10 @@ F-16XL（美国）行情报告
 | 字符串值 | 替换 `$变量` 后成为**一行** |
 | **数组值** | **一个元素一行**；元素内部**不换行**（换行会被压成空格） |
 | 空值段 | 自动省略（`$group` 在私聊、`$icon` 未缓存…），不产生空行 |
-| 键名 `image`/`icon`/`img`/`picture`… | 作为**图片附件**，不占文字 |
+| 键名 `icon`/`img`/`picture`… | 作为**图片附件**，不占文字 |
 | 键名 `mention`/`at` | 输出 @ 标记；用了它插件就不再自动加 @（平台在该会话不支持 @ 时为空值，自动省略） |
 | 多件物品 | 按“单件”模板逐件渲染后拼接 |
 | 渲染失败/为空 | 记警告并**整条回退**为可读文本 |
-
-## 图片：等拍完再一起发
-
-键值里出现 `$image` 时，插件会：
-
-1. 按 `snapshot_mode` / `snapshot_cooldown` 判断是否现拍；
-2. **等商品页快照渲染完**（约十几秒）；
-3. 把正文与图片**放在同一条消息里**发出（不再另发一张图）。
-
-拍不了（未开快照 / 冷却中 / 渲染失败）→ 只发正文，不影响推送。
-开快照的投递走后台任务，因此**不会拖住价格抓取循环**。
 
 ## 一、整轮字段
 
@@ -70,7 +57,7 @@ F-16XL（美国）行情报告
 | `$group` | 群 ID（私聊为空串） |
 | `$platform` | 平台类型，如 qq_official |
 | `$mention` | 该平台的 @ 标记；用了它插件就不再自动加 @。QQ 官方私聊（C2C）、不认 At 的平台等场景为空值（自动省略） |
-| `$mode` | 推送模式 on_change / always / on_trigger |
+| `$mode` | 刷新模式 always / only_change |
 | `$failures` | 本轮抓取失败的物品名（顿号分隔） |
 | `$failures_json` | 失败明细 [{name, error}] |
 | `$appid` | 游戏 appid |
@@ -99,7 +86,6 @@ F-16XL（美国）行情报告
 | `$buy_count_change_amount` | 求购挂单量变化量 |
 | `$buy_count_change_rate` | 求购挂单量变化率 |
 | `$url` | 商品页链接 |
-| `$image` | **商品页快照**（图片附件；需要现拍时会等它渲染完再一起发） |
 | `$icon` | 物品图标 URL |
 | `$tags` | 标签（顿号分隔，如 type:aircraft、quality:ultraRare） |
 | `$tags_json` | 标签数组 |

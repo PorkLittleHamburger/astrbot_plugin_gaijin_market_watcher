@@ -23,7 +23,7 @@ class PluginStorage:
       names.json    物品 ID -> 显示名 的缓存（让推送里显示人话）
       sessions.json 用户 UID -> 会话 UMO 的映射（支持"用 UID 配置推送对象"）
       pending_login.json 待提交验证码的登录中间态（会话 Cookie + 表单字段，不含密码）
-      quotes.json   每个物品"最近一次"的行情快照（用于比对价格变化）
+      quotes.json   每个物品"最近一次"的行情数据（用于比对价格变化）
       history.json  每个物品最近 N 条行情（用于走势回溯）
       subs.json     订阅会话（umo 列表）
       auth.json     鉴权状态（刷新后的最新 JWT / refresh_token）
@@ -66,7 +66,7 @@ class PluginStorage:
         except Exception as exc:
             self.logger.warning(f"写入 {path.name} 失败: {exc}")
 
-    # ------------------------------------------------------------- 行情快照
+    # ------------------------------------------------------------- 最近行情
 
     def get_last_quote(self, market_name: str) -> Quote | None:
         raw = self._load(self._quotes_file, {})

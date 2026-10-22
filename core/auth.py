@@ -359,10 +359,6 @@ class AuthManager:
         self.logger.info("已用 refresh_token 换取新的市场令牌。")
         return jwt
 
-    async def validate_refresh_token(self, refresh_token: str) -> str:
-        """验证候选 refresh_token 并返回 JWT，但不修改当前鉴权状态。"""
-        return await self.client.authorize_by_refresh_token(refresh_token)
-
     async def verify(self) -> dict:
         """校验当前令牌并返回账号信息。"""
         token = await self.get_token()

@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .constants import DEFAULT_APPID, DEFAULT_POLL_INTERVAL, PRICE_DECIMALS
+from .constants import DEFAULT_APPID, DEFAULT_POLL_INTERVAL, PRICE_DECIMALS, REFRESH_ONLY_CHANGE
 
 
 def fmt_price(value: float | None) -> str:
@@ -32,7 +32,7 @@ def fmt_delta(new: float | None, old: float | None) -> str:
 
 @dataclass(slots=True)
 class Quote:
-    """某个物品在某一时刻的行情快照。"""
+    """某个物品在某一时刻的行情记录。"""
 
     market_name: str
     sell_min: float | None = None  # 实时最低售价(GJN)  <- SELL[0]
@@ -99,6 +99,8 @@ class Subscription:
     enabled: bool = True
     #: 该订阅者希望的刷新间隔（秒）。同一物品被多人订阅时取最小值。
     interval: int = DEFAULT_POLL_INTERVAL
+    #: always=按 interval 推送；only_change=固定 5 秒检查，变化时推送。
+    mode: str = REFRESH_ONLY_CHANGE
 
     @property
     def key(self) -> tuple[str, str]:
@@ -139,3 +141,5 @@ class TriggerEvent:
     reasons: list[str] = field(default_factory=list)
     #: 当前仍处于满足状态的阈值 key -> 文案
     active_hits: dict[str, str] = field(default_factory=dict)
+    #: 该事件所属订阅的刷新模式。
+    mode: str = ""

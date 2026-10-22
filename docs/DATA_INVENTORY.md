@@ -109,9 +109,8 @@ depth      = SELL 570 / BUY 2168
 | `history.json` | 每物品最近 **200** 个点：`{t, sell, buy}`（可用于迷你走势） |
 | `names.json` | `market_name → 显示名` 缓存 |
 | `sessions.json` | `UID → 会话 UMO` + 用户昵称（推送与 @ 的前提） |
-| `subs.json` | 订阅快照（每用户每物品一条） |
+| `subs.json` | 订阅状态（每用户每物品一条） |
 | `auth.json` | `refresh_token` + `token` + 更新时间（**不含账号密码**） |
-| `snapshots/` | 商品页快照 PNG，自动保留最近 20 张 |
 
 ---
 
@@ -120,7 +119,7 @@ depth      = SELL 570 / BUY 2168
 | 数据 | 用途 |
 | --- | --- |
 | UID（= 用户 openid） | 身份判定、按人订阅、@ 目标 |
-| 昵称 | @ 时的显示名、`/gjm id` |
+| 昵称 | @ 时的显示名、推送文案 |
 | 群 ID / 会话 UMO | 推送目标定位 |
 | 平台类型（`peral` 等） | 决定 @ 的实现方式、是否启用平台专有能力 |
 | 是否管理员 | 未配置拥有者 UID 时的回退判定 |
@@ -141,7 +140,7 @@ depth      = SELL 570 / BUY 2168
 
 1. **100 档盘口** → 买卖价差、挂单墙、深度图；数据每轮已在手，纯浪费
 2. **`marketFee`** → 推送里直接给「到手价」，避免误判收益
-3. ~~**`tags` / `color` / `icon`**~~ → **已实现**：缓存后用 payload 的 `$tags` / `$rarity` / `$color` / `$image`
+3. ~~**`tags` / `color` / `icon`**~~ → **已实现**：缓存后用 payload 的 `$tags` / `$rarity` / `$color` / `$icon`
 4. **`history.json` 200 点** → 迷你走势（现在只存不读）
 5. `cln_get_pair_stat` → 官方走势图（需再试参）
 6. `cln_market_search` → 用名称检索来订阅（现在严格只接受链接）

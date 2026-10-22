@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from core.api_client import GaijinMarketClient
 from core.auth import AuthManager
+from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, Subscription, TriggerEvent
 from core.notifier import Notifier
 from core.payload import substitute
@@ -145,6 +146,87 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(store.all()[0].enabled)
         self.assertEqual(store.all()[0].interval, 120)
 
+    def test_remove_by_index_only_counts_current_users_subscriptions(self) -> None:
+        config = _SubscriptionConfig()
+        config.subscriptions = [
+            Subscription("user", "first", display_name="First"),
+            Subscription("other", "other-item", display_name="Other"),
+            Subscription("user", "second", display_name="Second"),
+        ]
+        saved: list[Subscription] = []
+        store = SubscriptionStore(config, saved.extend)
+
+        ok, message = store.remove_by_index("user", 2)
+
+        self.assertTrue(ok)
+        self.assertIn("Second", message)
+        self.assertEqual([sub.market_name for sub in store.all()], ["first", "other-item"])
+        self.assertFalse(store.remove_by_index("user", 9)[0])
+
+    def test_refresh_commands_support_global_and_per_item_targets(self) -> None:
+        config = _SubscriptionConfig()
+        config.subscriptions = [
+            Subscription("user", "first", interval=30),
+            Subscription("other", "other-item", interval=40),
+            Subscription("user", "second", interval=30),
+        ]
+        saved: list[Subscription] = []
+        store = SubscriptionStore(config, saved.extend)
+
+        ok, _ = store.set_interval("user", 12, "first")
+        self.assertTrue(ok)
+        self.assertEqual(store.subscriptions_of("user")[0].interval, 12)
+        self.assertEqual(store.subscriptions_of("user")[1].interval, 30)
+        self.assertEqual(store.subscriptions_of("other")[0].interval, 40)
+
+        ok, _ = store.set_interval_by_index("user", 18, 2)
+        self.assertTrue(ok)
+        self.assertEqual(store.subscriptions_of("user")[1].interval, 18)
+
+        ok, _ = store.set_refresh_mode("user", "always")
+        self.assertTrue(ok)
+        self.assertTrue(all(sub.mode == "always" for sub in store.subscriptions_of("user")))
+        self.assertEqual(store.subscriptions_of("other")[0].mode, "only_change")
+
+    def test_config_parses_per_item_interval_and_refresh_mode(self) -> None:
+        link = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+        config = PluginConfig(
+            {
+                "user_subscriptions": [
+                    {
+                        "uid": "fast",
+                        "interval": 30,
+                        "mode": "always",
+                        "items": [{"url": link, "interval": 9}],
+                    },
+                    {
+                        "uid": "slow",
+                        "interval": 30,
+                        "mode": "only_change",
+                        "items": [link],
+                    },
+                ]
+            }
+        )
+
+        fast = config.subscriptions_of("fast")[0]
+        slow = config.subscriptions_of("slow")[0]
+        self.assertEqual((fast.interval, fast.mode), (9, "always"))
+        self.assertEqual((slow.interval, slow.mode), (30, "only_change"))
+        self.assertEqual(config.interval_of("id50381_f_16xl_usa"), 5)
+
+    def test_refresh_modes_differ_on_unchanged_quote(self) -> None:
+        notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
+        spec = MonitorSpec("item")
+        quote = Quote("item", sell_min=10.0, buy_max=9.0)
+
+        only_change = notifier.evaluate(spec, quote, quote, mode="only_change")
+        always = notifier.evaluate(spec, quote, quote, mode="always")
+
+        self.assertIsNone(only_change)
+        self.assertIsNotNone(always)
+        self.assertEqual(always.mode, "always")
+
     def test_reconfigure_shortens_existing_windows(self) -> None:
         config = _WatcherConfig(interval=10)
         watcher = MarketWatcher(
@@ -281,33 +363,6 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         auth.sync_config_tokens()
 
         self.assertEqual(auth.refresh_token, "new-refresh-token")
-        self.assertEqual(auth.jwt, "")
-
-    async def test_candidate_refresh_token_validation_does_not_mutate_auth(self) -> None:
-        class Config:
-            jwt_token = ""
-            refresh_token = "existing"
-            account_email = ""
-            account_password = ""
-
-        class Storage:
-            def get_auth_state(self) -> dict:
-                return {}
-
-            def set_auth_state(self, *_args, **_kwargs) -> None:
-                pass
-
-        class Client:
-            async def authorize_by_refresh_token(self, refresh_token: str) -> str:
-                return "jwt-for-" + refresh_token
-
-        auth = AuthManager(Client(), Storage(), Config(), _Logger())
-        auth.bootstrap()
-
-        jwt = await auth.validate_refresh_token("candidate")
-
-        self.assertEqual(jwt, "jwt-for-candidate")
-        self.assertEqual(auth.refresh_token, "existing")
         self.assertEqual(auth.jwt, "")
 
 

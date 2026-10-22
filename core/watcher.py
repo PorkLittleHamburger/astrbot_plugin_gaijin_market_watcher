@@ -22,7 +22,7 @@ from contextlib import suppress
 
 from .api_client import AuthExpiredError, MarketApiError
 from .auth import LoginRequiredError
-from .constants import MIN_POLL_INTERVAL
+from .constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
 from .models import Quote, TriggerEvent
 
 #: 令牌失效后的重试间隔（秒），避免反复打扰用户
@@ -121,7 +121,8 @@ class MarketWatcher:
             key = sub.key
             if key not in self._last_pushed:
                 continue
-            proposed = now + max(MIN_POLL_INTERVAL, sub.interval)
+            interval = ONLY_CHANGE_INTERVAL if sub.mode == REFRESH_ONLY_CHANGE else max(MIN_POLL_INTERVAL, sub.interval)
+            proposed = now + interval
             current = self._next_notify.get(key)
             self._next_notify[key] = proposed if current is None else min(current, proposed)
         for key in [key for key in self._next_notify if key not in active]:
@@ -163,7 +164,7 @@ class MarketWatcher:
     # ------------------------------------------------------------ 单次轮询
 
     async def poll_once(self) -> list[TriggerEvent]:
-        """立即轮询全部物品（/gjm now、唤醒时使用）。"""
+        """立即轮询全部物品（/gjm mysub、唤醒时使用）。"""
         return await self.poll_items(self.config.watched_market_names)
 
     async def poll_due(self) -> list[TriggerEvent]:
@@ -193,8 +194,8 @@ class MarketWatcher:
             await self._handle_auth_failure(str(exc))
             return []
 
-        # ---------- 0) 先快照"上一轮"行情 ----------
-        # 必须在写入新快照之前读取，否则判定阶段拿到的"旧值"就是新值，
+        # ---------- 0) 先读取上一轮行情 ----------
+        # 必须在写入新行情之前读取，否则判定阶段拿到的"旧值"就是新值，
         # 会导致永远检测不到价格变化。
         previous_map: dict[str, Quote | None] = {
             market_name: self.storage.get_last_quote(market_name) for market_name in watched
@@ -338,7 +339,10 @@ class MarketWatcher:
             user_names.setdefault(sub.uid, self.storage.get_user_name(sub.uid))
             # 只有真的推送了才消耗窗口，并以这条行情作为他下次的对比基准
             self._last_pushed[key] = quote
-            self._next_notify[key] = now + max(MIN_POLL_INTERVAL, sub.interval)
+            notify_interval = (
+                ONLY_CHANGE_INTERVAL if sub.mode == REFRESH_ONLY_CHANGE else max(MIN_POLL_INTERVAL, sub.interval)
+            )
+            self._next_notify[key] = now + notify_interval
 
         # 订阅被删掉后不留垃圾
         for stale in [k for k in self._last_pushed if k not in alive]:

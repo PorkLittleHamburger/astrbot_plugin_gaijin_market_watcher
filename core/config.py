@@ -24,10 +24,13 @@ from .constants import (
     DEFAULT_TIMEOUT,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
+    ONLY_CHANGE_INTERVAL,
     PUSH_BATCH_SECONDS,
     PUSH_MODES,
     PUSH_ON_CHANGE,
-    SNAPSHOT_MODES,
+    REFRESH_ALWAYS,
+    REFRESH_MODES,
+    REFRESH_ONLY_CHANGE,
 )
 from .models import Subscription
 from .payload import validate_payload
@@ -119,6 +122,7 @@ class PluginConfig:
         # 刷新间隔不再全局配置，而是跟着每条订阅走（见 interval_of）。
         push_mode = _as_str(self.raw.get("push_mode"), PUSH_ON_CHANGE)
         self.push_mode: str = push_mode if push_mode in PUSH_MODES else PUSH_ON_CHANGE
+        self.default_refresh_mode: str = REFRESH_ALWAYS if self.push_mode == REFRESH_ALWAYS else REFRESH_ONLY_CHANGE
 
         # ---------- 身份与路由 ----------
         # 拥有者（管理员）：按 **UID** 判定，/login 与管理员指令都用它。
@@ -126,13 +130,6 @@ class PluginConfig:
         self.owner_uids: list[str] = _as_str_list(self.raw.get("owner_uids"))
         #: 推送时是否 @ 订阅者（群聊场景必需；QQ 官方会自动走文本内嵌标记）
         self.mention_users: bool = _as_bool(self.raw.get("mention_users"), True)
-
-        # ---------- 网页快照（价格变化时补一张商品页截图） ----------
-        #: off=不截图；on_change=价格变化后截图；on_trigger=仅阈值触发时截图
-        snapshot_mode = _as_str(self.raw.get("snapshot_mode"), "on_change").lower()
-        self.snapshot_mode: str = snapshot_mode if snapshot_mode in SNAPSHOT_MODES else "on_change"
-        #: 同一会话两次截图的最小间隔（秒），防止高频变化把截图队列打爆
-        self.snapshot_cooldown: int = max(0, _as_int(self.raw.get("snapshot_cooldown"), 600))
 
         # ---------- 输出模板（payload） ----------
         #: 用 $字段 占位，渲染成 JSON 当作推送正文；留空 = 保持默认可读文本
@@ -185,6 +182,7 @@ class PluginConfig:
             "buy_above": 0.0,
             "enabled": _as_bool(entry.get("enabled"), True),
             "interval": _clamp_interval(entry.get("interval"), self._default_interval),
+            "mode": self._refresh_mode(entry.get("mode"), self.default_refresh_mode),
         }
 
         out: list[Subscription] = []
@@ -204,7 +202,8 @@ class PluginConfig:
                         market_name=market_name,
                         display_name=_as_str(item.get("name")) or shared["display_name"],
                         enabled=_as_bool(item.get("enabled"), shared["enabled"]),
-                        interval=shared["interval"],
+                        interval=_clamp_interval(item.get("interval"), shared["interval"]),
+                        mode=self._refresh_mode(item.get("mode"), shared["mode"]),
                     )
                 )
                 continue
@@ -219,6 +218,11 @@ class PluginConfig:
             if market_name:
                 out.append(Subscription(uid=uid, market_name=market_name, **shared))
         return out
+
+    @staticmethod
+    def _refresh_mode(value: Any, default: str) -> str:
+        mode = _as_str(value, default).lower()
+        return mode if mode in REFRESH_MODES else default
 
     # ------------------------------------------------------------------ 校验
 
@@ -247,8 +251,6 @@ class PluginConfig:
             hints.append("未配置拥有者 UID，/login 等管理指令将回退为 AstrBot 管理员判定。")
         if not self.subscriptions:
             hints.append("当前没有任何用户订阅，推送将无处可去（可用 /gjm sub <物品链接> 添加）。")
-        if self.snapshot_mode != "off" and self.snapshot_cooldown < 60:
-            hints.append(f"网页快照冷却仅 {self.snapshot_cooldown} 秒：每张图约需 15 秒渲染，过短会造成截图排队。")
         if self.payload.strip():
             ok, note = validate_payload(self.payload)
             if not ok:
@@ -260,8 +262,16 @@ class PluginConfig:
     # ------------------------------------------------------------------ 间隔
 
     def interval_of(self, market_name: str) -> int:
-        """某件物品的实际抓取间隔 = 订阅它的那些用户里最小的 interval。"""
-        values = [s.interval for s in self.enabled_subscriptions if s.market_name == market_name]
+        """某件物品的实际抓取间隔。
+
+        ``always`` 使用用户配置的 interval；``only_change`` 固定 5 秒。
+        多人订阅时取所有策略中的最小值。
+        """
+        values = [
+            ONLY_CHANGE_INTERVAL if s.mode == REFRESH_ONLY_CHANGE else s.interval
+            for s in self.enabled_subscriptions
+            if s.market_name == market_name
+        ]
         return min(values) if values else DEFAULT_POLL_INTERVAL
 
     @property

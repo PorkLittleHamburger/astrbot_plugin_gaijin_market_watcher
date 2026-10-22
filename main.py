@@ -38,14 +38,13 @@ from astrbot.api.star import Context, Star, StarTools, register
 try:  # 常规：AstrBot 以包的形式加载插件
     from .core import platforms
     from .core.api_client import GaijinMarketClient
-    from .core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt, extract_refresh_token
+    from .core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from .core.config import PluginConfig
     from .core.config_watch import ConfigFileWatcher
-    from .core.constants import MIN_POLL_INTERVAL
+    from .core.constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
     from .core.models import Subscription
     from .core.notifier import Notifier
     from .core.resolver import extract_link_reference, prettify_market_name
-    from .core.snapshot import SnapshotDispatcher
     from .core.storage import PluginStorage
     from .core.subscriptions import REJECT_HINT, SubscriptionStore
     from .core.watcher import MarketWatcher
@@ -57,14 +56,13 @@ except ImportError:  # 兜底：以文件路径方式加载时
 
     from core import platforms
     from core.api_client import GaijinMarketClient
-    from core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt, extract_refresh_token
+    from core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from core.config import PluginConfig
     from core.config_watch import ConfigFileWatcher
-    from core.constants import MIN_POLL_INTERVAL
+    from core.constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
     from core.models import Subscription
     from core.notifier import Notifier
     from core.resolver import extract_link_reference, prettify_market_name
-    from core.snapshot import SnapshotDispatcher
     from core.storage import PluginStorage
     from core.subscriptions import REJECT_HINT, SubscriptionStore
     from core.watcher import MarketWatcher
@@ -94,7 +92,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.9.4",
+    "2.16.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -123,18 +121,6 @@ class GaijinMarketWatcher(Star):
 
         self.subscriptions = SubscriptionStore(self.cfg, self._persist_subscriptions, self.logger)
         self.notifier = Notifier(self.context, self.storage, self.cfg, self.logger)
-        #: 网页快照：价格变化后异步补一张商品页截图（失败只丢图，不影响推送）
-        self.snapshots = SnapshotDispatcher(
-            context=self.context,
-            config=lambda: self.cfg,
-            storage=self.storage,
-            jwt_provider=self.auth.get_token,
-            appid_provider=lambda: self.cfg.appid,
-            data_dir=self.data_dir,
-            logger=self.logger,
-        )
-        self.notifier.set_snapshot_hook(self.snapshots.schedule)
-        self.notifier.set_snapshot_provider(self.snapshots)
         self.watcher = MarketWatcher(
             client=self.client,
             auth=self.auth,
@@ -181,8 +167,6 @@ class GaijinMarketWatcher(Star):
 
     async def terminate(self) -> None:
         """插件停用 / 卸载时调用：务必释放后台任务与连接。"""
-        with contextlib.suppress(Exception):
-            await self.snapshots.shutdown()
         with contextlib.suppress(Exception):
             await self.notifier.shutdown()
         with contextlib.suppress(Exception):
@@ -261,7 +245,7 @@ class GaijinMarketWatcher(Star):
 
     def _persist_subscriptions(self, subs: list[Subscription]) -> None:
         """订阅列表落盘：写成 template_list 结构，WebUI 配置页里可直接查看/修改。"""
-        # 同一个 UID 折叠成一条：物品写成链接列表，刷新间隔挂在用户上
+        # 同一个 UID 折叠成一条；物品分别保存链接和刷新间隔。
         grouped: dict[str, dict] = {}
         for sub in subs:
             entry = grouped.setdefault(
@@ -272,19 +256,22 @@ class GaijinMarketWatcher(Star):
                     "uid": sub.uid,
                     "note": self.storage.get_user_name(sub.uid) or sub.display_name,
                     "interval": sub.interval,
+                    "mode": sub.mode,
                     "items": [],
                 },
             )
-            # 同组里以“任一启用即为启用”“间隔取最小值”为准
+            # 同组里以“任一启用即为启用”为准。
             entry["enabled"] = entry["enabled"] or sub.enabled
-            entry["interval"] = min(int(entry["interval"] or sub.interval), int(sub.interval))
             url = f"https://trade.gaijin.net/market/{self.cfg.appid}/{sub.market_name}"
-            if url not in entry["items"]:
-                entry["items"].append(url)
+            if not any(item.get("url") == url for item in entry["items"]):
+                entry["items"].append(
+                    {
+                        "__template_key": "item_entry",
+                        "url": url,
+                        "interval": int(sub.interval),
+                    }
+                )
         self._save_config(lambda raw: raw.__setitem__("user_subscriptions", list(grouped.values())))
-
-    def save_refresh_token(self, token: str) -> None:
-        self._save_config(lambda raw: raw.__setitem__("refresh_token", token))
 
     def save_twofa_code(self, code: str) -> None:
         """写回验证码字段（提交后清空，避免验证码长期留痕）。"""
@@ -430,38 +417,14 @@ class GaijinMarketWatcher(Star):
             "Gaijin 行情监控\n"
             "/login [验证码]        登录 / 提交两步验证码\n"
             "/gjm sub <链接>        订阅物品\n"
-            "/gjm unsub <链接>      取消订阅\n"
-            "/gjm my                我的订阅\n"
-            "/gjm list              被监控的物品与最新行情\n"
+            "/gjm unsub <链接|编号> 取消订阅\n"
+            "/gjm mysub             先刷新行情，再显示我的订阅 + 全局列表\n"
             "/gjm price <链接>      查询单个物品行情\n"
-            "/gjm shot [链接]       拍摄商品页快照\n"
-            "/gjm id                查看本会话 UID / UMO\n"
             "/gjm status            运行与令牌状态\n"
-            "/gjm now               立即刷新一轮\n"
-            "/gjm interval <秒>     设置我的刷新间隔\n"
-            "/gjm token <回跳链接>  导入 refresh_token\n"
+            "/gjm refresh mode <模式>  always / only_change\n"
+            "/gjm refresh interval <秒> [链接|编号]\n"
             "/gjm debug             排障信息"
         )
-
-    @gjm.command("id")
-    async def gjm_id(self, event: AstrMessageEvent):
-        """查看本会话的 UID / UMO。"""
-        self._remember(event)
-        umo = event.unified_msg_origin or ""
-        parts = umo.split(":", 2)
-        lines = [
-            "【本会话信息】",
-            f"平台：{parts[0] if parts else ''}",
-            f"UMO：{umo}",
-            f"UID：{event.get_sender_id()}",
-            f"昵称：{event.get_sender_name() or '未知'}",
-            f"群 ID：{event.get_group_id() or '（私聊）'}",
-            f"是否拥有者：{'是' if self._is_owner(event) else '否'}",
-            f"我的订阅：{len(self.cfg.subscriptions_of(str(event.get_sender_id())))} 条",
-            "",
-            "配置「拥有者 UID」时填上面的 UID。",
-        ]
-        yield event.plain_result("\n".join(lines))
 
     @gjm.command("sub")
     async def gjm_sub(self, event: AstrMessageEvent):
@@ -484,32 +447,86 @@ class GaijinMarketWatcher(Star):
 
     @gjm.command("unsub")
     async def gjm_unsub(self, event: AstrMessageEvent):
-        """取消订阅物品（只接受物品页链接）。"""
+        """按 /gjm mysub 的编号或物品页链接取消订阅。"""
         self._remember(event)
-        url = _args_after(event, "gjm", "unsub")
-        if not url:
-            yield event.plain_result(f"用法：/gjm unsub <物品链接>\n{REJECT_HINT}")
+        arg = _args_after(event, "gjm", "unsub").strip()
+        if not arg:
+            yield event.plain_result("用法：/gjm unsub <编号>\n或：/gjm unsub <物品链接>\n先发送 /gjm mysub 查看编号。")
             return
-        ok, message = self.subscriptions.unsubscribe(str(event.get_sender_id() or ""), url)
-        yield event.plain_result(message)
-
-    @gjm.command("my")
-    async def gjm_my(self, event: AstrMessageEvent):
-        """查看我订阅的物品。"""
-        self._remember(event)
         uid = str(event.get_sender_id() or "")
-        subs = self.cfg.subscriptions_of(uid)
-        if not subs:
-            yield event.plain_result("你还没有订阅。用 /gjm sub <物品链接> 订阅。")
+        serial = arg[1:] if arg.startswith("#") else arg
+        if serial.isdigit():
+            ok, message = self.subscriptions.remove_by_index(uid, int(serial))
+        else:
+            ok, message = self.subscriptions.unsubscribe(uid, arg)
+        yield event.plain_result(message)
+        if ok:
+            self.watcher.wake()
+
+    @gjm.command("mysub")
+    async def gjm_mysub(self, event: AstrMessageEvent):
+        """先刷新行情，再查看我的订阅与全局列表。"""
+        self._remember(event)
+        action = _args_after(event, "gjm", "mysub").strip().lower()
+        if action:
+            yield event.plain_result("用法：/gjm mysub")
             return
-        lines = [f"【我的订阅 · {len(subs)} 件】"]
-        for index, sub in enumerate(subs, start=1):
-            quote = self.storage.get_last_quote(sub.market_name)
-            lines.append(f"{index}. {sub.display_name or sub.market_name}")
-            lines.append(f"   {self.item_url(sub.market_name)}")
+
+        if self.cfg.watched_market_names:
+            await event.send(event.plain_result("正在刷新行情，请稍候…"))
+            try:
+                await self.watcher.poll_once()
+            except Exception as exc:
+                yield event.plain_result(f"刷新失败，以下为最近缓存：{exc}")
+
+        uid = str(event.get_sender_id() or "")
+        subs = self.subscriptions.subscriptions_of(uid)
+        sections: list[str] = []
+        if not subs:
+            sections.append("【我的订阅】\n你还没有订阅。用 /gjm sub <物品链接> 订阅。")
+        else:
+            lines = [f"【我的订阅 · {len(subs)} 件】"]
+            for index, sub in enumerate(subs, start=1):
+                quote = self.storage.get_last_quote(sub.market_name)
+                if sub.mode == REFRESH_ONLY_CHANGE:
+                    mode_text = f"only_change，每 {ONLY_CHANGE_INTERVAL} 秒检查"
+                else:
+                    mode_text = f"always，每 {sub.interval} 秒"
+                lines.append(f"{index}. {sub.display_name or sub.market_name}（{mode_text}）")
+                lines.append(f"   {self.item_url(sub.market_name)}")
+                if quote and quote.ok:
+                    lines.append(f"   售出 {quote.sell_min} / 求购 {quote.buy_max} GJN")
+            lines.append("")
+            lines.append("删除订阅：/gjm unsub <编号>，例如 /gjm unsub 1")
+            sections.append("\n".join(lines))
+        sections.append(self._global_list_text())
+        yield event.plain_result("\n\n".join(sections))
+
+    def _global_list_text(self) -> str:
+        """渲染全局被监控物品列表，供 ``/gjm mysub`` 使用。"""
+        names = self.cfg.watched_market_names
+        if not names:
+            return "没有被订阅的物品。用 /gjm sub <物品链接> 订阅。"
+
+        lines = ["【被监控的物品】"]
+        for index, market_name in enumerate(names, start=1):
+            quote = self.storage.get_last_quote(market_name)
+            title = (
+                self.storage.get_item_name(market_name)
+                or self.cfg.display_name_of(market_name)
+                or prettify_market_name(market_name)
+            )
+            subs = self.cfg.subscribers_of(market_name)
+            lines.append(f"{index}. {title}（{len(subs)} 人订阅）")
+            lines.append(f"   {self.item_url(market_name)}")
             if quote and quote.ok:
                 lines.append(f"   售出 {quote.sell_min} / 求购 {quote.buy_max} GJN")
-        yield event.plain_result("\n".join(lines))
+            else:
+                lines.append("   暂无行情数据")
+
+        lines.append("")
+        lines.append("提示：物品由用户订阅产生，用 /gjm sub <物品链接> 添加。")
+        return "\n".join(lines)
 
     def item_url(self, market_name: str) -> str:
         return f"https://trade.gaijin.net/market/{self.cfg.appid}/{market_name}"
@@ -553,29 +570,6 @@ class GaijinMarketWatcher(Star):
             f"{self.item_url(market_name)}"
         )
 
-    @gjm.command("shot")
-    async def gjm_shot(self, event: AstrMessageEvent):
-        """拍摄物品页快照（用于验证截图功能）。"""
-        self._remember(event)
-        arg = _args_after(event, "gjm", "shot")
-        market_name = ""
-        if arg:
-            _, market_name = extract_link_reference(arg)
-        if not market_name:
-            subs = self.cfg.subscriptions_of(str(event.get_sender_id()))
-            if subs:
-                _, market_name = extract_link_reference(subs[0].item_url)
-        if not market_name:
-            yield event.plain_result(f"用法：/gjm shot <物品链接>\n{REJECT_HINT}")
-            return
-        await event.send(event.plain_result("正在打开商品页截图…（约 15 秒）"))
-        try:
-            path = await self.snapshots.capture(market_name)
-        except Exception as exc:
-            yield event.plain_result(f"截图失败：{exc}")
-            return
-        yield event.image_result(str(path))
-
     @gjm.command("status")
     async def gjm_status(self, event: AstrMessageEvent):
         """查看运行与令牌状态。"""
@@ -616,77 +610,57 @@ class GaijinMarketWatcher(Star):
                 lines.append(f"  ! {uid} 未解析到会话")
         yield event.plain_result("\n".join(lines))
 
-    @gjm.command("list")
-    async def gjm_list(self, event: AstrMessageEvent):
-        """列出被订阅的物品与最近一次行情。"""
+    @gjm.group("refresh")
+    def gjm_refresh(self):
+        """刷新策略指令组。"""
+
+    @gjm_refresh.command("mode")
+    async def gjm_refresh_mode(self, event: AstrMessageEvent):
+        """设置当前用户全部订阅的刷新模式。"""
         self._remember(event)
-        names = self.cfg.watched_market_names
-        if not names:
-            yield event.plain_result("没有被订阅的物品。用 /gjm sub <物品链接> 订阅。")
+        mode = _args_after(event, "gjm", "refresh", "mode").strip().lower()
+        if mode == "on_change":
+            mode = "only_change"
+        if mode not in {"always", "only_change"}:
+            yield event.plain_result("用法：/gjm refresh mode <always|only_change>")
             return
+        ok, message = self.subscriptions.set_refresh_mode(str(event.get_sender_id() or ""), mode)
+        yield event.plain_result(message)
+        if ok:
+            self.watcher.reconfigure()
 
-        lines = ["【被监控的物品】"]
-        for index, market_name in enumerate(names, start=1):
-            quote = self.storage.get_last_quote(market_name)
-            title = (
-                self.storage.get_item_name(market_name)
-                or self.cfg.display_name_of(market_name)
-                or prettify_market_name(market_name)
-            )
-            subs = self.cfg.subscribers_of(market_name)
-            lines.append(f"{index}. {title}（{len(subs)} 人订阅）")
-            lines.append(f"   {self.item_url(market_name)}")
-            if quote and quote.ok:
-                lines.append(f"   售出 {quote.sell_min} / 求购 {quote.buy_max} GJN")
-            else:
-                lines.append("   暂无行情数据")
-
-        lines.append("")
-        lines.append("提示：物品由用户订阅产生，用 /gjm sub <物品链接> 添加。")
-        yield event.plain_result("\n".join(lines))
-
-    @gjm.command("now")
-    async def gjm_now(self, event: AstrMessageEvent):
-        """立即手动刷新一轮行情。"""
+    @gjm_refresh.command("interval")
+    async def gjm_refresh_interval(self, event: AstrMessageEvent):
+        """设置当前用户的全局或单物品刷新间隔（秒）。"""
         self._remember(event)
-        if not self._is_owner(event):
-            yield event.plain_result("仅插件拥有者可以触发手动刷新。")
-            return
-        if not self.cfg.watched_market_names:
-            yield event.plain_result("没有被监控的物品。")
-            return
-        yield event.plain_result("正在刷新行情，请稍候…")
-        try:
-            await self.watcher.poll_once()
-        except Exception as exc:
-            yield event.plain_result(f"刷新失败：{exc}")
-
-    @gjm.command("interval")
-    async def gjm_interval(self, event: AstrMessageEvent):
-        """修改自己订阅的刷新间隔（秒）。"""
-        self._remember(event)
-        parts = _args_after(event, "gjm", "interval").split()
+        parts = _args_after(event, "gjm", "refresh", "interval").split()
         if not parts:
             yield event.plain_result(
-                f"用法：/gjm interval <秒> [物品链接]\n"
-                f"（最小 {MIN_POLL_INTERVAL} 秒，建议 ≥ 10；不填链接则作用于你的全部订阅）"
+                f"用法：/gjm refresh interval <秒> [物品链接|编号]\n"
+                f"（最小 {MIN_POLL_INTERVAL} 秒；不填目标则作用于你的全部订阅）"
             )
             return
         try:
             value = int(float(parts[0]))
-        except ValueError:
-            yield event.plain_result("秒数没看懂，请给整数，例如 /gjm interval 30")
+        except (ValueError, OverflowError):
+            yield event.plain_result("秒数没看懂，请给整数，例如 /gjm refresh interval 30")
             return
-        market_name = ""
-        if len(parts) > 1:
-            _, market_name = extract_link_reference(" ".join(parts[1:]))
+        uid = str(event.get_sender_id() or "")
+        target = " ".join(parts[1:]).strip()
+        serial = target[1:] if target.startswith("#") else target
+        if serial.isdigit():
+            ok, message = self.subscriptions.set_interval_by_index(uid, value, int(serial))
+        elif target:
+            _, market_name = extract_link_reference(target)
             if not market_name:
                 yield event.plain_result(REJECT_HINT)
                 return
-        ok, message = self.subscriptions.set_interval(str(event.get_sender_id() or ""), value, market_name)
+            ok, message = self.subscriptions.set_interval(uid, value, market_name)
+        else:
+            ok, message = self.subscriptions.set_interval(uid, value)
         yield event.plain_result(message)
         if ok:
-            self.watcher.wake()
+            self.watcher.reconfigure()
 
     @filter.command("login", alias={"/login", "登录"})
     async def cmd_login(self, event: AstrMessageEvent):
@@ -696,7 +670,9 @@ class GaijinMarketWatcher(Star):
         event.stop_event()
 
         if not self._is_owner(event):
-            yield event.plain_result("仅拥有者可登录。请把你的 UID 填入配置的「拥有者 UID」。\n发送 /gjm id 可查看。")
+            yield event.plain_result(
+                "仅拥有者可登录。请把你的 UID 填入配置的「拥有者 UID」。\n可发送 AstrBot 内置命令 /sid 查看。"
+            )
             return
 
         code = _args_after(event, "login")
@@ -744,52 +720,6 @@ class GaijinMarketWatcher(Star):
             return f"验证码提交失败：{exc}"
         self.on_login_success()
         return f"验证码校验通过，{step.message}"
-
-    # ================================================================= 令牌应急
-
-    @gjm.command("token")
-    async def gjm_token(self, event: AstrMessageEvent):
-        """手动导入 refresh_token（正常用 /login 登录）。"""
-        # JWT / refresh_token 属于敏感凭据，必须在任何后续处理器之前截断传播。
-        event.stop_event()
-        self._remember(event)
-        if not self._is_owner(event):
-            yield event.plain_result("仅插件拥有者可以设置令牌。")
-            return
-        arg = _args_after(event, "gjm", "token")
-        if not arg:
-            yield event.plain_result("用法：/gjm token <含 refresh_token 的回跳链接>\n正常流程请到插件配置里完成登录。")
-            return
-
-        token = extract_refresh_token(arg)
-        jwt_candidate = arg if arg.startswith("eyJ") and arg.count(".") == 2 else ""
-        if not token and not jwt_candidate:
-            yield event.plain_result("无法识别输入，请提供含 refresh_token 的回跳链接或 JWT。")
-            return
-
-        await event.send(event.plain_result("正在校验令牌…"))
-        try:
-            if token:
-                jwt = await self.auth.validate_refresh_token(token)
-                account = await self.client.check_auth(jwt)
-            else:
-                jwt = jwt_candidate
-                account = await self.client.check_auth(jwt)
-        except Exception as exc:
-            yield event.plain_result(f"令牌校验失败，未修改现有配置：{exc}")
-            return
-
-        if token:
-            self.auth.absorb(jwt=jwt, refresh_token=token)
-            self.save_refresh_token(token)
-        else:
-            self.auth.absorb(jwt=jwt)
-            self._save_config(lambda raw: raw.__setitem__("jwt_token", jwt))
-
-        self.watcher.wake()
-        yield event.plain_result(
-            f"令牌有效并已保存，账号 {account.get('nick', '未知')}（uid {account.get('userId', '?')}）。"
-        )
 
     @gjm.command("debug")
     async def gjm_debug(self, event: AstrMessageEvent):
