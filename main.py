@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import re
 import time
 from pathlib import Path
@@ -92,7 +93,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.16.1",
+    "2.16.2",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -228,21 +229,34 @@ class GaijinMarketWatcher(Star):
         # 各层持有的是同一个 cfg / storage 对象引用，无需重新注入
         self.watcher.reconfigure()
 
-    def _save_config(self, mutate=None) -> None:
-        """把改动写回 AstrBot 配置，并热重载本插件的强类型配置。"""
+    def _save_config(self, mutate=None) -> bool:
+        """把改动写回 AstrBot 配置，成功后热重载本插件的强类型配置。
+
+        保存失败时必须让调用方知道，不能继续报告操作成功。
+        """
+        save = getattr(self.raw_config, "save_config", None)
+        if not callable(save):
+            self.logger.error("[GJM] 当前配置对象不支持 save_config，改动未保存。")
+            raise RuntimeError("当前配置对象不支持保存")
+
+        snapshot = copy.deepcopy(dict(self.raw_config))
         if mutate is not None:
             mutate(self.raw_config)
         try:
-            save = getattr(self.raw_config, "save_config", None)
-            if callable(save):
-                save()
+            save()
         except Exception as exc:
+            # 回滚内存中的原始配置，避免命令失败后留下“看似已保存”的脏状态。
+            with contextlib.suppress(Exception):
+                self.raw_config.clear()
+                self.raw_config.update(snapshot)
             self.logger.warning(f"[GJM] 保存配置失败: {exc}")
+            raise
 
         data = dict(self.raw_config)
         self._apply_config(data)
         # 告诉监听器"这份内容是我们自己写的"，避免下一轮自我触发
         self._config_watcher.mark_applied(data)
+        return True
 
     def _persist_subscriptions(self, subs: list[Subscription]) -> None:
         """订阅列表落盘：写成 template_list 结构，WebUI 配置页里可直接查看/修改。"""
@@ -276,7 +290,8 @@ class GaijinMarketWatcher(Star):
 
     def save_twofa_code(self, code: str) -> None:
         """写回验证码字段（提交后清空，避免验证码长期留痕）。"""
-        self._save_config(lambda raw: raw.__setitem__("twofa_code", code))
+        with contextlib.suppress(Exception):
+            self._save_config(lambda raw: raw.__setitem__("twofa_code", code))
 
     def on_login_success(self) -> None:
         """登录成功后的统一收尾。"""
@@ -353,7 +368,16 @@ class GaijinMarketWatcher(Star):
 
     def _owner_notify_umos(self) -> list[str]:
         """令牌失效等异常要主动通知谁：拥有者的会话。"""
-        return self.notifier.owner_sessions() or self.storage.list_subscriptions()
+        owners = self.notifier.owner_sessions()
+        if owners:
+            return owners
+        # 未配置拥有者 UID 时，保留向已知订阅会话兜底通知的行为。
+        fallback: list[str] = []
+        for sub in self.cfg.enabled_subscriptions:
+            umo = self.notifier.session_of(sub.uid)
+            if umo and umo not in fallback:
+                fallback.append(umo)
+        return fallback
 
     async def _platform_report(self) -> list[str]:
         """各平台的 @ 与主动推送能力（结论来自 core.platforms，供 /gjm debug 使用）。"""

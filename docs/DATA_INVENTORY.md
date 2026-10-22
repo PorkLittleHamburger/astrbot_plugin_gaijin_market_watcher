@@ -1,6 +1,6 @@
 # Gaijin 市场行情监控插件 · 数据清单
 
-> 版本 `v2.8.5`　|　生成时间 2026-09-24　|　所有字段均为**真实探测结果**（用你账号的有效 JWT 跑出来的，非文档推测）
+> 版本 `v2.16.2`　|　更新日期 2026-10-22　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
 
 ---
 
@@ -31,9 +31,9 @@ depth      = SELL 570 / BUY 2168
 
 ---
 
-## 二、物品元数据　`cln_market_search`　⚠️ 已实现但未接线
+## 二、物品元数据　`cln_market_search`　✅ 已接线
 
-单页 10 条，每个 `asset` 返回：
+插件在首次抓取物品行情后按名称搜索，并缓存匹配项的图标、标签、稀有度与颜色。每个 `asset` 返回：
 
 | 字段 | 示例 | 说明 |
 | --- | --- | --- |
@@ -106,11 +106,13 @@ depth      = SELL 570 / BUY 2168
 | 文件 | 内容 |
 | --- | --- |
 | `quotes.json` | 每物品最近一次行情：`market_name / sell_min / buy_max / sell_depth / buy_depth / timestamp / display_name / app_id / kind / error` |
-| `history.json` | 每物品最近 **200** 个点：`{t, sell, buy}`（可用于迷你走势） |
 | `names.json` | `market_name → 显示名` 缓存 |
 | `sessions.json` | `UID → 会话 UMO` + 用户昵称（推送与 @ 的前提） |
-| `subs.json` | 订阅状态（每用户每物品一条） |
+| `pending_login.json` | 待提交验证码的临时会话 Cookie 与表单字段（15 分钟过期） |
+| `items_meta.json` | 物品图标、标签、稀有度与颜色缓存 |
 | `auth.json` | `refresh_token` + `token` + 更新时间（**不含账号密码**） |
+
+用户订阅与刷新间隔保存在 AstrBot 插件配置 `user_subscriptions` 中，不再写入独立的 `subs.json`。
 
 ---
 
@@ -141,9 +143,8 @@ depth      = SELL 570 / BUY 2168
 1. **100 档盘口** → 买卖价差、挂单墙、深度图；数据每轮已在手，纯浪费
 2. **`marketFee`** → 推送里直接给「到手价」，避免误判收益
 3. ~~**`tags` / `color` / `icon`**~~ → **已实现**：缓存后用 payload 的 `$tags` / `$rarity` / `$color` / `$icon`
-4. **`history.json` 200 点** → 迷你走势（现在只存不读）
-5. `cln_get_pair_stat` → 官方走势图（需再试参）
-6. `cln_market_search` → 用名称检索来订阅（现在严格只接受链接）
+4. `cln_get_pair_stat` → 官方走势图（需再试参）
+5. `cln_market_search` → 用名称检索来订阅（现在严格只接受链接）
 
 ---
 

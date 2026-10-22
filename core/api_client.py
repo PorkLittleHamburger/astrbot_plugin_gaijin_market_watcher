@@ -166,8 +166,16 @@ class GaijinMarketClient:
             try:
                 client = await self._get_client()
                 response = await client.post(endpoint, data=payload)
+                if response.status_code in (401, 403):
+                    raise AuthExpiredError(action, f"HTTP_{response.status_code}", f"HTTP {response.status_code}")
                 if response.status_code >= 500 or response.status_code in (408, 429):
                     raise TransportError(action, f"HTTP {response.status_code}")
+                if not 200 <= response.status_code < 300:
+                    raise MarketApiError(
+                        action,
+                        f"HTTP_{response.status_code}",
+                        f"HTTP {response.status_code}",
+                    )
                 return self._unwrap(action, response.json())
             except (httpx.HTTPError, ValueError, TransportError) as exc:
                 last_error = exc
