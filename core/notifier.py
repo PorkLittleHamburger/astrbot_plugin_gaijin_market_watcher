@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 
@@ -111,7 +112,7 @@ class Notifier:
         self._payload_warned = False
         #: 出站失败通知限频（umo -> 上次通知时间）
         self._send_failure_at: dict[str, float] = {}
-        #: 推送合并缓冲：(umo, uid) -> {uid, name, events, failures, deadline}
+        #: 推送合并缓冲：(umo, uid) -> {uid, name, events, failures, deadline, on_delivered}
         #: 群聊中多个订阅者共享 UMO，必须继续按 UID 分开，否则会丢失 @。
         self._pending: dict[tuple[str, str], dict] = {}
         self._flush_task: asyncio.Task | None = None
@@ -566,19 +567,49 @@ class Notifier:
         return list(merged.values())
 
     def _buffer_push(
-        self, uid: str, umo: str, events: list[TriggerEvent], failures: list[Quote] | None, user_name: str, window: int
+        self,
+        uid: str,
+        umo: str,
+        events: list[TriggerEvent],
+        failures: list[Quote] | None,
+        user_name: str,
+        window: int,
+        on_delivered: Callable[[str, list[TriggerEvent]], None] | None = None,
     ) -> None:
         """把本次事件并入缓冲，等窗口到点后合成一条消息发出。"""
         key = (umo, uid)
         entry = self._pending.get(key)
         now = time.time()
         if entry is None:
-            entry = {"uid": uid, "name": user_name, "events": [], "failures": [], "deadline": now + window}
+            entry = {
+                "uid": uid,
+                "name": user_name,
+                "events": [],
+                "failures": [],
+                "deadline": now + window,
+                "on_delivered": on_delivered,
+            }
             self._pending[key] = entry
         entry["uid"] = uid
         entry["name"] = user_name or entry.get("name", "")
         entry["events"].extend(events)
         entry["failures"].extend(failures or [])
+        if on_delivered is not None:
+            entry["on_delivered"] = on_delivered
+
+    def _report_delivered(
+        self,
+        callback: Callable[[str, list[TriggerEvent]], None] | None,
+        uid: str,
+        events: list[TriggerEvent],
+    ) -> None:
+        """送达后通知调用方推进推送基线。"""
+        if callback is None:
+            return
+        try:
+            callback(uid, list(events))
+        except Exception as exc:
+            self.logger.warning(f"[GJM] 更新推送送达状态失败（{uid}）：{exc}")
 
     def _ensure_flush_task(self) -> None:
         if self._flush_task is not None and not self._flush_task.done():
@@ -605,7 +636,9 @@ class Notifier:
                     events = self._merge_events(entry["events"])
                     failures = entry["failures"] or None
                     try:
-                        await self._deliver(uid, umo, events, failures, entry["name"])
+                        delivered = await self._deliver(uid, umo, events, failures, entry["name"])
+                        if delivered:
+                            self._report_delivered(entry.get("on_delivered"), uid, events)
                     except Exception as exc:
                         self.logger.warning(f"[GJM] 合并推送失败（{umo}）：{exc}")
         except asyncio.CancelledError:
@@ -620,14 +653,17 @@ class Notifier:
                 umo, uid = key
                 entry = self._pending.pop(key)
                 if entry and entry["events"]:
+                    events = self._merge_events(entry["events"])
                     with suppress(Exception):
-                        await self._deliver(
+                        delivered = await self._deliver(
                             uid,
                             umo,
-                            self._merge_events(entry["events"]),
+                            events,
                             entry["failures"] or None,
                             entry["name"],
                         )
+                        if delivered:
+                            self._report_delivered(entry.get("on_delivered"), uid, events)
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
@@ -637,6 +673,8 @@ class Notifier:
         per_user: dict[str, list[TriggerEvent]],
         user_names: dict[str, str] | None = None,
         failures: list[Quote] | None = None,
+        *,
+        on_delivered: Callable[[str, list[TriggerEvent]], None] | None = None,
     ) -> int:
         """把各自的事件推送给对应订阅者，群聊里会 @ 到本人。
 
@@ -655,10 +693,11 @@ class Notifier:
                 continue
             user_name = names.get(uid, "")
             if window > 0:
-                self._buffer_push(uid, umo, events, failures, user_name, window)
+                self._buffer_push(uid, umo, events, failures, user_name, window, on_delivered)
                 sent += 1
                 continue
             if await self._deliver(uid, umo, events, failures, user_name):
+                self._report_delivered(on_delivered, uid, events)
                 sent += 1
         if window > 0 and self._pending:
             self._ensure_flush_task()

@@ -258,20 +258,26 @@ class AuthManager:
         if stored_rt:
             self._refresh_token = stored_rt
 
-    def sync_config_tokens(self) -> None:
-        """应用 WebUI 中手动修改过的非空 JWT / refresh_token。
+    def sync_config_tokens(self) -> bool:
+        """应用旧版配置或外部配置中变更过的非空 JWT / refresh_token。
 
         插件持久化状态通常会比配置文件里更晚，因此只在配置值确实变化时覆盖内存中的
         令牌；未变化的空字段不会把已刷新令牌清掉。
+
+        返回是否确实接收了新的令牌，供调度层解除旧的鉴权退避。
         """
         config_jwt = self.config.jwt_token or ""
         config_refresh = self.config.refresh_token or ""
+        updated = False
         if config_jwt and config_jwt != self._config_jwt:
             self._jwt = config_jwt
+            updated = True
         if config_refresh and config_refresh != self._config_refresh_token:
             self._refresh_token = config_refresh
+            updated = True
         self._config_jwt = config_jwt
         self._config_refresh_token = config_refresh
+        return updated
 
     def absorb(self, jwt: str = "", refresh_token: str = "") -> None:
         """吸收新令牌并落盘（只写令牌，不写密码）。"""

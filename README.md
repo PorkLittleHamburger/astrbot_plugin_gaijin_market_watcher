@@ -37,6 +37,7 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 在插件配置里填 `account_email` / `account_password`，并把你的 UID 填进 `owner_uids`
 （可发送 AstrBot 内置命令 `/sid` 查看；留空则回退 AstrBot 管理员判定）。
 请注意，插件只会将密码和账户储存在本地。
+登录成功后的续期凭据由插件内部保存，WebUI 不提供令牌字段。
 然后在聊天里：
 
 ```

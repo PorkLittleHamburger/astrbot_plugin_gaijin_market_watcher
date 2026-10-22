@@ -92,7 +92,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.16.0",
+    "2.16.1",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -223,7 +223,8 @@ class GaijinMarketWatcher(Star):
         self.client.language = self.cfg.language
         self.client.timeout = self.cfg.request_timeout
         self.client.retries = self.cfg.request_retries
-        self.auth.sync_config_tokens()
+        if self.auth.sync_config_tokens():
+            self.watcher.reset_auth_backoff()
         # 各层持有的是同一个 cfg / storage 对象引用，无需重新注入
         self.watcher.reconfigure()
 
@@ -280,6 +281,7 @@ class GaijinMarketWatcher(Star):
     def on_login_success(self) -> None:
         """登录成功后的统一收尾。"""
         self.logger.info("[GJM] 登录成功，令牌已更新。")
+        self.watcher.reset_auth_backoff()
         self.watcher.wake()
 
     async def _consume_config_code(self) -> None:

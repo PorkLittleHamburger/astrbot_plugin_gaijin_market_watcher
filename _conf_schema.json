@@ -10,7 +10,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "登录用。不想保存密码可留空，只靠 refresh_token。"
+    "hint": "登录用；已有登录态时可留空。"
   },
   "twofa_code": {
     "description": "两步验证码（备用）",
@@ -18,20 +18,6 @@
     "default": "",
     "secret": true,
     "hint": "平时用 /login <验证码> 提交；填这里保存也会自动提交并清空。"
-  },
-  "jwt_token": {
-    "description": "JWT 令牌",
-    "type": "string",
-    "default": "",
-    "secret": true,
-    "hint": "一般无需手填。"
-  },
-  "refresh_token": {
-    "description": "Refresh Token",
-    "type": "string",
-    "default": "",
-    "secret": true,
-    "hint": "自动续期用，不需要密码；可在插件配置中手动填写。"
   },
   "appid": {
     "description": "游戏 appid",
