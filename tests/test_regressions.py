@@ -808,7 +808,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(context.sent_messages), 3)
         self.assertTrue(primary.markdown)
 
-    async def test_qq_group_single_chart_merges_text_mention_and_image(self) -> None:
+    async def test_qq_group_single_chart_defers_image_to_preserve_native_mention(self) -> None:
         class _MessageChain:
             def __init__(self) -> None:
                 self.chain: list[object] = []
@@ -868,11 +868,11 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             sent = await notifier._send_blocks("test:GroupMessage:group", [block])
 
         self.assertTrue(sent)
-        self.assertEqual(len(context.sent_messages), 1)
+        self.assertEqual(len(context.sent_messages), 2)
         primary_text = "".join(part.text for part in context.sent_messages[0].chain if isinstance(part, _Plain))
-        self.assertIn("@Alice", primary_text)
-        self.assertNotIn("<qqbot-at-user", primary_text)
-        self.assertTrue(any(isinstance(part, _Image) for part in context.sent_messages[0].chain))
+        self.assertIn('<qqbot-at-user id="alice" />', primary_text)
+        self.assertFalse(any(isinstance(part, _Image) for part in context.sent_messages[0].chain))
+        self.assertTrue(any(isinstance(part, _Image) for part in context.sent_messages[1].chain))
 
     async def test_subscriber_only_receives_own_failure_details(self) -> None:
         class _FilterConfig(_NotifierConfig):

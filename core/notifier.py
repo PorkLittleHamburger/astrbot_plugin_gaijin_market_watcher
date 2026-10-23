@@ -516,8 +516,8 @@ class Notifier:
 
         platform_type = await self._platform_type(umo) if umo else ""
         total_images = sum(len(block.images) for block in blocks)
-        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and total_images > 1
-        inline_media = platform_type in platforms.ONE_IMAGE_PLATFORMS and not defer_images and total_images == 1
+        has_group_mentions = any(block.mentions for block in blocks)
+        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and (total_images > 1 or has_group_mentions)
         chain = MessageChain()
         use_markdown = False
         for index, block in enumerate(blocks):
@@ -530,16 +530,6 @@ class Notifier:
                 for uid, name, _plan in plans:
                     chain.chain.append(At(qq=uid, name=name or None))
                     chain.chain.append(Plain(" "))
-            elif plans and inline_media:
-                # QQ 官方媒体消息不会解析 qqbot-at-user，降级为可见的纯文本 @昵称。
-                plain_mentions = " ".join(
-                    f"@{name or uid}" for uid, name, plan in plans if plan.style != platforms.STYLE_NONE
-                )
-                if block.used_mention:
-                    for uid, name, plan in plans:
-                        block.text = block.text.replace(plan.text, f"@{name or uid}")
-                elif plain_mentions:
-                    block.text = f"{plain_mentions}\n{block.text}"
             elif plans and not block.used_mention:
                 mention_text = self._template_mention_text(plans)
                 if mention_text:
