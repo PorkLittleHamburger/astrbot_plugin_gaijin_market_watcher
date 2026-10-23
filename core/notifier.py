@@ -516,7 +516,8 @@ class Notifier:
 
         platform_type = await self._platform_type(umo) if umo else ""
         total_images = sum(len(block.images) for block in blocks)
-        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and total_images > 1
+        has_group_mentions = any(block.mentions for block in blocks)
+        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and (total_images > 1 or has_group_mentions)
         chain = MessageChain()
         use_markdown = False
         for index, block in enumerate(blocks):
