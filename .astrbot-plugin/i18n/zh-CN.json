@@ -1,0 +1,8 @@
+{
+  "views": {
+    "trade": {
+      "title": "Gaijin 自动交易",
+      "description": "拥有者私聊与 Dashboard 管理员使用的模拟/实盘自动交易控制台"
+    }
+  }
+}

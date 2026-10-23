@@ -46,6 +46,9 @@ class MarketWatcher:
         notifier,
         logger,
         on_auth_failure=None,
+        extra_market_names=None,
+        extra_interval=None,
+        on_quotes=None,
     ) -> None:
         self.client = client
         self.auth = auth
@@ -55,6 +58,9 @@ class MarketWatcher:
         self.logger = logger
         #: 须要用户介入时（如令牌全部失效）的回调：async def (reason: str) -> None
         self.on_auth_failure = on_auth_failure
+        self.extra_market_names = extra_market_names
+        self.extra_interval = extra_interval
+        self.on_quotes = on_quotes
 
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -98,7 +104,7 @@ class MarketWatcher:
         self._sync_group_schedule(time.time())
         self._task = asyncio.create_task(self._loop(), name="gaijin-market-watcher")
         self.logger.info(
-            f"行情监控已启动：{len(self.config.watched_market_names)} 个物品、"
+            f"行情监控已启动：{len(self._private_market_names())} 个物品、"
             f"{len(self.config.enabled_subscriptions)} 条用户订阅，"
             f"间隔 {self.config.min_interval}~{max(list(self.config.intervals.values()) or [0])} 秒（各自独立）。"
         )
@@ -124,7 +130,7 @@ class MarketWatcher:
         now = time.time()
         watched = set(self._private_market_names())
         for market_name in watched:
-            proposed = now + max(MIN_POLL_INTERVAL, self.config.interval_of(market_name))
+            proposed = now + max(MIN_POLL_INTERVAL, self._interval_for(market_name))
             current = self._next_due.get(market_name)
             self._next_due[market_name] = proposed if current is None else min(current, proposed)
         for market_name in [name for name in self._next_due if name not in watched]:
@@ -193,7 +199,23 @@ class MarketWatcher:
             target = self._target_of(sub)
             if not platforms.is_group_session(platforms.session_type_of(target)) and sub.market_name not in names:
                 names.append(sub.market_name)
+        if callable(self.extra_market_names):
+            with suppress(Exception):
+                for market_name in self.extra_market_names() or []:
+                    if market_name and market_name not in names:
+                        names.append(str(market_name))
         return names
+
+    def _interval_for(self, market_name: str) -> int:
+        base = int(self.config.interval_of(market_name))
+        names = []
+        if callable(self.extra_market_names):
+            with suppress(Exception):
+                names = list(self.extra_market_names() or [])
+        if market_name in names and callable(self.extra_interval):
+            with suppress(Exception):
+                return min(base, max(1, int(self.extra_interval())))
+        return base
 
     def _target_of(self, sub) -> str:
         if sub.target_umo:
@@ -213,7 +235,7 @@ class MarketWatcher:
 
     async def poll_once(self) -> list[TriggerEvent]:
         """立即轮询全部物品（/gjm mysub、唤醒时使用）。"""
-        return await self.poll_items(self.config.watched_market_names)
+        return await self.poll_items(self._private_market_names())
 
     async def poll_due(self) -> list[TriggerEvent]:
         """只轮询已到点的物品（间隔由各自订阅者决定）。"""
@@ -293,7 +315,7 @@ class MarketWatcher:
             retry_at = time.time()
             for market_name in watched:
                 self._latest_errors[market_name] = error
-                self._next_due[market_name] = retry_at + self.config.interval_of(market_name)
+            self._next_due[market_name] = retry_at + self._interval_for(market_name)
             self.last_poll_error = error
             self.logger.warning(error)
             return []
@@ -302,7 +324,7 @@ class MarketWatcher:
             retry_at = time.time()
             for market_name in watched:
                 self._latest_errors[market_name] = error
-                self._next_due[market_name] = retry_at + self.config.interval_of(market_name)
+                self._next_due[market_name] = retry_at + self._interval_for(market_name)
             self.last_poll_error = error
             self.logger.error(error)
             return []
@@ -325,7 +347,7 @@ class MarketWatcher:
             if index > 0 and self.config.item_interval > 0:
                 await asyncio.sleep(self.config.item_interval)
             # 先排下一次：无论本次成功失败都不会陷入紧凑重试
-            self._next_due[market_name] = time.time() + self.config.interval_of(market_name)
+            self._next_due[market_name] = time.time() + self._interval_for(market_name)
             self._last_attempt_at[market_name] = time.time()
 
             display = self.config.display_name_of(market_name) or self.storage.get_item_name(market_name)
@@ -396,6 +418,14 @@ class MarketWatcher:
                 cache_write_error = f"行情缓存写入失败：{market_name}"
                 self.logger.warning(cache_write_error)
             self._ensure_item_meta(market_name, quote.title)
+
+        if quotes and self.on_quotes is not None:
+            try:
+                callback_result = self.on_quotes(quotes)
+                if asyncio.iscoroutine(callback_result):
+                    await callback_result
+            except Exception as exc:
+                self.logger.warning(f"自动交易行情分发失败: {exc}")
 
         if auth_error:
             await self._handle_auth_failure(auth_error)
@@ -634,7 +664,7 @@ class MarketWatcher:
             "poll_interval": self.config.min_interval,
             "intervals": self.config.intervals,
             "subscriptions": len(self.config.enabled_subscriptions),
-            "watched": len(self.config.watched_market_names),
+            "watched": len(self._private_market_names()),
             "groups": len(self._group_targets()),
             "group_push_interval": self.config.group_push_interval,
         }

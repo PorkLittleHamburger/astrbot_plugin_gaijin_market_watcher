@@ -68,6 +68,20 @@ class PluginStorage:
             self.logger.warning(f"写入 {path.name} 失败: {exc}")
             return False
 
+    def load_aux_json(self, filename: str, default: Any) -> Any:
+        """读取插件数据目录下的辅助 JSON 文件。
+
+        自动交易规则、运行状态和日志均通过这里落盘，保持项目的持久化入口
+        统一。文件名由调用方使用固定常量，不接收用户输入。
+        """
+        name = Path(filename).name
+        return self._load(self.dir / name, default)
+
+    def save_aux_json(self, filename: str, data: Any) -> bool:
+        """原子写入插件数据目录下的辅助 JSON 文件。"""
+        name = Path(filename).name
+        return self._save(self.dir / name, data)
+
     # ------------------------------------------------------------- 最近行情
 
     def get_last_quote(self, market_name: str) -> Quote | None:

@@ -269,7 +269,7 @@ class PluginConfig:
                 "当前没有被监控/订阅的物品：可在聊天里发送 /gjm sub <物品链接>，或在配置里填写 user_subscriptions。"
             )
         if not self.owner_uids:
-            hints.append("未配置拥有者 UID，/login 等管理指令将回退为 AstrBot 管理员判定。")
+            hints.append("未配置拥有者 UID：/login 会回退管理员判定，但自动交易将持续禁用。")
         if not self.subscriptions:
             hints.append("当前没有任何用户订阅，推送将无处可去（可用 /gjm sub <物品链接> 添加）。")
         if self.payload.strip():

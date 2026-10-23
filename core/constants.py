@@ -11,7 +11,10 @@ PROXY_BASE = "https://market-proxy.gaijin.net"
 EP_TRADE = PROXY_BASE + "/web"
 #: 鉴权接口(用户校验/refresh_token 换 JWT)。cmn_* 系列 action 走这里。
 EP_MARKET = PROXY_BASE + "/market"
-#: 资产接口(暂未使用，保留以便扩展)。
+#: 账号资产接口(GetContexts / GetContextContents)。
+EP_ASSET = PROXY_BASE + "/assetAPI"
+#: 钱包接口(GJN 余额)。
+EP_WALLET = "https://wallet.gaijin.net/GetBalance"
 
 # ==================== SSO 登录 ====================
 LOGIN_BASE = "https://login.gaijin.net"
@@ -25,6 +28,14 @@ SSO_RETURN_URL = "aHR0cHM6Ly90cmFkZS5nYWlqaW4ubmV0"
 ACT_BOOKS_BRIEF = "cln_books_brief"  # 精简盘口 -> 最低售价/最高求购
 ACT_MARKET_SEARCH = "cln_market_search"  # 模糊搜索(返回物品列表)
 ACT_MARKET_INFO = "cln_market_info"  # 游戏列表/限价/手续费
+ACT_BOOKS = "cln_books"  # 完整盘口(含订单 ID)
+ACT_MARKET_BUY = "cln_market_buy"
+ACT_MARKET_SELL = "cln_market_sell"
+ACT_USER_OPEN_ORDERS = "cln_get_user_open_orders"
+ACT_CANCEL_ORDER = "cancel_order"
+ACT_MARKET_GET_ASSET_CLASS = "cln_market_get_asset_class"
+ACT_GET_CONTEXTS = "GetContexts"
+ACT_GET_CONTEXT_CONTENTS = "GetContextContents"
 ACT_AUTH_REFRESH = "cln_authorize_by_refresh_token"
 ACT_CHECK_AUTH = "cmn_check_user_auth"
 

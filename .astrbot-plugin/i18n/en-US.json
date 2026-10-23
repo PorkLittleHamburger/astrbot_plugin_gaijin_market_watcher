@@ -1,0 +1,8 @@
+{
+  "views": {
+    "trade": {
+      "title": "Gaijin Auto Trading",
+      "description": "Paper and live auto-trading console for the plugin owner and Dashboard administrators"
+    }
+  }
+}

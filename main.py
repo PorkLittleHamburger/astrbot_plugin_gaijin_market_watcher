@@ -36,9 +36,14 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+try:
+    from astrbot.api.web import error_response, json_response, request
+except ImportError:  # 兼容尚未提供插件 Web API 的旧版 AstrBot；聊天功能仍可使用
+    error_response = json_response = request = None  # type: ignore[assignment]
+
 try:  # 常规：AstrBot 以包的形式加载插件
     from .core import platforms
-    from .core.api_client import GaijinMarketClient
+    from .core.api_client import AuthExpiredError, GaijinMarketClient
     from .core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from .core.config import PluginConfig
     from .core.config_watch import ConfigFileWatcher
@@ -48,6 +53,7 @@ try:  # 常规：AstrBot 以包的形式加载插件
     from .core.resolver import extract_link_reference, prettify_market_name
     from .core.storage import PluginStorage
     from .core.subscriptions import REJECT_HINT, SubscriptionStore
+    from .core.trader import AutoTrader, TradeError
     from .core.watcher import MarketWatcher
 except ImportError:  # 兜底：以文件路径方式加载时
     import sys
@@ -56,7 +62,7 @@ except ImportError:  # 兜底：以文件路径方式加载时
         sys.path.append(str(Path(__file__).resolve().parent))
 
     from core import platforms
-    from core.api_client import GaijinMarketClient
+    from core.api_client import AuthExpiredError, GaijinMarketClient
     from core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from core.config import PluginConfig
     from core.config_watch import ConfigFileWatcher
@@ -66,6 +72,7 @@ except ImportError:  # 兜底：以文件路径方式加载时
     from core.resolver import extract_link_reference, prettify_market_name
     from core.storage import PluginStorage
     from core.subscriptions import REJECT_HINT, SubscriptionStore
+    from core.trader import AutoTrader, TradeError
     from core.watcher import MarketWatcher
 
 PLUGIN_NAME = "astrbot_plugin_gaijin_market_watcher"
@@ -91,9 +98,10 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
     "porklittlehamburger",
     (
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
-        "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
+        "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人；"
+        "拥有者可私聊或通过 WebUI 使用默认模拟的自动交易。"
     ),
-    "2.17.7",
+    "2.18.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -128,6 +136,15 @@ class GaijinMarketWatcher(Star):
             resolve_target=self.storage.resolve_uid,
         )
         self.notifier = Notifier(self.context, self.storage, self.cfg, self.logger)
+        self.trader = AutoTrader(
+            client=self.client,
+            auth=self.auth,
+            storage=self.storage,
+            config=self.cfg,
+            notifier=self.notifier,
+            logger=self.logger,
+            on_watch_change=self._trade_watch_changed,
+        )
         self.watcher = MarketWatcher(
             client=self.client,
             auth=self.auth,
@@ -136,7 +153,11 @@ class GaijinMarketWatcher(Star):
             notifier=self.notifier,
             logger=self.logger,
             on_auth_failure=self._notify_auth_failure,
+            extra_market_names=self.trader.watch_market_names,
+            extra_interval=self.trader.poll_interval,
+            on_quotes=self.trader.on_quotes,
         )
+        self._register_trade_web_apis()
 
         # ---------- 配置热监听 ----------
         self._config_path = self._resolve_config_path()
@@ -176,6 +197,7 @@ class GaijinMarketWatcher(Star):
                 self.logger.warning(f"[GJM] 持久化旧订阅会话失败: {exc}")
 
         self._config_watcher.start()
+        self.trader.start()
         self.watcher.start()
         # 启动时补一次：可能用户已经先填好账号/验证码再重载插件
         await self._consume_config_code()
@@ -186,6 +208,8 @@ class GaijinMarketWatcher(Star):
             await self.notifier.shutdown()
         with contextlib.suppress(Exception):
             await self.watcher.stop()
+        with contextlib.suppress(Exception):
+            await self.trader.stop()
         with contextlib.suppress(Exception):
             await self._config_watcher.stop()
         with contextlib.suppress(Exception):
@@ -420,6 +444,130 @@ class GaijinMarketWatcher(Star):
             lines.append(platforms.describe(pid, ptype, declared))
         return lines
 
+    # ================================================================= 交易 WebUI
+
+    def _register_trade_web_apis(self) -> None:
+        register_api = getattr(self.context, "register_web_api", None)
+        if not callable(register_api):
+            self.logger.warning("[GJM] 当前 AstrBot 不支持插件 Web API，交易页不可用。")
+            return
+        routes = [
+            ("trade/overview", self._trade_web_overview, ["GET"]),
+            ("trade/settings", self._trade_web_settings, ["POST"]),
+            ("trade/rules/save", self._trade_web_save_rule, ["POST"]),
+            ("trade/rules/action", self._trade_web_action, ["POST"]),
+            ("trade/stop-all", self._trade_web_stop_all, ["POST"]),
+            ("trade/logs", self._trade_web_logs, ["GET"]),
+        ]
+        for path, handler, methods in routes:
+            register_api(
+                f"/{PLUGIN_NAME}/{path}",
+                handler,
+                methods,
+                f"Gaijin market watcher: {path}",
+            )
+
+    @staticmethod
+    def _trade_web_actor() -> str:
+        return str(getattr(request, "username", "") or "dashboard")
+
+    async def _trade_web_overview(self):
+        data = self.trader.overview()
+        auth = self.auth.status()
+        data["auth"] = {
+            "has_jwt": bool(auth.get("has_jwt")),
+            "nick": auth.get("nick") or "",
+            "seconds_left": int(auth.get("seconds_left") or 0),
+        }
+        data["events"] = [event.to_dict() for event in self.trader.store.events[-100:]]
+        return json_response(data)
+
+    async def _trade_web_logs(self):
+        try:
+            limit = max(1, min(500, int(request.query.get("limit", 100))))
+        except (TypeError, ValueError):
+            return error_response("limit 必须是整数", status_code=400)
+        return json_response({"events": [event.to_dict() for event in self.trader.store.events[-limit:]]})
+
+    async def _trade_web_settings(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            await self.trader.update_settings(payload)
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 保存设置失败: {exc}")
+            return error_response("保存交易设置失败", status_code=500)
+        self.logger.info(f"[GJM Trade] WebUI 设置修改者: {self._trade_web_actor()}")
+        return json_response(self.trader.overview())
+
+    async def _trade_web_save_rule(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            rule_id = str(payload.get("rule_id") or "").strip()
+            if rule_id:
+                changes = {
+                    key: payload[key]
+                    for key in ("buy_price", "quantity", "sell_net_price", "mode", "display_name")
+                    if key in payload
+                }
+                rule = await self.trader.update_rule(rule_id, **changes)
+            else:
+                rule = await self.trader.create_rule(
+                    url=str(payload.get("url") or ""),
+                    buy_price=payload.get("buy_price"),
+                    quantity=payload.get("quantity"),
+                    sell_net_price=payload.get("sell_net_price"),
+                    mode=str(payload.get("mode") or ""),
+                    display_name=str(payload.get("display_name") or ""),
+                )
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 保存规则失败: {exc}")
+            return error_response("保存交易规则失败", status_code=500)
+        self.logger.info(f"[GJM Trade] WebUI 规则修改者: {self._trade_web_actor()}")
+        return json_response({"rule": self.trader.rule_view(rule)})
+
+    async def _trade_web_action(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        rule_id = str(payload.get("rule_id") or "").strip()
+        action = str(payload.get("action") or "").strip()
+        try:
+            if action == "prepare_arm":
+                message = await self.trader.prepare_arm(rule_id)
+                return json_response({"prepared": True, "rule_id": rule_id, "message": message})
+            rule = await self.trader.action(rule_id, action, str(payload.get("confirmation_id") or ""))
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 操作失败: {exc}")
+            return error_response("执行交易操作失败", status_code=500)
+        self.logger.info(f"[GJM Trade] WebUI 操作 {action} / {rule_id} / {self._trade_web_actor()}")
+        return json_response({"rule": self.trader.rule_view(rule)})
+
+    async def _trade_web_stop_all(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict) or str(payload.get("confirmation") or "").strip().lower() != "stop-all":
+            return error_response("请输入 stop-all 确认急停", status_code=400)
+        try:
+            result = await self.trader.stop_all()
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 急停失败: {exc}")
+            return error_response("执行急停失败", status_code=500)
+        self.logger.warning(f"[GJM Trade] WebUI 急停操作者: {self._trade_web_actor()}")
+        return json_response(result)
+
     def _is_owner(self, event: AstrMessageEvent) -> bool:
         """是否为插件拥有者。
 
@@ -429,6 +577,21 @@ class GaijinMarketWatcher(Star):
         if self.cfg.owner_uids:
             return bool(self._uid_candidates(event) & set(self.cfg.owner_uids))
         return bool(event.is_admin())
+
+    def _trade_access_error(self, event: AstrMessageEvent) -> str:
+        """交易指令严格要求：显式拥有者 UID + 私聊会话。"""
+        if not self.cfg.owner_uids:
+            return "自动交易已禁用：请先在配置中填写 owner_uids，不能回退到 AstrBot 管理员判定。"
+        if platforms.session_type_of(event.unified_msg_origin or "") != platforms.SESSION_TYPE_FRIEND:
+            return "自动交易指令仅允许在拥有者私聊中使用。"
+        if not self._is_owner(event):
+            return "仅插件拥有者可以操作自动交易。"
+        return ""
+
+    def _trade_watch_changed(self) -> None:
+        watcher = getattr(self, "watcher", None)
+        if watcher is not None:
+            watcher.reconfigure()
 
     async def _notify_auth_failure(self, reason: str) -> None:
         """令牌失效时通知拥有者（限频 30 分钟）。"""
@@ -471,6 +634,7 @@ class GaijinMarketWatcher(Star):
             "/gjm refresh mode <模式>  always / only_change\n"
             "/gjm refresh interval <秒> [链接|编号]\n"
             "群聊会自动按固定间隔发送全部订阅物品和价格图\n"
+            "/gjm trade             自动交易（仅拥有者私聊）\n"
             "/gjm debug             排障信息"
         )
 
@@ -732,6 +896,293 @@ class GaijinMarketWatcher(Star):
         yield event.plain_result(message)
         if ok:
             self.watcher.reconfigure()
+
+    @gjm.group("trade")
+    def gjm_trade(self):
+        """自动交易指令组（仅拥有者私聊）。"""
+
+    @gjm_trade.command("add")
+    async def gjm_trade_add(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        raw = _args_after(event, "gjm", "trade", "add")
+        parts = raw.split()
+        if len(parts) != 5:
+            yield event.plain_result(
+                "用法：/gjm trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>\n新规则默认模拟运行。"
+            )
+            return
+        try:
+            rule = await self.trader.create_rule(
+                url=parts[0],
+                buy_price=parts[1],
+                quantity=parts[2],
+                sell_net_price=parts[3],
+                mode=parts[4],
+            )
+        except Exception as exc:
+            yield event.plain_result(f"创建失败：{exc}")
+            return
+        yield event.plain_result(
+            f"已创建模拟规则 {rule.rule_id}\n"
+            f"物品：{rule.title}\n"
+            f"买入：{rule.buy_price_raw / 10000:.2f} GJN × {rule.quantity}\n"
+            f"税后卖出：{rule.sell_net_price_raw / 10000:.2f} GJN\n"
+            f"模式：{rule.mode}\n"
+            f"实盘切换：/gjm trade arm {rule.rule_id}"
+        )
+
+    @gjm_trade.command("list")
+    async def gjm_trade_list(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rules = self.trader.store.rules
+        if not rules:
+            yield event.plain_result("当前没有自动交易规则。")
+            return
+        lines = ["【自动交易规则】"]
+        for rule in rules:
+            runtime = self.trader.store.get_runtime(rule.rule_id)
+            lines.append(
+                f"{rule.rule_id}  {'实盘' if rule.live else '模拟'}  "
+                f"{'启用' if rule.enabled else '停用'}  {runtime.phase}\n"
+                f"  {rule.title}｜买 {rule.buy_price_raw / 10000:.2f}｜数量 {rule.quantity}｜"
+                f"税后卖 {rule.sell_net_price_raw / 10000:.2f}｜{rule.mode}"
+            )
+            if runtime.last_error:
+                lines.append(f"  错误：{runtime.last_error}")
+        yield event.plain_result("\n".join(lines))
+
+    @gjm_trade.command("show")
+    async def gjm_trade_show(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "show").strip()
+        if not rule_id:
+            yield event.plain_result("用法：/gjm trade show <规则ID>")
+            return
+        try:
+            rule = self.trader._require_rule(rule_id)
+            view = self.trader.rule_view(rule)
+        except TradeError as exc:
+            yield event.plain_result(str(exc))
+            return
+        runtime = view["runtime"]
+        yield event.plain_result(
+            f"【规则 {view['rule_id']}】\n"
+            f"物品：{view['title']}\n"
+            f"市场：{self.item_url(view['market_name'])}\n"
+            f"状态：{runtime['phase']}｜{'实盘' if view['live'] else '模拟'}｜"
+            f"{'启用' if view['enabled'] else '停用'}\n"
+            f"买入限价：{view['buy_price']} GJN × {view['quantity']}\n"
+            f"税后目标：{view['sell_net_price']} GJN\n"
+            f"税前挂单价：{view['sell_gross_price']} GJN（预计到手 {view['estimated_net']}）\n"
+            f"持仓：{runtime['held_quantity']}，挂单：{runtime['listed_quantity']}，"
+            f"累计税后收益：{runtime['proceeds_raw'] / 10000:.2f} GJN\n"
+            f"模式：{view['mode']}｜完成轮数：{runtime['cycle_count']}\n"
+        )
+
+    @gjm_trade.command("budget")
+    async def gjm_trade_budget(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        data = self.trader.overview()
+        settings = data["settings"]
+        ledger = data["ledger"]
+        yield event.plain_result(
+            "【自动交易预算】\n"
+            f"总开关：{'开' if settings['enabled'] else '关'}\n"
+            f"总投入预算：{settings['total_budget']} GJN｜当前占用 {data['exposure']}｜"
+            f"剩余 {data['budget_remaining']}\n"
+            f"每日限额：{settings['daily_limit']} GJN｜今日已用 {ledger['daily_spent']}｜"
+            f"剩余 {ledger['daily_remaining']}\n"
+            f"单笔上限：{settings['max_order']} GJN｜最大数量：{settings['max_quantity']}"
+        )
+
+    @gjm_trade.command("arm")
+    async def gjm_trade_arm(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        parts = _args_after(event, "gjm", "trade", "arm").split()
+        if not parts:
+            yield event.plain_result("用法：/gjm trade arm <规则ID>，然后发送 /gjm trade arm <规则ID> confirm")
+            return
+        rule_id = parts[0]
+        try:
+            if len(parts) > 1 and parts[1].lower() == "confirm":
+                await self.trader.confirm_arm(rule_id, rule_id)
+                yield event.plain_result(f"规则 {rule_id.upper()} 已切换实盘。")
+            else:
+                yield event.plain_result(await self.trader.prepare_arm(rule_id))
+        except Exception as exc:
+            yield event.plain_result(f"切换实盘失败：{exc}")
+
+    @gjm_trade.command("disarm")
+    async def gjm_trade_disarm(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "disarm").strip()
+        try:
+            await self.trader.action(rule_id, "disarm")
+        except Exception as exc:
+            yield event.plain_result(f"退出实盘失败：{exc}")
+            return
+        yield event.plain_result(f"规则 {rule_id.upper()} 已退出实盘。")
+
+    @gjm_trade.command("pause")
+    async def gjm_trade_pause(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "pause").strip()
+        try:
+            await self.trader.action(rule_id, "pause")
+        except Exception as exc:
+            yield event.plain_result(f"暂停失败：{exc}")
+            return
+        yield event.plain_result(f"规则 {rule_id.upper()} 已暂停。")
+
+    @gjm_trade.command("resume")
+    async def gjm_trade_resume(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "resume").strip()
+        try:
+            await self.trader.action(rule_id, "resume")
+        except Exception as exc:
+            yield event.plain_result(f"恢复失败：{exc}")
+            return
+        yield event.plain_result(f"规则 {rule_id.upper()} 已恢复。")
+
+    @gjm_trade.command("cancel")
+    async def gjm_trade_cancel(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "cancel").strip()
+        try:
+            await self.trader.action(rule_id, "cancel_orders")
+        except Exception as exc:
+            yield event.plain_result(f"撤单失败：{exc}")
+            return
+        yield event.plain_result(f"规则 {rule_id.upper()} 的自动订单已撤销，规则已暂停。")
+
+    @gjm_trade.command("delete")
+    async def gjm_trade_delete(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        rule_id = _args_after(event, "gjm", "trade", "delete").strip()
+        try:
+            await self.trader.action(rule_id, "delete")
+        except Exception as exc:
+            yield event.plain_result(f"删除失败：{exc}")
+            return
+        yield event.plain_result(f"规则 {rule_id.upper()} 已删除。")
+
+    @gjm_trade.command("orders")
+    async def gjm_trade_orders(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        lines: list[str] = []
+        for rule in self.trader.store.rules:
+            runtime = self.trader.store.get_runtime(rule.rule_id)
+            for order in runtime.orders:
+                lines.append(
+                    f"{rule.rule_id}  {order.side}  {rule.title}\n"
+                    f"  订单 {order.order_id}｜数量 {order.amount}｜价格 {order.price_raw / 10000:.2f} GJN"
+                )
+        yield event.plain_result("\n".join(lines) if lines else "当前没有本插件跟踪的自动挂单。")
+
+    @gjm_trade.command("log")
+    async def gjm_trade_log(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        raw = _args_after(event, "gjm", "trade", "log").strip()
+        try:
+            limit = max(1, min(50, int(raw or 10)))
+        except ValueError:
+            yield event.plain_result("用法：/gjm trade log [1-50]")
+            return
+        events = self.trader.store.events[-limit:]
+        if not events:
+            yield event.plain_result("暂无自动交易日志。")
+            return
+        lines = ["【自动交易日志】"]
+        for event_item in events:
+            stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(event_item.timestamp))
+            lines.append(f"{stamp} [{event_item.rule_id or '-'}] {event_item.message}")
+        yield event.plain_result("\n".join(lines))
+
+    @gjm_trade.command("stop-all")
+    async def gjm_trade_stop_all(self, event: AstrMessageEvent):
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if _args_after(event, "gjm", "trade", "stop-all").strip().lower() != "confirm":
+            yield event.plain_result(
+                "急停会撤销本插件跟踪的全部订单并暂停规则。\n确认请发送：/gjm trade stop-all confirm"
+            )
+            return
+        try:
+            result = await self.trader.stop_all()
+        except Exception as exc:
+            yield event.plain_result(f"急停失败：{exc}")
+            return
+        text = "自动交易已急停，所有规则已暂停。"
+        if result["cancelled"]:
+            text += "\n已撤单规则：" + "、".join(result["cancelled"])
+        if result["errors"]:
+            text += "\n撤单异常：\n" + "\n".join(result["errors"])
+        yield event.plain_result(text)
 
     @filter.command("login", alias={"/login", "登录"})
     async def cmd_login(self, event: AstrMessageEvent):

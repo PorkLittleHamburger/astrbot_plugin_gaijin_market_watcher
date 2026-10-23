@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gaijin 自动交易</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">GAIJIN MARKET</p>
+          <h1>自动交易</h1>
+          <p class="muted">固定手续费 15% · 普通商品 · 默认模拟运行</p>
+        </div>
+        <div class="hero-actions">
+          <span id="authBadge" class="badge">登录状态读取中</span>
+          <button id="refreshBtn" class="button secondary">刷新</button>
+        </div>
+      </header>
+
+      <div id="toast" class="toast" hidden></div>
+
+      <div id="modalBackdrop" class="modal-backdrop" hidden>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+          <h3 id="modalTitle">确认操作</h3>
+          <pre id="modalMessage" class="modal-message"></pre>
+          <label id="modalInputWrap" class="modal-input" hidden>
+            <span id="modalInputLabel"></span>
+            <input id="modalInput" type="text" autocomplete="off" />
+          </label>
+          <div class="modal-actions">
+            <button id="modalCancel" type="button" class="button secondary">取消</button>
+            <button id="modalConfirm" type="button" class="button primary">确认</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="metrics">
+        <article class="card metric"><span>交易总开关</span><strong id="masterState">--</strong></article>
+        <article class="card metric"><span>当前投入</span><strong id="exposure">-- GJN</strong></article>
+        <article class="card metric"><span>预算剩余</span><strong id="budgetRemaining">-- GJN</strong></article>
+        <article class="card metric"><span>今日已买</span><strong id="dailySpent">-- GJN</strong></article>
+      </section>
+
+      <section class="grid two-column">
+        <article class="card">
+          <div class="section-heading">
+            <div><h2>安全设置</h2><p class="muted">实盘额度全部为 0 时，任何规则都不能切换实盘。</p></div>
+          </div>
+          <form id="settingsForm" class="form-grid">
+            <label class="switch-row span-2"><span>自动交易总开关</span><input id="settingEnabled" type="checkbox" /></label>
+            <label><span>总投入预算 (GJN)</span><input id="settingTotal" type="number" min="0" step="0.01" /></label>
+            <label><span>每日限额 (GJN)</span><input id="settingDaily" type="number" min="0" step="0.01" /></label>
+            <label><span>单笔上限 (GJN)</span><input id="settingMaxOrder" type="number" min="0" step="0.01" /></label>
+            <label><span>最大数量</span><input id="settingMaxQty" type="number" min="0" step="1" /></label>
+            <label><span>检查间隔 (秒)</span><input id="settingInterval" type="number" min="1" max="3600" step="1" /></label>
+            <label class="switch-row"><span>隐藏交易动态</span><input id="settingPrivate" type="checkbox" /></label>
+            <div class="form-actions span-2"><button type="submit" class="button primary">保存设置</button></div>
+          </form>
+        </article>
+
+        <article class="card">
+          <div class="section-heading">
+            <div><h2 id="ruleFormTitle">新建交易规则</h2><p class="muted">税后卖出价必须高于买入价；首版只支持 COMMODITY。</p></div>
+            <button id="resetRuleBtn" type="button" class="button ghost">清空</button>
+          </div>
+          <form id="ruleForm" class="form-grid">
+            <input id="editRuleId" type="hidden" />
+            <label class="span-2"><span>物品页链接</span><input id="ruleUrl" type="url" placeholder="https://trade.gaijin.net/market/1067/..." required /></label>
+            <label class="span-2"><span>显示名称（可选）</span><input id="ruleName" type="text" placeholder="留空则使用市场名称" /></label>
+            <label><span>买入限价 (GJN)</span><input id="ruleBuy" type="number" min="0.01" step="0.01" required /></label>
+            <label><span>数量</span><input id="ruleQty" type="number" min="1" max="1000" step="1" value="1" required /></label>
+            <label><span>税后卖出价 (GJN)</span><input id="ruleSellNet" type="number" min="0.01" step="0.01" required /></label>
+            <label><span>周期</span><select id="ruleMode"><option value="once">once · 单次</option><option value="loop">loop · 循环</option></select></label>
+            <div class="form-actions span-2"><button type="submit" class="button primary">保存规则</button></div>
+          </form>
+        </article>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div><h2>规则</h2><p class="muted">模拟规则只记录虚拟成交；切换实盘必须输入规则 ID。</p></div>
+          <button id="stopAllBtn" class="button danger">全部急停</button>
+        </div>
+        <div id="rulesList" class="rule-list"><p class="muted empty">暂无规则</p></div>
+      </section>
+
+      <section class="grid two-column">
+        <article class="card"><div class="section-heading"><h2>自动订单</h2></div><div id="ordersList" class="stack-list"><p class="muted empty">暂无自动挂单</p></div></article>
+        <article class="card"><div class="section-heading"><h2>最近日志</h2></div><div id="logsList" class="stack-list"><p class="muted empty">暂无日志</p></div></article>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -125,7 +125,7 @@
     "description": "拥有者 UID",
     "type": "list",
     "default": [],
-    "hint": "/login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空回退 AstrBot 管理员判定。"
+    "hint": "/login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空时登录可回退 AstrBot 管理员判定，但自动交易会直接禁用。"
   },
   "user_subscriptions": {
     "description": "用户订阅",

@@ -22,23 +22,36 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
 from .constants import (
     ACT_AUTH_REFRESH,
+    ACT_BOOKS,
     ACT_BOOKS_BRIEF,
+    ACT_CANCEL_ORDER,
     ACT_CHECK_AUTH,
+    ACT_GET_CONTEXT_CONTENTS,
+    ACT_GET_CONTEXTS,
+    ACT_MARKET_BUY,
+    ACT_MARKET_GET_ASSET_CLASS,
+    ACT_MARKET_INFO,
     ACT_MARKET_SEARCH,
+    ACT_MARKET_SELL,
+    ACT_USER_OPEN_ORDERS,
     BOOK_PRICE_SCALE,
     DEFAULT_APPID,
     DEFAULT_LANGUAGE,
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
+    EP_ASSET,
     EP_MARKET,
     EP_TRADE,
+    EP_WALLET,
     ERR_BAD_REFRESH_TOKEN,
     ERR_INVALID_TOKEN,
     ERR_TOKEN_REQUIRED,
@@ -47,6 +60,7 @@ from .constants import (
     USER_AGENT,
 )
 from .models import Quote
+from .trade_models import BookLevel, BookSnapshot
 
 
 class MarketApiError(Exception):
@@ -131,20 +145,16 @@ class GaijinMarketClient:
             self._last_request_ts = time.monotonic()
 
     @staticmethod
-    def _unwrap(action: str, payload: dict) -> dict:
+    def _unwrap(action: str, payload: Any) -> Any:
         """拆掉 {"response": {...}} 外壳，并把 success=false 映射成异常。"""
-        body = None
+        body: Any = payload
         if isinstance(payload, dict):
             # 不同接口的外壳不一致，可能是 response / result / 裸对象
             for key in ("response", "result"):
-                if isinstance(payload.get(key), dict):
+                if key in payload:
                     body = payload[key]
                     break
-            if body is None:
-                body = payload
-        else:
-            body = {}
-        if body.get("success") is False:
+        if isinstance(body, dict) and body.get("success") is False:
             error = str(body.get("error") or "UNKNOWN_ERROR")
             if error in (ERR_TOKEN_REQUIRED, ERR_INVALID_TOKEN):
                 raise AuthExpiredError(action, error)
@@ -153,7 +163,15 @@ class GaijinMarketClient:
             raise MarketApiError(action, error)
         return body
 
-    async def _post(self, endpoint: str, action: str, params: dict, *, with_token: str | None) -> dict:
+    async def _post(
+        self,
+        endpoint: str,
+        action: str,
+        params: dict,
+        *,
+        with_token: str | None,
+        retries: int | None = None,
+    ) -> Any:
         """发送一次带重试的表单 POST。"""
         payload: dict[str, Any] = {"action": action, "language": self.language}
         if with_token:
@@ -161,7 +179,8 @@ class GaijinMarketClient:
         payload.update({k: v for k, v in params.items() if v is not None})
 
         last_error: Exception | None = None
-        for attempt in range(self.retries + 1):
+        attempts = self.retries if retries is None else max(0, int(retries))
+        for attempt in range(attempts + 1):
             await self._throttle()
             try:
                 client = await self._get_client()
@@ -179,11 +198,46 @@ class GaijinMarketClient:
                 return self._unwrap(action, response.json())
             except (httpx.HTTPError, ValueError, TransportError) as exc:
                 last_error = exc
-                if attempt >= self.retries:
+                if attempt >= attempts:
                     break
                 # 线性退避后重试
                 await asyncio.sleep(0.8 * (attempt + 1))
         raise TransportError(action, f"请求失败: {last_error}")
+
+    @staticmethod
+    def new_transaction_id() -> int:
+        """生成与网页端同量级的交易幂等 ID。"""
+        return secrets.randbelow(10**15 - 10**6) + 10**6
+
+    @staticmethod
+    def _raw_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(Decimal(str(value)))
+        except (InvalidOperation, TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _book_levels(cls, raw: Any) -> list[BookLevel]:
+        levels: list[BookLevel] = []
+        for entry in raw or []:
+            if isinstance(entry, dict):
+                price = cls._raw_int(entry.get("price") or entry.get("unit_price"))
+                amount = cls._raw_int(
+                    entry.get("amount") or entry.get("quantity") or entry.get("count") or entry.get("qty")
+                )
+                order_id = str(entry.get("id") or entry.get("orderId") or entry.get("order_id") or "")
+                pair_id = str(entry.get("pairId") or entry.get("pair_id") or "")
+            else:
+                try:
+                    price = cls._raw_int(entry[0])
+                    amount = cls._raw_int(entry[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                order_id = str(entry[2]) if len(entry) > 2 else ""
+                pair_id = str(entry[3]) if len(entry) > 3 else ""
+            if price > 0 and amount > 0:
+                levels.append(BookLevel(price_raw=price, amount=amount, order_id=order_id, pair_id=pair_id))
+        return levels
 
     # ------------------------------------------------------------ 业务方法
 
@@ -268,3 +322,169 @@ class GaijinMarketClient:
         if not jwt:
             raise MarketApiError(ACT_AUTH_REFRESH, "NO_JWT", "接口未返回 jwt")
         return str(jwt)
+
+    # ------------------------------------------------------------ 交易接口
+
+    async def fetch_book(self, market_name: str, token: str, *, appid: str = DEFAULT_APPID) -> BookSnapshot:
+        """抓取完整盘口。返回价格、数量和可用的订单 ID。"""
+        body = await self._post(
+            EP_TRADE,
+            ACT_BOOKS,
+            {"appid": appid, "market_name": market_name, "count": 100, "skip": 0},
+            with_token=token,
+        )
+        if not isinstance(body, dict):
+            raise MarketApiError(ACT_BOOKS, "BAD_RESPONSE", "盘口响应格式不正确")
+        sell = self._book_levels(body.get("SELL"))
+        buy = self._book_levels(body.get("BUY"))
+        sell.sort(key=lambda level: level.price_raw)
+        buy.sort(key=lambda level: level.price_raw, reverse=True)
+        return BookSnapshot(
+            market_name=market_name,
+            sell_levels=sell,
+            buy_levels=buy,
+            kind=str(body.get("type") or ""),
+            auctionable=bool(body.get("auctionable")),
+        )
+
+    async def get_market_info(self, token: str) -> dict:
+        body = await self._post(EP_TRADE, ACT_MARKET_INFO, {}, with_token=token)
+        return body if isinstance(body, dict) else {}
+
+    async def get_asset_class(self, market_name: str, token: str, *, appid: str = DEFAULT_APPID) -> dict | list:
+        body = await self._post(
+            EP_TRADE,
+            ACT_MARKET_GET_ASSET_CLASS,
+            {"appid": appid, "name": market_name},
+            with_token=token,
+        )
+        if not isinstance(body, dict):
+            return []
+        value = body.get("asset_class") or []
+        return value if isinstance(value, dict | list) else []
+
+    async def get_contexts(self, token: str, *, appid: str = DEFAULT_APPID) -> list[dict]:
+        body = await self._post(EP_ASSET, ACT_GET_CONTEXTS, {"appid": appid}, with_token=token)
+        if not isinstance(body, dict):
+            return []
+        contexts = body.get("contexts") or []
+        return [item for item in contexts if isinstance(item, dict)] if isinstance(contexts, list) else []
+
+    async def get_context_assets(self, context_id: str, token: str, *, appid: str = DEFAULT_APPID) -> list[dict]:
+        body = await self._post(
+            EP_ASSET,
+            ACT_GET_CONTEXT_CONTENTS,
+            {"appid": appid, "contextid": context_id},
+            with_token=token,
+        )
+        if not isinstance(body, dict):
+            return []
+        assets = body.get("assets") or []
+        return [item for item in assets if isinstance(item, dict)] if isinstance(assets, list) else []
+
+    async def get_open_orders(self, token: str) -> list[dict]:
+        body = await self._post(EP_TRADE, ACT_USER_OPEN_ORDERS, {}, with_token=token)
+        if isinstance(body, list):
+            return [item for item in body if isinstance(item, dict)]
+        if isinstance(body, dict):
+            for key in ("orders", "data"):
+                value = body.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
+    async def get_balance(self, token: str) -> int:
+        """读取 GJN 钱包余额（原始刻度）。该接口使用 Bearer 而不是表单 token。"""
+        await self._throttle()
+        client = await self._get_client()
+        try:
+            response = await client.get(EP_WALLET, headers={"Authorization": f"BEARER {token}"})
+        except httpx.HTTPError as exc:
+            raise TransportError("GetBalance", "TRANSPORT", str(exc)) from exc
+        if response.status_code in (401, 403):
+            raise AuthExpiredError("GetBalance", f"HTTP_{response.status_code}")
+        if response.status_code >= 400:
+            raise MarketApiError("GetBalance", f"HTTP_{response.status_code}")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TransportError("GetBalance", "BAD_RESPONSE", str(exc)) from exc
+        if isinstance(body, dict):
+            body = body.get("balance", body.get("result", 0))
+        return self._raw_int(body)
+
+    async def place_buy_order(
+        self,
+        market_name: str,
+        amount: int,
+        price_raw: int,
+        token: str,
+        *,
+        transact_id: int,
+        appid: str = DEFAULT_APPID,
+        private_mode: bool = True,
+    ) -> Any:
+        return await self._post(
+            EP_TRADE,
+            ACT_MARKET_BUY,
+            {
+                "appid": appid,
+                "market_name": market_name,
+                "amount": int(amount),
+                "currencyid": "gjn",
+                "price": int(price_raw),
+                "agree_stamp": "true",
+                "privateMode": "true" if private_mode else "false",
+                "transactid": int(transact_id),
+                "reqstamp": int(time.time() * 1000),
+            },
+            with_token=token,
+            retries=0,
+        )
+
+    async def place_sell_order(
+        self,
+        context_id: str,
+        asset_id: str,
+        amount: int,
+        price_raw: int,
+        seller_should_get_raw: int,
+        token: str,
+        *,
+        transact_id: int,
+        appid: str = DEFAULT_APPID,
+        private_mode: bool = True,
+    ) -> Any:
+        return await self._post(
+            EP_TRADE,
+            ACT_MARKET_SELL,
+            {
+                "appid": appid,
+                "contextid": context_id,
+                "assetid": asset_id,
+                "amount": int(amount),
+                "currencyid": "gjn",
+                "price": int(price_raw),
+                "seller_should_get": int(seller_should_get_raw),
+                "agree_stamp": "true",
+                "privateMode": "true" if private_mode else "false",
+                "transactid": int(transact_id),
+                "reqstamp": int(time.time() * 1000),
+            },
+            with_token=token,
+            retries=0,
+        )
+
+    async def cancel_order(self, pair_id: str, order_id: str, token: str, *, transact_id: int) -> Any:
+        return await self._post(
+            EP_MARKET,
+            ACT_CANCEL_ORDER,
+            {
+                "pairId": pair_id,
+                "orderId": order_id,
+                "transactid": int(transact_id),
+                "reqstamp": int(time.time() * 1000),
+            },
+            with_token=token,
+            retries=0,
+        )

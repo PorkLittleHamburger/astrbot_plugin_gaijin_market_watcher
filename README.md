@@ -1,4 +1,4 @@
-# Gaijin 市场行情监控
+# Gaijin 市场行情监控与自动交易
 
 监控 [Gaijin Market](https://trade.gaijin.net/market/sell) 上物品的**最低售价**、**最高求购价**与**挂单量**，
 变化时推送到群聊或私聊，可 @ 到订阅者本人。
@@ -10,6 +10,8 @@
 - **群聊聚合**：固定间隔刷新群内全部订阅物品，合并成一条快照并分别 @ 订阅者
 - **价格折线图**：每次自动行情推送按物品展示最近 N 次最低售价和最高求购
 - **两步验证登录**：账号密码 + 验证码登录，之后用 refresh_token 自动续期，无需重复登录
+- **自动交易**：监测普通商品盘口，按限价买入，达到税后目标价后卖出；默认模拟，二次确认后实盘
+- **交易控制台**：WebUI 提供规则、预算、订单、日志和急停；聊天交易仅限拥有者私聊
 
 ## 适配平台
 
@@ -26,7 +28,7 @@
 
 ### 1. 安装
 
-需要 AstrBot ≥ 4.23.6、Python ≥ 3.10。
+需要 AstrBot ≥ 4.26.0、Python ≥ 3.10（自动交易 WebUI 页面依赖插件可视化视图 API）。
 
 在 AstrBot 插件市场搜索Gaijin 市场行情监控，或通过以下仓库地址安装：
 ```text
@@ -40,6 +42,7 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 （可发送 AstrBot 内置命令 `/sid` 查看；留空则回退 AstrBot 管理员判定）。
 请注意，插件只会将密码和账户储存在本地。
 登录成功后的续期凭据由插件内部保存，WebUI 不提供令牌字段。
+**自动交易不会回退管理员判定：未配置 `owner_uids` 时交易功能直接禁用。**
 然后在聊天里：
 
 ```
@@ -47,7 +50,33 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 /login <验证码>     提交两步验证码
 ```
 
-### 3. 订阅物品
+### 3. 自动交易（仅拥有者私聊）
+
+自动交易首版只支持 `COMMODITY` 普通商品，拍卖物品会拒绝创建规则。手续费固定为 15%。
+新规则始终从模拟盘开始，必须先在 WebUI 设置总开关、总预算、每日限额、单笔上限和最大数量。
+
+```
+/gjm trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>
+/gjm trade list
+/gjm trade show <规则ID>
+/gjm trade arm <规则ID>                 查看实盘风险摘要
+/gjm trade arm <规则ID> confirm         60 秒内二次确认切换实盘
+/gjm trade pause|resume|disarm <规则ID>
+/gjm trade cancel <规则ID>              撤销本插件为该规则创建的订单并暂停
+/gjm trade delete <规则ID>
+/gjm trade orders
+/gjm trade log [1-50]
+/gjm trade budget
+/gjm trade stop-all confirm             撤销全部自动订单并暂停所有规则
+```
+
+买入逻辑：最低售价达到买入限价后，按阈值内卖单深度买入；允许部分成交，并立即撤销未成交余量。
+卖出逻辑：目标税后价以上的求购单覆盖多少就卖多少；剩余持仓按可达到目标到手价的挂单价发布卖单。
+
+WebUI 的“插件可视化视图 → Gaijin 自动交易”页面可由所有已登录 AstrBot Dashboard 管理员操作。
+聊天侧仍严格要求 `owner_uids` 拥有者和 `FriendMessage` 私聊。
+
+### 4. 订阅物品
 
 ```
 /gjm sub <物品页链接>      订阅（只接受物品页链接）
@@ -57,7 +86,7 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 /gjm refresh interval <秒> [物品链接|编号]
 ```
 
-### 4. 查看与排障
+### 5. 查看与排障
 
 ```
 /gjm status               运行与令牌状态
@@ -95,3 +124,4 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 - 图表只记录成功抓取；失败不会新增数据点，缺少行情时显示占位。
 
 字段清单：`docs/PAYLOAD_FIELDS.md`（输出模板）、`docs/DATA_INVENTORY.md`（插件能取到的全部数据）。
+自动交易实现与状态机：`docs/AUTO_TRADING.md`。

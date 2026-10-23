@@ -1,7 +1,7 @@
 name: astrbot_plugin_gaijin_market_watcher
-display_name: Gaijin 市场行情监控
-help: 发送 /login 登录；发送 /gjm help 查看全部指令。
-short_desc: Gaijin 市场行情监控：/login 登录，按 UID 订阅，价格变化时 @ 推送
+display_name: Gaijin 市场行情监控与自动交易
+help: 发送 /login 登录；发送 /gjm help 查看行情与拥有者自动交易指令。
+short_desc: Gaijin 市场行情监控与拥有者自动交易，含模拟盘、资金限额和 WebUI 控制台
 desc: |
   监控 Gaijin Market（trade.gaijin.net）上物品的实时最低售价、最高求购价与挂单量，
   变化时推送到群聊或私聊。
@@ -11,10 +11,12 @@ desc: |
   - 群聊全量快照：按固定间隔合并群内全部物品并分别 @ 订阅者
   - 价格折线图：自动推送最近 N 次最低售价与最高求购
   - 多平台适配：适配微信/qq平台
-version: 2.17.7
+  - 自动交易：拥有者私聊或 WebUI 管理，默认模拟，二次确认后实盘
+  - 交易安全：固定 15% 手续费、全局预算、每日限额、急停与订单对账
+version: 2.18.0
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
-astrbot_version: ">=4.23.6,<5"
+astrbot_version: ">=4.26.0,<5"
 support_platforms:
   - qq_official
   - qq_official_webhook
@@ -25,3 +27,4 @@ tags:
   - market
   - price-monitor
   - notification
+  - auto-trading
