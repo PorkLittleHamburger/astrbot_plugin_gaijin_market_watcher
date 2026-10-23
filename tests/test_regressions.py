@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
 import json
 import tempfile
@@ -9,8 +11,14 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from core.api_client import AuthExpiredError, GaijinMarketClient, MarketApiError, TransportError
-from core.auth import AuthManager
+from core.api_client import (
+    AuthExpiredError,
+    GaijinMarketClient,
+    MarketApiError,
+    RefreshTokenInvalidError,
+    TransportError,
+)
+from core.auth import AuthManager, LoginRequiredError
 from core.charts import render_price_chart
 from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent
@@ -304,6 +312,16 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(points[-1]["sell"], 16.0)
         self.assertEqual(len(raw["item"]["history"]), 7)
 
+    def test_storage_write_failure_is_returned_to_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = PluginStorage(Path(temp_dir), _Logger())
+            with patch("core.storage.os.replace", side_effect=OSError("disk full")):
+                quote_saved = storage.set_last_quote(Quote("item", sell_min=10.0, buy_max=9.0, timestamp=1000.0))
+                auth_saved = storage.set_auth_state("jwt", "refresh")
+
+        self.assertFalse(quote_saved)
+        self.assertFalse(auth_saved)
+
     def test_price_chart_is_valid_png(self) -> None:
         points = [{"t": 1000 + index, "sell": 10 + index, "buy": 8 + index} for index in range(5)]
 
@@ -518,9 +536,143 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         watcher._next_due["item"] = time.time()
         watcher._auth_backoff_until = time.time() + 600
 
-        self.assertGreater(watcher._next_wait_seconds(), 500)
+        self.assertEqual(watcher._next_wait_seconds(), 60.0)
+        self.assertGreater(watcher._auth_backoff_remaining(), 500)
         self.assertEqual(await watcher.poll_items(["item"]), [])
         self.assertEqual(watcher.poll_count, 0)
+
+    async def test_auth_backoff_skips_group_snapshots(self) -> None:
+        group_umo = "test:GroupMessage:group"
+
+        class _Config:
+            enabled_subscriptions = [Subscription("alice", "item", target_umo=group_umo, interval=5)]
+            watched_market_names = ["item"]
+            item_interval = 0
+            appid = "1067"
+            group_push_interval = 5
+            chart_history_points = 5
+
+            @staticmethod
+            def interval_of(_market_name: str) -> int:
+                return 5
+
+            @staticmethod
+            def display_name_of(_market_name: str) -> str:
+                return "Item"
+
+        class _Notifier(_WatcherNotifier):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def session_of(self, _uid: str) -> str:
+                return group_umo
+
+            async def push_group_snapshot(self, _umo: str, _items: list[SnapshotItem]) -> bool:
+                self.calls += 1
+                return True
+
+        notifier = _Notifier()
+        watcher = MarketWatcher(
+            client=object(),
+            auth=object(),
+            storage=_Storage(),
+            config=_Config(),
+            notifier=notifier,
+            logger=_Logger(),
+        )
+        watcher._auth_backoff_until = time.time() + 600
+        watcher._next_group_push = {group_umo: time.time() - 1}
+
+        result = await watcher.poll_due_groups()
+
+        self.assertEqual(result, {})
+        self.assertEqual(notifier.calls, 0)
+        self.assertEqual(watcher._next_wait_seconds(), 60.0)
+        self.assertGreater(watcher._auth_backoff_remaining(), 500)
+
+    async def test_transport_error_during_token_refresh_does_not_return_expired_token(self) -> None:
+        class _Config:
+            jwt_token = "expired.invalid.jwt"
+            refresh_token = "refresh-token"
+            account_email = ""
+            account_password = ""
+
+        class _Storage:
+            def get_auth_state(self) -> dict:
+                return {}
+
+            def get_pending_login(self) -> dict:
+                return {}
+
+            def set_auth_state(self, *_args, **_kwargs) -> bool:
+                return True
+
+        class _Client:
+            async def authorize_by_refresh_token(self, _refresh_token: str) -> str:
+                raise TransportError("refresh", "HTTP 503")
+
+        auth = AuthManager(_Client(), _Storage(), _Config(), _Logger())
+        auth.bootstrap()
+
+        with self.assertRaises(TransportError):
+            await auth.get_token(force_refresh=True)
+        self.assertIn("503", auth.status()["last_error"])
+
+    async def test_invalid_refresh_token_requires_login(self) -> None:
+        class _Config:
+            jwt_token = ""
+            refresh_token = "bad-refresh-token"
+            account_email = ""
+            account_password = ""
+
+        class _Storage:
+            def get_auth_state(self) -> dict:
+                return {}
+
+            def get_pending_login(self) -> dict:
+                return {}
+
+            def set_auth_state(self, *_args, **_kwargs) -> bool:
+                return True
+
+        class _Client:
+            async def authorize_by_refresh_token(self, _refresh_token: str) -> str:
+                raise RefreshTokenInvalidError("refresh", "BAD_REFRESH_TOKEN")
+
+        auth = AuthManager(_Client(), _Storage(), _Config(), _Logger())
+        auth.bootstrap()
+
+        with self.assertRaises(LoginRequiredError):
+            await auth.get_token(force_refresh=True)
+
+    async def test_force_refresh_does_not_reuse_rejected_unexpired_token(self) -> None:
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 3600}).encode()).decode()
+
+        class _Config:
+            jwt_token = f"e30.{payload}.signature"
+            refresh_token = "refresh-token"
+            account_email = ""
+            account_password = ""
+
+        class _Storage:
+            def get_auth_state(self) -> dict:
+                return {}
+
+            def get_pending_login(self) -> dict:
+                return {}
+
+            def set_auth_state(self, *_args, **_kwargs) -> bool:
+                return True
+
+        class _Client:
+            async def authorize_by_refresh_token(self, _refresh_token: str) -> str:
+                raise TransportError("refresh", "HTTP 503")
+
+        auth = AuthManager(_Client(), _Storage(), _Config(), _Logger())
+        auth.bootstrap()
+
+        with self.assertRaises(TransportError):
+            await auth.get_token(force_refresh=True)
 
     async def test_non_auth_error_after_token_refresh_does_not_trigger_backoff(self) -> None:
         class _Auth:
@@ -548,6 +700,62 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         await watcher.poll_items(["item"])
 
+        self.assertEqual(watcher._auth_backoff_remaining(), 0)
+        self.assertIn("503", watcher.last_poll_error)
+
+    async def test_transient_token_error_retries_on_normal_interval(self) -> None:
+        class _Auth:
+            async def get_token(self, **_kwargs) -> str:
+                raise TransportError("refresh", "HTTP 503")
+
+        class _Client:
+            async def fetch_quote(self, *_args, **_kwargs):
+                raise AssertionError("不应在无令牌时抓取行情")
+
+        watcher = MarketWatcher(
+            client=_Client(),
+            auth=_Auth(),
+            storage=_Storage(),
+            config=_WatcherConfig(interval=5),
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+        before = time.time()
+
+        await watcher.poll_items(["item"])
+
+        self.assertEqual(watcher._auth_backoff_remaining(), 0)
+        self.assertIn("503", watcher.last_poll_error)
+        self.assertGreaterEqual(watcher._next_due["item"], before + 4.9)
+
+    async def test_transient_error_during_forced_refresh_does_not_trigger_backoff(self) -> None:
+        class _Auth:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def get_token(self, *, force_refresh: bool = False) -> str:
+                self.calls += 1
+                if force_refresh:
+                    raise TransportError("refresh", "HTTP 503")
+                return "expired-token"
+
+        class _Client:
+            async def fetch_quote(self, *_args, **_kwargs):
+                raise AuthExpiredError("fetch", "INVALID_TOKEN")
+
+        auth = _Auth()
+        watcher = MarketWatcher(
+            client=_Client(),
+            auth=auth,
+            storage=_Storage(),
+            config=_WatcherConfig(interval=5),
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+
+        await watcher.poll_items(["item"])
+
+        self.assertEqual(auth.calls, 2)
         self.assertEqual(watcher._auth_backoff_remaining(), 0)
         self.assertIn("503", watcher.last_poll_error)
 
@@ -627,6 +835,97 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             ["alice", "bob"],
         )
         self.assertEqual([item.market_name for item in notifier.snapshots[group_b]], ["item-b"])
+
+    async def test_concurrent_poll_calls_are_serialized(self) -> None:
+        class _Config:
+            enabled_subscriptions: list[Subscription] = []
+            watched_market_names = ["item"]
+            item_interval = 0
+            appid = "1067"
+            group_push_interval = 30
+            chart_history_points = 5
+
+            @staticmethod
+            def interval_of(_market_name: str) -> int:
+                return 5
+
+            @staticmethod
+            def display_name_of(_market_name: str) -> str:
+                return "Item"
+
+        class _Auth:
+            async def get_token(self, **_kwargs) -> str:
+                return "token"
+
+        class _SlowClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.active = 0
+                self.max_active = 0
+                self.first_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def fetch_quote(self, market_name: str, *_args, **_kwargs) -> Quote:
+                self.calls += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.first_started.set()
+                await self.release.wait()
+                self.active -= 1
+                return Quote(market_name, sell_min=10.0, buy_max=9.0, display_name="Item")
+
+        class _CachedStorage(_Storage):
+            def get_item_meta(self, _market_name: str) -> dict:
+                return {"cached": True}
+
+        client = _SlowClient()
+        watcher = MarketWatcher(
+            client=client,
+            auth=_Auth(),
+            storage=_CachedStorage(),
+            config=_Config(),
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+
+        first = asyncio.create_task(watcher.poll_items(["item"]))
+        await asyncio.wait_for(client.first_started.wait(), timeout=1)
+        second = asyncio.create_task(watcher.poll_items(["item"]))
+        await asyncio.sleep(0.02)
+
+        self.assertEqual(client.max_active, 1)
+        client.release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.max_active, 1)
+
+    def test_idle_watcher_uses_long_sleep(self) -> None:
+        class _Config:
+            enabled_subscriptions: list[Subscription] = []
+            watched_market_names: list[str] = []
+            item_interval = 0
+            appid = "1067"
+            group_push_interval = 30
+            chart_history_points = 5
+
+            @staticmethod
+            def interval_of(_market_name: str) -> int:
+                return 30
+
+            @staticmethod
+            def display_name_of(_market_name: str) -> str:
+                return ""
+
+        watcher = MarketWatcher(
+            client=object(),
+            auth=object(),
+            storage=object(),
+            config=_Config(),
+            notifier=_WatcherNotifier(),
+            logger=_Logger(),
+        )
+
+        self.assertEqual(watcher._next_wait_seconds(), 60.0)
 
     def test_empty_mention_is_not_treated_as_rendered(self) -> None:
         text, used_mention, _unknown = substitute("$mention", {"mention": ""})
@@ -873,6 +1172,102 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('<qqbot-at-user id="alice" />', primary_text)
         self.assertFalse(any(isinstance(part, _Image) for part in context.sent_messages[0].chain))
         self.assertTrue(any(isinstance(part, _Image) for part in context.sent_messages[1].chain))
+
+        class _FailingContext(_Context):
+            def __init__(self) -> None:
+                super().__init__()
+                self.outcomes = [True, False]
+
+            async def send_message(self, _umo: str, chain) -> bool:
+                self.sent_messages.append(chain)
+                return self.outcomes.pop(0)
+
+        failed_context = _FailingContext()
+        failed_notifier = Notifier(failed_context, _Storage(), _NotifierConfig(), _Logger())
+        with patch.dict(
+            "sys.modules",
+            {
+                "astrbot.api.event": event_module,
+                "astrbot.api.message_components": components_module,
+            },
+        ):
+            failed_sent = await failed_notifier._send_blocks("test:GroupMessage:group", [block])
+
+        self.assertFalse(failed_sent)
+        self.assertEqual(len(failed_context.sent_messages), 2)
+
+    async def test_qq_single_image_stays_inline_without_native_group_mention(self) -> None:
+        class _MessageChain:
+            def __init__(self) -> None:
+                self.chain: list[object] = []
+                self.markdown = None
+
+            def use_markdown(self, value: bool) -> None:
+                self.markdown = value
+
+        class _Plain:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class _At:
+            pass
+
+        class _Image:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+
+            @classmethod
+            def fromBytes(cls, data: bytes):
+                return cls(data)
+
+        class _Context:
+            def __init__(self) -> None:
+                self.sent_messages: list[object] = []
+
+            def get_config(self) -> dict:
+                return {"platform": [{"id": "test", "type": "qq_official"}]}
+
+            async def send_message(self, _umo: str, chain) -> bool:
+                self.sent_messages.append(chain)
+                return True
+
+        event_module = ModuleType("astrbot.api.event")
+        event_module.MessageChain = _MessageChain
+        components_module = ModuleType("astrbot.api.message_components")
+        components_module.At = _At
+        components_module.Image = _Image
+        components_module.Plain = _Plain
+        block = DeliveryBlock(
+            text="Item A",
+            title="Item A",
+            mentions=[("alice", "Alice")],
+            images=[b"\x89PNG\r\n\x1a\n"],
+        )
+
+        async def _send(umo: str, mention_users: bool):
+            context = _Context()
+            config = _NotifierConfig()
+            config.mention_users = mention_users
+            notifier = Notifier(context, _Storage(), config, _Logger())
+            with patch.dict(
+                "sys.modules",
+                {
+                    "astrbot.api.event": event_module,
+                    "astrbot.api.message_components": components_module,
+                },
+            ):
+                sent = await notifier._send_blocks(umo, [block])
+            return sent, context.sent_messages
+
+        private_sent, private_messages = await _send("test:FriendMessage:alice", True)
+        disabled_sent, disabled_messages = await _send("test:GroupMessage:group", False)
+
+        self.assertTrue(private_sent)
+        self.assertEqual(len(private_messages), 1)
+        self.assertTrue(any(isinstance(part, _Image) for part in private_messages[0].chain))
+        self.assertTrue(disabled_sent)
+        self.assertEqual(len(disabled_messages), 1)
+        self.assertTrue(any(isinstance(part, _Image) for part in disabled_messages[0].chain))
 
     async def test_subscriber_only_receives_own_failure_details(self) -> None:
         class _FilterConfig(_NotifierConfig):

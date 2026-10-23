@@ -516,14 +516,18 @@ class Notifier:
 
         platform_type = await self._platform_type(umo) if umo else ""
         total_images = sum(len(block.images) for block in blocks)
-        has_group_mentions = any(block.mentions for block in blocks)
-        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and (total_images > 1 or has_group_mentions)
+        prepared = [(block, self._mention_plans(platform_type, block.mentions, umo)) for block in blocks]
+        has_native_group_mentions = any(
+            plan.style == platforms.STYLE_MARKDOWN_TEXT for _block, plans in prepared for _uid, _name, plan in plans
+        )
+        defer_images = platform_type in platforms.ONE_IMAGE_PLATFORMS and (
+            total_images > 1 or (total_images > 0 and has_native_group_mentions)
+        )
         chain = MessageChain()
         use_markdown = False
-        for index, block in enumerate(blocks):
+        for index, (block, plans) in enumerate(prepared):
             if index > 0:
                 chain.chain.append(Plain(BLOCK_SEPARATOR))
-            plans = self._mention_plans(platform_type, block.mentions, umo)
             if any(plan.style == platforms.STYLE_MARKDOWN_TEXT for _, _, plan in plans):
                 use_markdown = True
             if plans and all(plan.style == platforms.STYLE_AT_COMPONENT for _, _, plan in plans):
@@ -553,12 +557,14 @@ class Notifier:
         except Exception as exc:
             self.logger.warning(f"推送到 {umo} 失败: {exc}")
             return False
+        delivery_ok = sent
         if sent and defer_images:
             for block in blocks:
                 for source in block.images:
                     if not await self._send_block_image(umo, block.title, source):
                         self.logger.warning(f"[GJM] 图表补发失败（{block.title or umo}）")
-        return sent
+                        delivery_ok = False
+        return delivery_ok
 
     async def _send_block_image(self, umo: str, title: str, source: str | bytes) -> bool:
         """QQ 官方单消息只支持一张图时，为物品单独补发图片。"""
@@ -568,7 +574,11 @@ class Notifier:
         chain = MessageChain()
         if title:
             chain.chain.append(Plain(title))
-        self._append_image(chain, source)
+        try:
+            self._append_image(chain, source)
+        except Exception as exc:
+            self.logger.warning(f"构造图片补发消息失败（{title or umo}）：{exc}")
+            return False
         try:
             return bool(await self.context.send_message(umo, chain))
         except Exception as exc:

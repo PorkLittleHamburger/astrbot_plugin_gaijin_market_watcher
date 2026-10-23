@@ -58,6 +58,9 @@ class MarketWatcher:
 
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
+        #: 手动刷新、普通轮询和群快照可能从不同协程同时触发，
+        #: 串行化抓取与分发，避免重复请求和重复推送。
+        self._poll_lock = asyncio.Lock()
         self._running = False
         self._auth_backoff_until = 0.0
         self.last_poll_at: float = 0.0
@@ -170,13 +173,10 @@ class MarketWatcher:
         now = time.time()
         backoff_remaining = self._auth_backoff_remaining(now)
         if backoff_remaining > 0:
-            group_waits = [deadline - now for deadline in self._next_group_push.values()]
-            if group_waits:
-                return max(1.0, min(backoff_remaining, min(group_waits), MAX_SLEEP_SECONDS))
-            return max(1.0, backoff_remaining)
+            return max(1.0, min(backoff_remaining, MAX_SLEEP_SECONDS))
         waits = [self._next_due[mn] - now for mn in self._private_market_names() if mn in self._next_due]
         waits.extend(deadline - now for deadline in self._next_group_push.values())
-        wait = min(waits) if waits else 1.0
+        wait = min(waits) if waits else MAX_SLEEP_SECONDS
         return max(1.0, min(wait, MAX_SLEEP_SECONDS))
 
     def _group_targets(self) -> list[str]:
@@ -225,6 +225,9 @@ class MarketWatcher:
 
     async def poll_due_groups(self) -> dict[str, bool]:
         """到期群统一刷新物品并发送完整快照。"""
+        if self._auth_backoff_remaining() > 0:
+            self.logger.debug("市场鉴权仍在退避期内，本轮群快照跳过。")
+            return {}
         now = time.time()
         self._sync_group_schedule(now)
         due = [target for target, deadline in self._next_group_push.items() if now >= deadline]
@@ -257,6 +260,11 @@ class MarketWatcher:
         return results
 
     async def poll_items(self, names: list[str]) -> list[TriggerEvent]:
+        """串行抓取指定物品并分发事件。"""
+        async with self._poll_lock:
+            return await self._poll_items_unlocked(names)
+
+    async def _poll_items_unlocked(self, names: list[str]) -> list[TriggerEvent]:
         """抓取指定物品 -> 判定 -> 推送给订阅者。
 
         返回值：本轮真正产生的事件（按用户聚合后展平），供调用方展示。
@@ -280,6 +288,24 @@ class MarketWatcher:
                 self._latest_errors[market_name] = str(exc)
             await self._handle_auth_failure(str(exc))
             return []
+        except MarketApiError as exc:
+            error = f"获取市场令牌失败: {exc}"
+            retry_at = time.time()
+            for market_name in watched:
+                self._latest_errors[market_name] = error
+                self._next_due[market_name] = retry_at + self.config.interval_of(market_name)
+            self.last_poll_error = error
+            self.logger.warning(error)
+            return []
+        except Exception as exc:
+            error = f"获取市场令牌时发生未知错误: {exc}"
+            retry_at = time.time()
+            for market_name in watched:
+                self._latest_errors[market_name] = error
+                self._next_due[market_name] = retry_at + self.config.interval_of(market_name)
+            self.last_poll_error = error
+            self.logger.error(error)
+            return []
         self._auth_backoff_until = 0.0
 
         # ---------- 0) 先读取上一轮行情 ----------
@@ -293,6 +319,7 @@ class MarketWatcher:
         quotes: dict[str, Quote] = {}
         failures: list[Quote] = []
         auth_error = ""
+        cache_write_error = ""
 
         for index, market_name in enumerate(watched):
             if index > 0 and self.config.item_interval > 0:
@@ -312,10 +339,15 @@ class MarketWatcher:
                     self._latest_errors[market_name] = auth_error
                     failures.append(Quote(market_name=market_name, display_name=display, error=str(refresh_exc)))
                     break
+                except MarketApiError as refresh_exc:
+                    error = f"{exc}; 刷新令牌异常: {refresh_exc}"
+                    self._latest_errors[market_name] = error
+                    failures.append(Quote(market_name=market_name, display_name=display, error=error))
+                    break
                 except Exception as refresh_exc:
-                    auth_error = f"{exc}; 刷新令牌异常: {refresh_exc}"
-                    self._latest_errors[market_name] = auth_error
-                    failures.append(Quote(market_name=market_name, display_name=display, error=auth_error))
+                    error = f"{exc}; 刷新令牌异常: {refresh_exc}"
+                    self._latest_errors[market_name] = error
+                    failures.append(Quote(market_name=market_name, display_name=display, error=error))
                     break
 
                 try:
@@ -360,7 +392,9 @@ class MarketWatcher:
 
             quotes[market_name] = quote
             self._latest_errors.pop(market_name, None)
-            self.storage.set_last_quote(quote)
+            if self.storage.set_last_quote(quote) is False:
+                cache_write_error = f"行情缓存写入失败：{market_name}"
+                self.logger.warning(cache_write_error)
             self._ensure_item_meta(market_name, quote.title)
 
         if auth_error:
@@ -391,7 +425,7 @@ class MarketWatcher:
         elif failures:
             self.last_poll_error = failures[0].error
         else:
-            self.last_poll_error = ""
+            self.last_poll_error = cache_write_error
         return [ev for evs in per_user.values() for ev in evs]
 
     # ------------------------------------------------------------ 物品元数据
@@ -419,7 +453,7 @@ class MarketWatcher:
                 hit = next((a for a in assets if str(a.get("hash_name")) == market_name), None)
                 if not hit:
                     continue
-                self.storage.set_item_meta(
+                persisted = self.storage.set_item_meta(
                     market_name,
                     {
                         "icon": str(hit.get("icon") or ""),
@@ -428,6 +462,9 @@ class MarketWatcher:
                         "name": str(hit.get("name") or ""),
                     },
                 )
+                if persisted is False:
+                    self.logger.warning(f"[GJM] 物品元数据写入失败：{display_name or market_name}")
+                    return
                 self.logger.info(f"[GJM] 已缓存物品元数据：{display_name or market_name}")
                 return
         except Exception as exc:

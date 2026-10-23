@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -53,15 +54,19 @@ class PluginStorage:
             self.logger.warning(f"读取 {path.name} 失败，使用默认值: {exc}")
             return default
 
-    def _save(self, path: Path, data: Any) -> None:
+    def _save(self, path: Path, data: Any) -> bool:
         # 先写临时文件再原子替换，避免进程中断留下半个 JSON
+        tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp = path.with_suffix(path.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as fp:
                 json.dump(data, fp, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
+            return True
         except Exception as exc:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
             self.logger.warning(f"写入 {path.name} 失败: {exc}")
+            return False
 
     # ------------------------------------------------------------- 最近行情
 
@@ -70,9 +75,9 @@ class PluginStorage:
         item = raw.get(market_name) if isinstance(raw, dict) else None
         return Quote.from_dict(item) if isinstance(item, dict) else None
 
-    def set_last_quote(self, quote: Quote) -> None:
+    def set_last_quote(self, quote: Quote) -> bool:
         if not quote.ok:
-            return
+            return False
         data = self._load(self._quotes_file, {})
         if not isinstance(data, dict):
             data = {}
@@ -93,7 +98,7 @@ class PluginStorage:
         record = quote.to_dict()
         record["history"] = history[-MAX_STORED_PRICE_POINTS:]
         data[quote.market_name] = record
-        self._save(self._quotes_file, data)
+        return self._save(self._quotes_file, data)
 
     def get_price_history(self, market_name: str, limit: int = MAX_STORED_PRICE_POINTS) -> list[dict[str, Any]]:
         """返回某个物品最近的行情点，兼容旧版独立 history.json。"""
@@ -145,43 +150,44 @@ class PluginStorage:
         data = self._load(self._pending_login_file, {})
         return data if isinstance(data, dict) else {}
 
-    def set_pending_login(self, data: dict) -> None:
+    def set_pending_login(self, data: dict) -> bool:
         """保存登录中间态：只含会话 Cookie 与表单字段，**不含账号密码**。"""
         if not isinstance(data, dict) or not data:
-            self.clear_pending_login()
-            return
-        self._save(self._pending_login_file, data)
+            return self.clear_pending_login()
+        return self._save(self._pending_login_file, data)
 
-    def clear_pending_login(self) -> None:
+    def clear_pending_login(self) -> bool:
         try:
             if self._pending_login_file.exists():
                 self._pending_login_file.unlink()
+            return True
         except Exception as exc:
             self.logger.warning(f"清理登录中间态失败: {exc}")
+            return False
 
     # ------------------------------------------------------------- 会话映射
 
-    def remember_session(self, uid: str, umo: str, platform: str = "", name: str = "") -> None:
+    def remember_session(self, uid: str, umo: str, platform: str = "", name: str = "") -> bool:
         """记住 UID -> 会话(UMO) 的映射，以及该用户的显示名。
 
         UID -> 会话是"用 UID 配置推送对象 / @ 订阅者"的关键：
         AstrBot 发送消息只能按会话(UMO)寻址，所以必须先把 UID 落到具体会话上。
         """
         if not uid or not umo:
-            return
+            return False
         data = self._load(self._sessions_file, {})
         if not isinstance(data, dict):
             data = {}
         entry = data.get(uid) if isinstance(data.get(uid), dict) else {}
         if entry.get("umo") == umo and entry.get("platform") == platform and (not name or entry.get("name") == name):
-            return  # 无变化则不落盘
+            return True  # 无变化则不落盘
         data[uid] = {
             "umo": umo,
             "platform": platform or entry.get("platform", ""),
             "name": name or entry.get("name", ""),
             "updated_at": time.time(),
         }
-        self._save(self._sessions_file, data)
+        return self._save(self._sessions_file, data)
 
     def get_user_name(self, uid: str) -> str:
         """取缓存里的用户显示名（@ 时用；没有则返回空串）。"""
@@ -211,17 +217,17 @@ class PluginStorage:
             return ""
         return str(names.get(market_name) or "")
 
-    def set_item_name(self, market_name: str, name: str) -> None:
+    def set_item_name(self, market_name: str, name: str) -> bool:
         """缓存物品显示名，避免推送里出现冰冷的 ID。"""
         if not market_name or not name:
-            return
+            return False
         names = self._load(self._names_file, {})
         if not isinstance(names, dict):
             names = {}
         if names.get(market_name) == name:
-            return
+            return True
         names[market_name] = name
-        self._save(self._names_file, names)
+        return self._save(self._names_file, names)
 
     # ------------------------------------------------------------- 物品元数据
 
@@ -231,15 +237,15 @@ class PluginStorage:
         item = data.get(market_name) if isinstance(data, dict) else None
         return item if isinstance(item, dict) else {}
 
-    def set_item_meta(self, market_name: str, meta: dict[str, Any]) -> None:
+    def set_item_meta(self, market_name: str, meta: dict[str, Any]) -> bool:
         """缓存物品元数据（供 payload 模板的 image / tags / rarity / color 使用）。"""
         if not market_name or not meta:
-            return
+            return False
         data = self._load(self._meta_file, {})
         if not isinstance(data, dict):
             data = {}
         data[market_name] = meta
-        self._save(self._meta_file, data)
+        return self._save(self._meta_file, data)
 
     # ------------------------------------------------------------- 鉴权状态
 
@@ -247,10 +253,10 @@ class PluginStorage:
         state = self._load(self._auth_file, {})
         return state if isinstance(state, dict) else {}
 
-    def set_auth_state(self, token: str, refresh_token: str) -> None:
+    def set_auth_state(self, token: str, refresh_token: str) -> bool:
         """只保存令牌，绝不保存账号密码。"""
         if not token and not refresh_token:
-            return
+            return True
         state = self.get_auth_state()
         if token:
             state["token"] = token
@@ -258,7 +264,7 @@ class PluginStorage:
         if refresh_token:
             state["refresh_token"] = refresh_token
             state["refresh_updated_at"] = time.time()
-        self._save(self._auth_file, state)
+        return self._save(self._auth_file, state)
 
     def stats(self) -> dict[str, int]:
         return {

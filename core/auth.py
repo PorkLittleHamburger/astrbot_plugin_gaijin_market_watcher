@@ -34,7 +34,7 @@ from urllib.parse import urljoin
 import httpx
 
 from . import constants as C
-from .api_client import GaijinMarketClient, MarketApiError, RefreshTokenInvalidError
+from .api_client import AuthExpiredError, GaijinMarketClient, MarketApiError, RefreshTokenInvalidError
 
 # ---------------------------------------------------------------- 表单解析
 _FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.S | re.I)
@@ -279,13 +279,24 @@ class AuthManager:
         self._config_refresh_token = config_refresh
         return updated
 
-    def absorb(self, jwt: str = "", refresh_token: str = "") -> None:
-        """吸收新令牌并落盘（只写令牌，不写密码）。"""
+    def absorb(self, jwt: str = "", refresh_token: str = "") -> bool:
+        """吸收新令牌并落盘（只写令牌，不写密码）。
+
+        返回持久化是否成功。内存中的令牌即使写盘失败仍可继续使用，
+        但调用方和状态页必须能看见“重启后可能丢失”的风险。
+        """
         if jwt:
             self._jwt = jwt
         if refresh_token:
             self._refresh_token = refresh_token
-        self.storage.set_auth_state(self._jwt if jwt else "", self._refresh_token if refresh_token else "")
+        persisted = self.storage.set_auth_state(
+            self._jwt if jwt else "",
+            self._refresh_token if refresh_token else "",
+        )
+        if persisted is False:
+            self.logger.error("[GJM] 鉴权令牌已更新到内存，但持久化失败；重启后可能丢失。")
+            return False
+        return True
 
     # ------------------------------------------------------------ 状态
 
@@ -333,11 +344,28 @@ class AuthManager:
         if not force_refresh and self.is_token_valid():
             return self._jwt
 
-        await self.try_refresh()
+        if not self._refresh_token:
+            self._last_refresh_error = "未配置 refresh_token"
+            if not force_refresh and self._jwt and self.token_seconds_left() > 0:
+                return self._jwt
+            raise LoginRequiredError("没有可用的市场令牌，且未配置 refresh_token。")
 
-        if self._jwt:
-            return self._jwt
-        raise LoginRequiredError("没有可用的市场令牌，且 refresh_token 续期失败。")
+        try:
+            await self.refresh()
+        except (RefreshTokenInvalidError, AuthExpiredError) as exc:
+            self._last_refresh_error = str(exc)
+            if not force_refresh and self._jwt and self.token_seconds_left() > 0:
+                return self._jwt
+            raise LoginRequiredError("没有可用的市场令牌，refresh_token 已失效。") from exc
+        except MarketApiError as exc:
+            # 网络抖动、服务端 5xx 等临时错误不能伪装成鉴权失效，
+            # 否则调度层会停摆十分钟，而不是按正常间隔继续重试。
+            self._last_refresh_error = str(exc)
+            if not force_refresh and self._jwt and self.token_seconds_left() > 0:
+                return self._jwt
+            raise
+
+        return self._jwt
 
     async def try_refresh(self) -> bool:
         """尝试用 refresh_token 静默续期，成功返回 True（不抛异常）。"""
@@ -360,8 +388,8 @@ class AuthManager:
         if not self._refresh_token:
             raise RefreshTokenInvalidError("cln_authorize_by_refresh_token", "NO_REFRESH_TOKEN")
         jwt = await self.client.authorize_by_refresh_token(self._refresh_token)
-        self.absorb(jwt=jwt)
-        self._last_refresh_error = ""
+        persisted = self.absorb(jwt=jwt)
+        self._last_refresh_error = "" if persisted else "JWT 已更新到内存，但持久化失败。"
         self.logger.info("已用 refresh_token 换取新的市场令牌。")
         return jwt
 
@@ -445,7 +473,7 @@ class AuthManager:
                     "登录未能完成：站点返回的页面既没有验证码输入框，也没有下发 refresh_token。"
                     "可能是站点改版或触发了风控，请稍后重试或改用 refresh_token 导入。"
                 )
-            self.storage.set_pending_login(
+            persisted = self.storage.set_pending_login(
                 PendingLogin(
                     cookies=dump_cookies(browser),
                     submit_url=str(response.url) or submit_url,
@@ -453,6 +481,8 @@ class AuthManager:
                     code_field=code_field,
                 ).to_dict()
             )
+            if persisted is False:
+                raise LoginError("无法保存登录中间状态，请检查插件数据目录写入权限。")
             self.logger.info(f"SSO 登录需要验证码，等待提交（字段 {code_field}）。")
             return LoginStep(
                 need_code=True,
@@ -488,7 +518,8 @@ class AuthManager:
             for _ in range(5):
                 token = self._grab_refresh_token(response)
                 if token:
-                    self.storage.clear_pending_login()
+                    if self.storage.clear_pending_login() is False:
+                        self.logger.warning("验证码登录成功，但清理登录中间状态失败。")
                     await self._finish_login(token)
                     return LoginStep(
                         need_code=False,

@@ -93,7 +93,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.17.6",
+    "2.17.7",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -358,7 +358,8 @@ class GaijinMarketWatcher(Star):
         if self._seen_sessions.get(uid) == umo and not name:
             return
         self._seen_sessions[uid] = umo
-        self.storage.remember_session(uid, umo, self._platform_of(event), name)
+        if self.storage.remember_session(uid, umo, self._platform_of(event), name) is False:
+            self.logger.warning(f"[GJM] 会话映射写入失败：{uid}")
         if self.subscriptions.bind_legacy_target(uid, umo):
             self.watcher.reconfigure()
 
@@ -487,9 +488,9 @@ class GaijinMarketWatcher(Star):
         ok, message = self.subscriptions.subscribe(uid, url, target_umo)
         if ok:
             market_name = self.subscriptions.parse_url(url)
-            self.storage.set_item_name(
-                market_name, self.cfg.display_name_of(market_name) or prettify_market_name(market_name)
-            )
+            display_name = self.cfg.display_name_of(market_name) or prettify_market_name(market_name)
+            if self.storage.set_item_name(market_name, display_name) is False:
+                self.logger.warning(f"[GJM] 物品名称缓存写入失败：{market_name}")
             self.watcher.reconfigure()
         yield event.plain_result(message)
 
