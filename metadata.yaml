@@ -11,7 +11,7 @@ desc: |
   - 群聊全量快照：按固定间隔合并群内全部物品并分别 @ 订阅者
   - 价格折线图：自动推送最近 N 次最低售价与最高求购
   - 多平台适配：适配微信/qq平台
-version: 2.17.0
+version: 2.17.1
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.23.6,<5"
