@@ -93,7 +93,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.16.2",
+    "2.17.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -108,6 +108,7 @@ class GaijinMarketWatcher(Star):
         except Exception:  # 极端情况下回退
             self.data_dir = Path(__file__).resolve().parent / "data"
         self.storage = PluginStorage(self.data_dir, self.logger)
+        self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
 
         # ---------- 各层装配 ----------
         self.client = GaijinMarketClient(
@@ -120,7 +121,12 @@ class GaijinMarketWatcher(Star):
         self.auth = AuthManager(self.client, self.storage, self.cfg, self.logger)
         self.auth.bootstrap()
 
-        self.subscriptions = SubscriptionStore(self.cfg, self._persist_subscriptions, self.logger)
+        self.subscriptions = SubscriptionStore(
+            self.cfg,
+            self._persist_subscriptions,
+            self.logger,
+            resolve_target=self.storage.resolve_uid,
+        )
         self.notifier = Notifier(self.context, self.storage, self.cfg, self.logger)
         self.watcher = MarketWatcher(
             client=self.client,
@@ -218,6 +224,7 @@ class GaijinMarketWatcher(Star):
     def _apply_config(self, data: dict) -> None:
         """把新配置应用到内存中的各层。"""
         self.cfg.reload(data)
+        self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
         # 订阅层持有自己的权威列表，配置变了要同步过去
         self.subscriptions.reload(self.cfg.subscriptions)
         # 让网络层跟随配置变化（语言 / 超时 / 重试）
@@ -261,14 +268,15 @@ class GaijinMarketWatcher(Star):
     def _persist_subscriptions(self, subs: list[Subscription]) -> None:
         """订阅列表落盘：写成 template_list 结构，WebUI 配置页里可直接查看/修改。"""
         # 同一个 UID 折叠成一条；物品分别保存链接和刷新间隔。
-        grouped: dict[str, dict] = {}
+        grouped: dict[tuple[str, str], dict] = {}
         for sub in subs:
             entry = grouped.setdefault(
-                sub.uid,
+                (sub.target_umo, sub.uid),
                 {
                     "__template_key": "user_entry",
                     "enabled": sub.enabled,
                     "uid": sub.uid,
+                    "target": sub.target_umo,
                     "note": self.storage.get_user_name(sub.uid) or sub.display_name,
                     "interval": sub.interval,
                     "mode": sub.mode,
@@ -341,6 +349,8 @@ class GaijinMarketWatcher(Star):
             return
         self._seen_sessions[uid] = umo
         self.storage.remember_session(uid, umo, self._platform_of(event), name)
+        if self.subscriptions.bind_legacy_target(uid, umo):
+            self.watcher.reconfigure()
 
     @staticmethod
     def _platform_of(event: AstrMessageEvent) -> str:
@@ -449,6 +459,7 @@ class GaijinMarketWatcher(Star):
             "/gjm status            运行与令牌状态\n"
             "/gjm refresh mode <模式>  always / only_change\n"
             "/gjm refresh interval <秒> [链接|编号]\n"
+            "群聊会自动按固定间隔发送全部订阅物品和价格图\n"
             "/gjm debug             排障信息"
         )
 
@@ -462,13 +473,14 @@ class GaijinMarketWatcher(Star):
             return
 
         uid = str(event.get_sender_id() or "")
-        ok, message = self.subscriptions.subscribe(uid, url)
+        target_umo = event.unified_msg_origin or ""
+        ok, message = self.subscriptions.subscribe(uid, url, target_umo)
         if ok:
             market_name = self.subscriptions.parse_url(url)
             self.storage.set_item_name(
                 market_name, self.cfg.display_name_of(market_name) or prettify_market_name(market_name)
             )
-            self.watcher.wake()
+            self.watcher.reconfigure()
         yield event.plain_result(message)
 
     @gjm.command("unsub")
@@ -480,14 +492,15 @@ class GaijinMarketWatcher(Star):
             yield event.plain_result("用法：/gjm unsub <编号>\n或：/gjm unsub <物品链接>\n先发送 /gjm mysub 查看编号。")
             return
         uid = str(event.get_sender_id() or "")
+        target_umo = event.unified_msg_origin or ""
         serial = arg[1:] if arg.startswith("#") else arg
         if serial.isdigit():
-            ok, message = self.subscriptions.remove_by_index(uid, int(serial))
+            ok, message = self.subscriptions.remove_by_index(uid, int(serial), target_umo)
         else:
-            ok, message = self.subscriptions.unsubscribe(uid, arg)
+            ok, message = self.subscriptions.unsubscribe(uid, arg, target_umo)
         yield event.plain_result(message)
         if ok:
-            self.watcher.wake()
+            self.watcher.reconfigure()
 
     @gjm.command("mysub")
     async def gjm_mysub(self, event: AstrMessageEvent):
@@ -506,15 +519,18 @@ class GaijinMarketWatcher(Star):
                 yield event.plain_result(f"刷新失败，以下为最近缓存：{exc}")
 
         uid = str(event.get_sender_id() or "")
-        subs = self.subscriptions.subscriptions_of(uid)
+        target_umo = event.unified_msg_origin or ""
+        subs = self.subscriptions.subscriptions_of(uid, target_umo)
         sections: list[str] = []
         if not subs:
             sections.append("【我的订阅】\n你还没有订阅。用 /gjm sub <物品链接> 订阅。")
         else:
-            lines = [f"【我的订阅 · {len(subs)} 件】"]
+            lines = [f"【当前会话中我的订阅 · {len(subs)} 件】"]
             for index, sub in enumerate(subs, start=1):
                 quote = self.storage.get_last_quote(sub.market_name)
-                if sub.mode == REFRESH_ONLY_CHANGE:
+                if platforms.is_group_session(platforms.session_type_of(target_umo)):
+                    mode_text = f"群聊全量，每 {self.cfg.group_push_interval} 秒"
+                elif sub.mode == REFRESH_ONLY_CHANGE:
                     mode_text = f"only_change，每 {ONLY_CHANGE_INTERVAL} 秒检查"
                 else:
                     mode_text = f"always，每 {sub.interval} 秒"
@@ -630,7 +646,10 @@ class GaijinMarketWatcher(Star):
         subs = self.cfg.enabled_subscriptions
         uids = list(dict.fromkeys(s.uid for s in subs))
         lines.append("")
-        lines.append(f"推送：{self.cfg.push_mode}，{len(subs)} 条订阅 / {len(uids)} 个 UID")
+        lines.append(
+            f"推送：{self.cfg.push_mode}，{len(subs)} 条订阅 / {len(uids)} 个 UID；"
+            f"群聊每 {self.cfg.group_push_interval} 秒全量刷新，图表 {self.cfg.chart_history_points} 点"
+        )
         for uid in uids:
             if not self.notifier.session_of(uid):
                 lines.append(f"  ! {uid} 未解析到会话")
@@ -644,13 +663,22 @@ class GaijinMarketWatcher(Star):
     async def gjm_refresh_mode(self, event: AstrMessageEvent):
         """设置当前用户全部订阅的刷新模式。"""
         self._remember(event)
+        if platforms.is_group_session(platforms.session_type_of(event.unified_msg_origin or "")):
+            yield event.plain_result(
+                f"群聊统一每 {self.cfg.group_push_interval} 秒刷新全部物品并推送，不使用个人刷新模式。"
+            )
+            return
         mode = _args_after(event, "gjm", "refresh", "mode").strip().lower()
         if mode == "on_change":
             mode = "only_change"
         if mode not in {"always", "only_change"}:
             yield event.plain_result("用法：/gjm refresh mode <always|only_change>")
             return
-        ok, message = self.subscriptions.set_refresh_mode(str(event.get_sender_id() or ""), mode)
+        ok, message = self.subscriptions.set_refresh_mode(
+            str(event.get_sender_id() or ""),
+            mode,
+            event.unified_msg_origin or "",
+        )
         yield event.plain_result(message)
         if ok:
             self.watcher.reconfigure()
@@ -659,6 +687,11 @@ class GaijinMarketWatcher(Star):
     async def gjm_refresh_interval(self, event: AstrMessageEvent):
         """设置当前用户的全局或单物品刷新间隔（秒）。"""
         self._remember(event)
+        if platforms.is_group_session(platforms.session_type_of(event.unified_msg_origin or "")):
+            yield event.plain_result(
+                f"群聊统一每 {self.cfg.group_push_interval} 秒刷新全部物品并推送，不支持个人刷新间隔。"
+            )
+            return
         parts = _args_after(event, "gjm", "refresh", "interval").split()
         if not parts:
             yield event.plain_result(
@@ -673,17 +706,18 @@ class GaijinMarketWatcher(Star):
             return
         uid = str(event.get_sender_id() or "")
         target = " ".join(parts[1:]).strip()
+        target_umo = event.unified_msg_origin or ""
         serial = target[1:] if target.startswith("#") else target
         if serial.isdigit():
-            ok, message = self.subscriptions.set_interval_by_index(uid, value, int(serial))
+            ok, message = self.subscriptions.set_interval_by_index(uid, value, int(serial), target_umo)
         elif target:
             _, market_name = extract_link_reference(target)
             if not market_name:
                 yield event.plain_result(REJECT_HINT)
                 return
-            ok, message = self.subscriptions.set_interval(uid, value, market_name)
+            ok, message = self.subscriptions.set_interval(uid, value, market_name, target_umo)
         else:
-            ok, message = self.subscriptions.set_interval(uid, value)
+            ok, message = self.subscriptions.set_interval(uid, value, "", target_umo)
         yield event.plain_result(message)
         if ok:
             self.watcher.reconfigure()

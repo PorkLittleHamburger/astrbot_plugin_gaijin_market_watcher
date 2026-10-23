@@ -1,6 +1,6 @@
 # Gaijin 市场行情监控插件 · 数据清单
 
-> 版本 `v2.16.2`　|　更新日期 2026-10-22　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
+> 版本 `v2.17.0`　|　更新日期 2026-10-22　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
 
 ---
 
@@ -103,16 +103,21 @@ depth      = SELL 570 / BUY 2168
 
 ## 六、插件本地落盘　`data/plugin_data/astrbot_plugin_gaijin_market_watcher/`
 
+群聊快照按 `group_push_interval` 周期主动刷新群内全部订阅物品。同一物品只保留一个行情块，
+该物品的全部群订阅者都会出现在对应 @ 列表中；没有成功行情时显示占位。
+
 | 文件 | 内容 |
 | --- | --- |
-| `quotes.json` | 每物品最近一次行情：`market_name / sell_min / buy_max / sell_depth / buy_depth / timestamp / display_name / app_id / kind / error` |
+| `quotes.json` | 每物品最近一次行情，并内嵌最近最多 50 个 `{t, sell, buy}` 价格点，用于折线图 |
 | `names.json` | `market_name → 显示名` 缓存 |
 | `sessions.json` | `UID → 会话 UMO` + 用户昵称（推送与 @ 的前提） |
 | `pending_login.json` | 待提交验证码的临时会话 Cookie 与表单字段（15 分钟过期） |
 | `items_meta.json` | 物品图标、标签、稀有度与颜色缓存 |
 | `auth.json` | `refresh_token` + `token` + 更新时间（**不含账号密码**） |
 
-用户订阅与刷新间隔保存在 AstrBot 插件配置 `user_subscriptions` 中，不再写入独立的 `subs.json`。
+用户订阅、所属会话 `target`、刷新间隔与模式保存在 AstrBot 插件配置 `user_subscriptions` 中。
+
+旧版独立 `history.json` 只作为兼容数据源读取；新行情点直接写入 `quotes.json`，不再产生额外历史文件写盘。
 
 ---
 

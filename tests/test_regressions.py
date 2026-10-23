@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -9,11 +11,13 @@ from unittest.mock import patch
 
 from core.api_client import AuthExpiredError, GaijinMarketClient, MarketApiError, TransportError
 from core.auth import AuthManager
+from core.charts import render_price_chart
 from core.config import PluginConfig
-from core.models import MonitorSpec, Quote, Subscription, TriggerEvent
+from core.models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent
 from core.notifier import Notifier
 from core.payload import substitute
 from core.resolver import extract_link_reference
+from core.storage import PluginStorage
 from core.subscriptions import SubscriptionStore
 from core.watcher import MarketWatcher
 
@@ -35,6 +39,8 @@ class _Logger:
 class _Storage:
     def __init__(self) -> None:
         self.sessions: dict[str, str] = {}
+        self.quotes: dict[str, Quote] = {}
+        self.history: dict[str, list[dict]] = {}
 
     def resolve_uid(self, uid: str) -> str:
         return self.sessions.get(uid, "")
@@ -52,10 +58,16 @@ class _Storage:
         return ""
 
     def get_last_quote(self, _market_name: str):
-        return None
+        return self.quotes.get(_market_name)
 
-    def set_last_quote(self, _quote) -> None:
-        pass
+    def set_last_quote(self, quote) -> None:
+        self.quotes[quote.market_name] = quote
+        self.history.setdefault(quote.market_name, []).append(
+            {"t": quote.timestamp, "sell": quote.sell_min, "buy": quote.buy_max}
+        )
+
+    def get_price_history(self, market_name: str, limit: int = 50) -> list[dict]:
+        return self.history.get(market_name, [])[-limit:]
 
 
 class _NotifierConfig:
@@ -65,6 +77,7 @@ class _NotifierConfig:
     mention_users = True
     appid = "1067"
     owner_uids: list[str] = []
+    chart_history_points = 5
 
 
 class _Response:
@@ -108,11 +121,18 @@ class _SubscriptionConfig:
 
 class _WatcherConfig:
     def __init__(self, interval: int) -> None:
-        self.subscription = Subscription("user", "item", interval=interval)
+        self.subscription = Subscription(
+            "user",
+            "item",
+            interval=interval,
+            target_umo="test:FriendMessage:user",
+        )
         self.enabled_subscriptions = [self.subscription]
         self.watched_market_names = ["item"]
         self.item_interval = 0
         self.appid = "1067"
+        self.group_push_interval = 30
+        self.chart_history_points = 5
 
     def interval_of(self, _market_name: str) -> int:
         return self.subscription.interval
@@ -125,6 +145,9 @@ class _WatcherNotifier:
     def owner_sessions(self) -> list[str]:
         return []
 
+    def session_of(self, uid: str) -> str:
+        return f"test:FriendMessage:{uid}"
+
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
     def test_webui_schema_does_not_expose_token_fields(self) -> None:
@@ -133,6 +156,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("jwt_token", schema)
         self.assertNotIn("refresh_token", schema)
+        self.assertEqual(schema["group_push_interval"]["default"], 30)
+        self.assertEqual(schema["chart_history_points"]["default"], 5)
+        self.assertIn("target", schema["user_subscriptions"]["templates"]["user_entry"]["items"])
 
     def test_batching_is_keyed_by_umo_and_uid(self) -> None:
         notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
@@ -209,6 +235,24 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.mode, "always")
         self.assertEqual(updated.display_name, "Second")
 
+    def test_subscriptions_are_scoped_to_origin_session(self) -> None:
+        config = _SubscriptionConfig()
+        config.subscriptions = []
+        saved: list[Subscription] = []
+        store = SubscriptionStore(config, saved.extend)
+        link = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+        group_a = "test:GroupMessage:a"
+        group_b = "test:GroupMessage:b"
+
+        self.assertTrue(store.subscribe("user", link, group_a)[0])
+        self.assertTrue(store.subscribe("user", link, group_b)[0])
+
+        self.assertEqual(len(store.subscriptions_of("user", group_a)), 1)
+        self.assertEqual(len(store.subscriptions_of("user", group_b)), 1)
+        self.assertTrue(store.remove("user", "id50381_f_16xl_usa", group_a)[0])
+        self.assertEqual(store.subscriptions_of("user", group_a), [])
+        self.assertEqual(len(store.subscriptions_of("user", group_b)), 1)
+
     def test_remove_by_index_only_counts_current_users_subscriptions(self) -> None:
         config = _SubscriptionConfig()
         config.subscriptions = [
@@ -239,6 +283,37 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertIn("失败", message)
         self.assertEqual([sub.market_name for sub in store.all()], ["id50381_f_16xl_usa"])
+
+    def test_storage_keeps_bounded_embedded_price_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = PluginStorage(Path(temp_dir), _Logger())
+            for index in range(7):
+                storage.set_last_quote(
+                    Quote(
+                        "item",
+                        sell_min=10.0 + index,
+                        buy_max=9.0 + index,
+                        timestamp=1000.0 + index,
+                    )
+                )
+
+            points = storage.get_price_history("item", limit=5)
+            raw = json.loads((Path(temp_dir) / "quotes.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(points), 5)
+        self.assertEqual(points[-1]["sell"], 16.0)
+        self.assertEqual(len(raw["item"]["history"]), 7)
+
+    def test_price_chart_is_valid_png(self) -> None:
+        points = [{"t": 1000 + index, "sell": 10 + index, "buy": 8 + index} for index in range(5)]
+
+        image_bytes = render_price_chart("测试物品", points)
+
+        self.assertTrue(image_bytes.startswith(b"\x89PNG"))
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            self.assertEqual(image.size, (1200, 680))
 
     def test_refresh_commands_support_global_and_per_item_targets(self) -> None:
         config = _SubscriptionConfig()
@@ -291,6 +366,26 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((fast.interval, fast.mode), (9, "always"))
         self.assertEqual((slow.interval, slow.mode), (30, "only_change"))
         self.assertEqual(config.interval_of("id50381_f_16xl_usa"), 5)
+
+    def test_config_parses_subscription_target_and_hydrates_legacy(self) -> None:
+        link = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+        config = PluginConfig(
+            {
+                "user_subscriptions": [
+                    {"uid": "known", "target": "test:GroupMessage:known", "items": [link]},
+                    {"uid": "legacy", "items": [link]},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            config.subscriptions_of("known", target_umo="test:GroupMessage:known")[0].target_umo,
+            "test:GroupMessage:known",
+        )
+        changed = config.hydrate_subscription_targets(lambda uid: "test:GroupMessage:legacy" if uid == "legacy" else "")
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(config.subscriptions_of("legacy")[0].target_umo, "test:GroupMessage:legacy")
 
     def test_refresh_modes_differ_on_unchanged_quote(self) -> None:
         notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
@@ -361,18 +456,20 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         per_user, _ = watcher._evaluate_subscribers({"item": quote}, {"item": previous})
 
-        self.assertIn("user", per_user)
+        delivery_key = ("test:FriendMessage:user", "user")
+        self.assertIn(delivery_key, per_user)
         self.assertNotIn(key, watcher._last_pushed)
         self.assertNotIn(key, watcher._next_notify)
 
         # 第一次发送未送达后，即使最新缓存已经等于当前行情，也必须继续重试。
         retry, _ = watcher._evaluate_subscribers({"item": quote}, {"item": quote})
-        self.assertIn("user", retry)
+        self.assertIn(delivery_key, retry)
 
-        watcher._mark_delivered("user", per_user["user"])
+        watcher._mark_delivered("test:FriendMessage:user", "user", per_user[delivery_key])
 
-        self.assertIs(watcher._last_pushed[key], quote)
-        self.assertGreater(watcher._next_notify[key], time.time())
+        target_key = ("test:FriendMessage:user", "user", "item")
+        self.assertIs(watcher._last_pushed[target_key], quote)
+        self.assertGreater(watcher._next_notify[target_key], time.time())
 
     async def test_buffered_delivery_calls_ack_after_success(self) -> None:
         class _DeliveringNotifier(Notifier):
@@ -384,7 +481,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             spec=MonitorSpec("item"),
             quote=Quote("item", sell_min=10.0, buy_max=9.0),
         )
-        delivered: list[tuple[str, list[TriggerEvent]]] = []
+        delivered: list[tuple[str, str, list[TriggerEvent]]] = []
         umo = "test:GroupMessage:1"
 
         notifier._buffer_push(
@@ -394,14 +491,15 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             None,
             "Alice",
             10,
-            lambda uid, events: delivered.append((uid, events)),
+            lambda target_umo, uid, events: delivered.append((target_umo, uid, events)),
         )
         notifier._pending[(umo, "alice")]["deadline"] = time.time() - 1
         await notifier._flush_loop()
 
         self.assertEqual(len(delivered), 1)
-        self.assertEqual(delivered[0][0], "alice")
-        self.assertEqual(delivered[0][1][0].quote.market_name, "item")
+        self.assertEqual(delivered[0][0], umo)
+        self.assertEqual(delivered[0][1], "alice")
+        self.assertEqual(delivered[0][2][0].quote.market_name, "item")
 
     async def test_auth_backoff_blocks_polling_for_full_duration(self) -> None:
         class _UnexpectedAuth:
@@ -453,6 +551,83 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(watcher._auth_backoff_remaining(), 0)
         self.assertIn("503", watcher.last_poll_error)
 
+    async def test_group_tick_fetches_unique_items_and_builds_full_snapshots(self) -> None:
+        group_a = "test:GroupMessage:a"
+        group_b = "test:GroupMessage:b"
+
+        class _Config:
+            enabled_subscriptions = [
+                Subscription("alice", "item-a", target_umo=group_a, interval=60),
+                Subscription("bob", "item-a", target_umo=group_a, interval=60),
+                Subscription("carol", "item-b", target_umo=group_b, interval=60),
+            ]
+            watched_market_names = ["item-a", "item-b"]
+            item_interval = 0
+            appid = "1067"
+            group_push_interval = 30
+            chart_history_points = 5
+
+            @staticmethod
+            def interval_of(_market_name: str) -> int:
+                return 60
+
+            @staticmethod
+            def display_name_of(market_name: str) -> str:
+                return market_name
+
+        class _Auth:
+            async def get_token(self, **_kwargs) -> str:
+                return "token"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def fetch_quote(self, market_name: str, *_args, **_kwargs) -> Quote:
+                self.calls.append(market_name)
+                return Quote(market_name, sell_min=10.0, buy_max=9.0, display_name=market_name)
+
+        class _Notifier(_WatcherNotifier):
+            def __init__(self) -> None:
+                self.snapshots: dict[str, list[SnapshotItem]] = {}
+
+            def session_of(self, uid: str) -> str:
+                return group_a if uid in {"alice", "bob"} else group_b
+
+            async def push_group_snapshot(self, umo: str, items: list[SnapshotItem]) -> bool:
+                self.snapshots[umo] = items
+                return True
+
+        class _GroupStorage(_Storage):
+            def get_item_meta(self, _market_name: str) -> dict:
+                return {"cached": True}
+
+        client = _Client()
+        notifier = _Notifier()
+        watcher = MarketWatcher(
+            client=client,
+            auth=_Auth(),
+            storage=_GroupStorage(),
+            config=_Config(),
+            notifier=notifier,
+            logger=_Logger(),
+        )
+        watcher._sync_group_schedule(1000.0)
+        self.assertEqual(watcher._next_group_push, {group_a: 1030.0, group_b: 1030.0})
+        self.assertEqual(await watcher.poll_due(), [])
+        watcher._next_group_push = {group_a: time.time() - 1, group_b: time.time() - 1}
+
+        results = await watcher.poll_due_groups()
+
+        self.assertEqual(client.calls, ["item-a", "item-b"])
+        self.assertEqual(results, {group_a: True, group_b: True})
+        self.assertEqual([item.market_name for item in notifier.snapshots[group_a]], ["item-a"])
+        self.assertEqual(
+            [uid for uid, _name in notifier.snapshots[group_a][0].mentions],
+            ["alice", "bob"],
+        )
+        self.assertEqual([item.market_name for item in notifier.snapshots[group_b]], ["item-b"])
+
     def test_empty_mention_is_not_treated_as_rendered(self) -> None:
         text, used_mention, _unknown = substitute("$mention", {"mention": ""})
 
@@ -478,13 +653,13 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         class _Context:
             def __init__(self) -> None:
-                self.sent = None
+                self.sent_messages: list[object] = []
 
             def get_config(self) -> dict:
                 return {"platform": [{"id": "test", "type": "telegram"}]}
 
             async def send_message(self, _umo: str, chain) -> bool:
-                self.sent = chain
+                self.sent_messages.append(chain)
                 return True
 
         class _Config(_NotifierConfig):
@@ -520,13 +695,113 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(sent)
-        self.assertIsInstance(context.sent.chain[0], _At)
-        self.assertEqual(context.sent.chain[0].qq, "alice")
-        self.assertTrue(any(isinstance(item, _Plain) and item.text == "Item" for item in context.sent.chain))
+        primary = context.sent_messages[0]
+        self.assertIsInstance(primary.chain[0], _At)
+        self.assertEqual(primary.chain[0].qq, "alice")
+        self.assertTrue(any(isinstance(item, _Plain) and item.text == "Item" for item in primary.chain))
+
+    async def test_group_snapshot_orders_mentions_blocks_and_charts(self) -> None:
+        class _MessageChain:
+            def __init__(self) -> None:
+                self.chain: list[object] = []
+                self.markdown = None
+
+            def use_markdown(self, value: bool) -> None:
+                self.markdown = value
+
+        class _Plain:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class _At:
+            pass
+
+        class _Image:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+
+            @classmethod
+            def fromBytes(cls, data: bytes):
+                return cls(data)
+
+        class _Context:
+            def __init__(self) -> None:
+                self.sent_messages: list[object] = []
+
+            def get_config(self) -> dict:
+                return {"platform": [{"id": "test", "type": "qq_official"}]}
+
+            async def send_message(self, _umo: str, chain) -> bool:
+                self.sent_messages.append(chain)
+                return True
+
+        event_module = ModuleType("astrbot.api.event")
+        event_module.MessageChain = _MessageChain
+        components_module = ModuleType("astrbot.api.message_components")
+        components_module.At = _At
+        components_module.Image = _Image
+        components_module.Plain = _Plain
+        storage = _Storage()
+        for index in range(5):
+            timestamp = 1000 + index
+            storage.history.setdefault("item-a", []).append({"t": timestamp, "sell": 10 + index, "buy": 8 + index})
+            storage.history.setdefault("item-b", []).append({"t": timestamp, "sell": 20 + index, "buy": 18 + index})
+        context = _Context()
+        notifier = Notifier(context, storage, _NotifierConfig(), _Logger())
+        items = [
+            SnapshotItem(
+                market_name="item-a",
+                display_name="Item A",
+                quote=Quote("item-a", sell_min=14.0, buy_max=12.0, display_name="Item A"),
+                previous=None,
+                mentions=[("alice", "Alice"), ("bob", "Bob")],
+            ),
+            SnapshotItem(
+                market_name="item-b",
+                display_name="Item B",
+                quote=Quote("item-b", sell_min=24.0, buy_max=22.0, display_name="Item B"),
+                previous=None,
+                mentions=[("carol", "Carol")],
+            ),
+            SnapshotItem(
+                market_name="item-c",
+                display_name="Item C",
+                quote=None,
+                previous=None,
+                mentions=[("dave", "Dave")],
+                error="HTTP 503",
+            ),
+        ]
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "astrbot.api.event": event_module,
+                "astrbot.api.message_components": components_module,
+            },
+        ):
+            sent = await notifier.push_group_snapshot("test:GroupMessage:group", items)
+
+        self.assertTrue(sent)
+        primary = context.sent_messages[0]
+        texts = [part.text for part in primary.chain if isinstance(part, _Plain)]
+        images = [part for message in context.sent_messages for part in message.chain if isinstance(part, _Image)]
+        joined = "\n".join(texts)
+        self.assertLess(joined.index('id="alice"'), joined.index('id="bob"'))
+        self.assertLess(joined.index('id="bob"'), joined.index("Item A"))
+        self.assertLess(joined.index("Item A"), joined.index('id="carol"'))
+        self.assertLess(joined.index('id="carol"'), joined.index("Item B"))
+        self.assertLess(joined.index("Item B"), joined.index('id="dave"'))
+        self.assertIn("暂无行情", joined)
+        self.assertIn("HTTP 503", joined)
+        self.assertEqual(len(images), 2)
+        self.assertTrue(all(image.data.startswith(b"\x89PNG") for image in images))
+        self.assertEqual(len(context.sent_messages), 3)
+        self.assertTrue(primary.markdown)
 
     async def test_subscriber_only_receives_own_failure_details(self) -> None:
         class _FilterConfig(_NotifierConfig):
-            enabled_subscriptions = [Subscription("bob", "item-b")]
+            enabled_subscriptions = [Subscription("bob", "item-b", target_umo="test:FriendMessage:bob")]
             push_batch_seconds = 0
 
         class _CaptureNotifier(Notifier):
@@ -545,7 +820,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             Quote("item-b", error="own failure"),
         ]
 
-        await notifier.push_to_subscribers({"bob": [event]}, {"bob": "Bob"}, failures)
+        target = "test:FriendMessage:bob"
+        await notifier.push_to_subscribers({(target, "bob"): [event]}, {(target, "bob"): "Bob"}, failures)
 
         self.assertEqual(notifier.seen_failures, ["item-b"])
 

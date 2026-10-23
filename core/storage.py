@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .constants import MAX_STORED_PRICE_POINTS
 from .models import Quote
 
 
@@ -36,6 +37,7 @@ class PluginStorage:
         self._sessions_file = self.dir / "sessions.json"
         self._pending_login_file = self.dir / "pending_login.json"
         self._quotes_file = self.dir / "quotes.json"
+        self._legacy_history_file = self.dir / "history.json"
         self._auth_file = self.dir / "auth.json"
         self._meta_file = self.dir / "items_meta.json"
 
@@ -69,11 +71,72 @@ class PluginStorage:
         return Quote.from_dict(item) if isinstance(item, dict) else None
 
     def set_last_quote(self, quote: Quote) -> None:
+        if not quote.ok:
+            return
         data = self._load(self._quotes_file, {})
         if not isinstance(data, dict):
             data = {}
-        data[quote.market_name] = quote.to_dict()
+        current = data.get(quote.market_name)
+        history = self._history_points(current.get("history")) if isinstance(current, dict) else []
+        if not history:
+            legacy = self._load(self._legacy_history_file, {})
+            if isinstance(legacy, dict):
+                history = self._history_points(legacy.get(quote.market_name))
+        if not history or abs(float(history[-1]["t"]) - float(quote.timestamp)) > 1e-6:
+            history.append(
+                {
+                    "t": float(quote.timestamp),
+                    "sell": quote.sell_min,
+                    "buy": quote.buy_max,
+                }
+            )
+        record = quote.to_dict()
+        record["history"] = history[-MAX_STORED_PRICE_POINTS:]
+        data[quote.market_name] = record
         self._save(self._quotes_file, data)
+
+    def get_price_history(self, market_name: str, limit: int = MAX_STORED_PRICE_POINTS) -> list[dict[str, Any]]:
+        """返回某个物品最近的行情点，兼容旧版独立 history.json。"""
+        data = self._load(self._quotes_file, {})
+        item = data.get(market_name) if isinstance(data, dict) else None
+        history = self._history_points(item.get("history")) if isinstance(item, dict) else []
+        if not history:
+            legacy = self._load(self._legacy_history_file, {})
+            if isinstance(legacy, dict):
+                history = self._history_points(legacy.get(market_name))
+        size = max(1, int(limit))
+        return history[-size:]
+
+    @staticmethod
+    def _history_points(raw: Any) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        if not isinstance(raw, list):
+            return points
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = float(item.get("t") or item.get("timestamp") or 0)
+            except (TypeError, ValueError):
+                continue
+            if timestamp <= 0:
+                continue
+            sell = PluginStorage._optional_float(item.get("sell"))
+            buy = PluginStorage._optional_float(item.get("buy"))
+            if sell is None and buy is None:
+                continue
+            points.append({"t": timestamp, "sell": sell, "buy": buy})
+        points.sort(key=lambda point: point["t"])
+        return points[-MAX_STORED_PRICE_POINTS:]
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------- 登录中间态
 
