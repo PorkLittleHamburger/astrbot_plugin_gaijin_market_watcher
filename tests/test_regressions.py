@@ -14,7 +14,7 @@ from core.auth import AuthManager
 from core.charts import render_price_chart
 from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent
-from core.notifier import Notifier
+from core.notifier import DeliveryBlock, Notifier
 from core.payload import substitute
 from core.resolver import extract_link_reference
 from core.storage import PluginStorage
@@ -798,6 +798,72 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(image.data.startswith(b"\x89PNG") for image in images))
         self.assertEqual(len(context.sent_messages), 3)
         self.assertTrue(primary.markdown)
+
+    async def test_qq_group_single_chart_defers_image_to_preserve_mention(self) -> None:
+        class _MessageChain:
+            def __init__(self) -> None:
+                self.chain: list[object] = []
+                self.markdown = None
+
+            def use_markdown(self, value: bool) -> None:
+                self.markdown = value
+
+        class _Plain:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class _At:
+            pass
+
+        class _Image:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+
+            @classmethod
+            def fromBytes(cls, data: bytes):
+                return cls(data)
+
+        class _Context:
+            def __init__(self) -> None:
+                self.sent_messages: list[object] = []
+
+            def get_config(self) -> dict:
+                return {"platform": [{"id": "test", "type": "qq_official"}]}
+
+            async def send_message(self, _umo: str, chain) -> bool:
+                self.sent_messages.append(chain)
+                return True
+
+        event_module = ModuleType("astrbot.api.event")
+        event_module.MessageChain = _MessageChain
+        components_module = ModuleType("astrbot.api.message_components")
+        components_module.At = _At
+        components_module.Image = _Image
+        components_module.Plain = _Plain
+        context = _Context()
+        notifier = Notifier(context, _Storage(), _NotifierConfig(), _Logger())
+        block = DeliveryBlock(
+            text="Item A",
+            title="Item A",
+            mentions=[("alice", "Alice")],
+            images=[b"\x89PNG\r\n\x1a\n"],
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "astrbot.api.event": event_module,
+                "astrbot.api.message_components": components_module,
+            },
+        ):
+            sent = await notifier._send_blocks("test:GroupMessage:group", [block])
+
+        self.assertTrue(sent)
+        self.assertEqual(len(context.sent_messages), 2)
+        primary_text = "".join(part.text for part in context.sent_messages[0].chain if isinstance(part, _Plain))
+        self.assertIn('<qqbot-at-user id="alice" />', primary_text)
+        self.assertFalse(any(isinstance(part, _Image) for part in context.sent_messages[0].chain))
+        self.assertTrue(any(isinstance(part, _Image) for part in context.sent_messages[1].chain))
 
     async def test_subscriber_only_receives_own_failure_details(self) -> None:
         class _FilterConfig(_NotifierConfig):
