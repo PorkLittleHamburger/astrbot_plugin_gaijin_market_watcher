@@ -15,7 +15,7 @@ from core.charts import render_price_chart
 from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent
 from core.notifier import DeliveryBlock, Notifier
-from core.payload import substitute
+from core.payload import render_message, substitute
 from core.resolver import extract_link_reference
 from core.storage import PluginStorage
 from core.subscriptions import SubscriptionStore
@@ -633,6 +633,15 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(text, "")
         self.assertFalse(used_mention)
+
+    def test_payload_image_alias_uses_icon_without_unknown_field(self) -> None:
+        text, _used_mention, unknown = substitute("$image", {"icon": "https://example.invalid/item.png"})
+        rendered = render_message('{"image":"$image"}', {"icon": "https://example.invalid/item.png"})
+
+        self.assertEqual(text, "https://example.invalid/item.png")
+        self.assertEqual(unknown, [])
+        self.assertEqual(rendered.images, ["https://example.invalid/item.png"])
+        self.assertEqual(rendered.unknown_fields, [])
 
     async def test_component_platform_renders_real_at_from_template_mention(self) -> None:
         class _MessageChain:

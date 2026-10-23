@@ -33,13 +33,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 #: 这些键会被当作**图片附件**而不是文字
-IMAGE_KEYS = frozenset({"icon", "img", "picture", "photo", "pic", "cover", "thumbnail"})
+IMAGE_KEYS = frozenset({"image", "icon", "img", "picture", "photo", "pic", "cover", "thumbnail"})
 
 #: 这些键会被当作 @ 标记
 MENTION_KEYS = frozenset({"mention", "at"})
 
 #: 别名 -> 正式字段名（方便你沿用自己习惯的命名）
 ALIASES: dict[str, str] = {
+    "image": "icon",
     "item_name": "name",
     "goods_name": "name",
     "sell_lowest_price": "sell_text",
