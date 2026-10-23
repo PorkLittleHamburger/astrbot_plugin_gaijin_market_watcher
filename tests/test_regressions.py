@@ -870,7 +870,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent)
         self.assertEqual(len(context.sent_messages), 1)
         primary_text = "".join(part.text for part in context.sent_messages[0].chain if isinstance(part, _Plain))
-        self.assertIn('<qqbot-at-user id="alice" />', primary_text)
+        self.assertIn("@Alice", primary_text)
+        self.assertNotIn("<qqbot-at-user", primary_text)
         self.assertTrue(any(isinstance(part, _Image) for part in context.sent_messages[0].chain))
 
     async def test_subscriber_only_receives_own_failure_details(self) -> None:
