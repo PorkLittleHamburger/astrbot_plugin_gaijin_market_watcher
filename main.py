@@ -93,7 +93,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
         "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人。"
     ),
-    "2.17.0",
+    "2.17.1",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -108,7 +108,7 @@ class GaijinMarketWatcher(Star):
         except Exception:  # 极端情况下回退
             self.data_dir = Path(__file__).resolve().parent / "data"
         self.storage = PluginStorage(self.data_dir, self.logger)
-        self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
+        self._target_migration_pending = bool(self.cfg.hydrate_subscription_targets(self.storage.resolve_uid))
 
         # ---------- 各层装配 ----------
         self.client = GaijinMarketClient(
@@ -167,6 +167,14 @@ class GaijinMarketWatcher(Star):
         for hint in self.cfg.validate():
             self.logger.info(f"[GJM] {hint}")
 
+        if self._target_migration_pending:
+            try:
+                self._persist_subscriptions(self.subscriptions.all())
+                self._target_migration_pending = False
+                self.logger.info("[GJM] 已把旧订阅迁移到各自最近会话。")
+            except Exception as exc:
+                self.logger.warning(f"[GJM] 持久化旧订阅会话失败: {exc}")
+
         self._config_watcher.start()
         self.watcher.start()
         # 启动时补一次：可能用户已经先填好账号/验证码再重载插件
@@ -224,7 +232,9 @@ class GaijinMarketWatcher(Star):
     def _apply_config(self, data: dict) -> None:
         """把新配置应用到内存中的各层。"""
         self.cfg.reload(data)
-        self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
+        self._target_migration_pending = bool(
+            self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
+        ) or getattr(self, "_target_migration_pending", False)
         # 订阅层持有自己的权威列表，配置变了要同步过去
         self.subscriptions.reload(self.cfg.subscriptions)
         # 让网络层跟随配置变化（语言 / 超时 / 重试）
