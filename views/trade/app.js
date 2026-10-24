@@ -82,6 +82,10 @@ function formatDuration(seconds) {
   return `${Math.floor(value)} 秒`;
 }
 
+function authIsValid(auth) {
+  return Boolean(auth?.has_jwt && Number(auth.seconds_left || 0) > 0);
+}
+
 function showInlineMessage(elementId, message, kind = "") {
   const el = $(elementId);
   el.textContent = message || "";
@@ -115,6 +119,8 @@ function renderAccount(data) {
   lastAccount = data;
   const account = data.account || {};
   const auth = data.auth || {};
+  const loginValid = authIsValid(auth);
+  const tokenState = loginValid ? "有效" : (auth.has_jwt ? "已过期" : "未登录");
   const editingAccount = $("accountForm").contains(document.activeElement);
   if (!editingAccount && !accountDirty) {
     $("accountEmail").value = account.email || "";
@@ -124,7 +130,7 @@ function renderAccount(data) {
   $("accountPassword").placeholder = account.password_configured ? "已保存，留空保持不变" : "请输入账号密码";
 
   const statusItems = [
-    ["登录令牌", auth.has_jwt ? "有效" : "未登录"],
+    ["登录令牌", tokenState],
     ["Gaijin 账号", auth.nick || "未知"],
     ["令牌剩余", formatDuration(auth.seconds_left)],
     ["续期令牌", auth.has_refresh_token ? "已保存" : "无"],
@@ -139,10 +145,10 @@ function renderAccount(data) {
   $("codePanel").hidden = !auth.pending_login;
 
   const badge = $("authBadge");
-  badge.textContent = auth.has_jwt ? `已登录 · ${auth.nick || "Gaijin"}` : (auth.pending_login ? "等待验证码" : "未登录");
-  badge.className = `badge ${auth.has_jwt ? "ok" : "bad"}`;
-  $("loginHint").hidden = Boolean(auth.has_jwt);
-  $("monitorStatus").textContent = auth.has_jwt ? "已登录" : "未登录";
+  badge.textContent = loginValid ? `已登录 · ${auth.nick || "Gaijin"}` : (auth.pending_login ? "等待验证码" : tokenState);
+  badge.className = `badge ${loginValid ? "ok" : "bad"}`;
+  $("loginHint").hidden = loginValid;
+  $("monitorStatus").textContent = loginValid ? "已登录" : tokenState;
 }
 
 async function loadAccount() {
@@ -240,7 +246,7 @@ function renderMonitor(data) {
   $("monitorGroupCount").textContent = String(groups.length);
   $("monitorItemCount").textContent = String(itemCount);
   $("monitorWatchedCount").textContent = String((data.watched_market_names || []).length);
-  $("monitorStatus").textContent = lastAccount?.auth?.has_jwt ? "已登录" : "未登录";
+  $("monitorStatus").textContent = authIsValid(lastAccount?.auth) ? "已登录" : "未登录";
   fillSessionOptions();
 
   const container = $("subscriptionList");

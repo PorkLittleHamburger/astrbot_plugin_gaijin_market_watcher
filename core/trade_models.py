@@ -227,6 +227,7 @@ class TradeOrder:
     amount: int
     price_raw: int
     market_name: str = ""
+    transaction_id: int = 0
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -237,6 +238,7 @@ class TradeOrder:
             "amount": int(self.amount),
             "price_raw": int(self.price_raw),
             "market_name": self.market_name,
+            "transaction_id": int(self.transaction_id),
             "created_at": float(self.created_at),
         }
 
@@ -249,6 +251,7 @@ class TradeOrder:
             amount=max(0, int(data.get("amount") or 0)),
             price_raw=max(0, int(data.get("price_raw") or 0)),
             market_name=str(data.get("market_name") or ""),
+            transaction_id=max(0, int(data.get("transaction_id") or 0)),
             created_at=float(data.get("created_at") or time.time()),
         )
 

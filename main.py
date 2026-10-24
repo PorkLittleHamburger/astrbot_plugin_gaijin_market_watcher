@@ -90,6 +90,24 @@ FORMER_TRADE_FILES = (
     "trade_events.json",
     "trade_logs_meta.json",
 )
+LEGACY_UI_KEYS = (
+    "account_email",
+    "account_password",
+    "twofa_code",
+    "owner_uids",
+    "user_subscriptions",
+    "payload",
+)
+
+
+def _can_cleanup_legacy_config(
+    *,
+    legacy_values_present: bool,
+    migration_ok: bool,
+    data_files_ready: bool,
+) -> bool:
+    """只有所有权威数据已落盘时，才允许删除兼容配置。"""
+    return bool(legacy_values_present and migration_ok and data_files_ready)
 
 
 def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
@@ -114,7 +132,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "Gaijin 市场行情监控插件升级版，使用 /gjm 指令命名空间；"
         "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.20.1",
+    "2.20.2",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -155,16 +173,18 @@ class GaijinMarketWatcher(Star):
                 "subscriptions.json", [item.to_dict() for item in subscription_items]
             )
 
-        legacy_data_present = bool(
-            self.raw_config.get("account_email")
-            or self.raw_config.get("account_password")
-            or self.raw_config.get("twofa_code")
-            or self.raw_config.get("owner_uids")
-            or self.raw_config.get("user_subscriptions")
+        legacy_values_present = any(bool(self.raw_config.get(key)) for key in LEGACY_UI_KEYS)
+        migration_ok = account_ok and output_ok and subscription_migrated
+        data_files_ready = bool(self.accounts.persisted and self.output.persisted and subscription_migrated)
+        self._legacy_config_pending = _can_cleanup_legacy_config(
+            legacy_values_present=legacy_values_present,
+            migration_ok=migration_ok,
+            data_files_ready=data_files_ready,
         )
-        self._legacy_config_pending = migrating or legacy_data_present
         if migrating and account_ok and output_ok and subscription_migrated:
             self.storage.set_ui_schema_version(1)
+        elif legacy_values_present:
+            self.logger.warning("[GJM] 旧配置迁移未完成，保留原配置并将在下次启动重试。")
 
         target_migration_pending = any(not sub.target_umo for sub in subscription_items)
         self.subscriptions = SubscriptionStore(
@@ -251,6 +271,7 @@ class GaijinMarketWatcher(Star):
             subscriptions=self.subscriptions,
             owner_uids=self.accounts.owner_uids,
             output=self.output,
+            auth=self.auth,
         ):
             self.logger.info(f"[GJM] {hint}")
 
@@ -401,14 +422,7 @@ class GaijinMarketWatcher(Star):
         """迁移完成后从原生配置中移除敏感项和已迁出的界面字段。"""
         if not getattr(self, "_legacy_config_pending", False):
             return
-        legacy_keys = (
-            "account_email",
-            "account_password",
-            "twofa_code",
-            "owner_uids",
-            "user_subscriptions",
-            "payload",
-        )
+        legacy_keys = LEGACY_UI_KEYS
         if not any(key in self.raw_config for key in legacy_keys):
             self._legacy_config_pending = False
             return

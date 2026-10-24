@@ -48,6 +48,9 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 ARM_CONFIRM_TTL = 60
 MAX_RULE_QUANTITY = 1_000
 MAX_LISTING_RECONCILE_SECONDS = 30
+SELL_RECONCILE_ATTEMPTS = 5
+SELL_RECONCILE_DELAY = 0.8
+BUY_CANCEL_VERIFY_ATTEMPTS = 3
 
 
 class TradeError(RuntimeError):
@@ -182,6 +185,26 @@ class AutoTrader:
         mode: str,
         display_name: str = "",
     ) -> TradeRule:
+        async with self._action_lock:
+            return await self._create_rule_unlocked(
+                url=url,
+                buy_price=buy_price,
+                quantity=quantity,
+                sell_net_price=sell_net_price,
+                mode=mode,
+                display_name=display_name,
+            )
+
+    async def _create_rule_unlocked(
+        self,
+        *,
+        url: str,
+        buy_price: Any,
+        quantity: Any,
+        sell_net_price: Any,
+        mode: str,
+        display_name: str = "",
+    ) -> TradeRule:
         from .resolver import extract_reference
 
         _, market_name = extract_reference(str(url or ""))
@@ -247,6 +270,10 @@ class AutoTrader:
         return rule
 
     async def update_rule(self, rule_id: str, **changes: Any) -> TradeRule:
+        async with self._action_lock:
+            return await self._update_rule_unlocked(rule_id, **changes)
+
+    async def _update_rule_unlocked(self, rule_id: str, **changes: Any) -> TradeRule:
         rule = self._require_rule(rule_id)
         if rule.live:
             raise TradeError("实盘规则不能直接修改，请先退出实盘")
@@ -288,6 +315,10 @@ class AutoTrader:
         return rule
 
     async def update_settings(self, payload: dict[str, Any]) -> TradeSettings:
+        async with self._action_lock:
+            return await self._update_settings_unlocked(payload)
+
+    async def _update_settings_unlocked(self, payload: dict[str, Any]) -> TradeSettings:
         current = self.store.settings
         settings = TradeSettings(
             enabled=bool(payload.get("enabled", current.enabled)),
@@ -319,6 +350,10 @@ class AutoTrader:
         return settings
 
     async def prepare_arm(self, rule_id: str) -> str:
+        async with self._action_lock:
+            return await self._prepare_arm_unlocked(rule_id)
+
+    async def _prepare_arm_unlocked(self, rule_id: str) -> str:
         rule = self._require_rule(rule_id)
         runtime = self.store.get_runtime(rule.rule_id)
         if rule.live:
@@ -357,6 +392,10 @@ class AutoTrader:
         )
 
     async def confirm_arm(self, rule_id: str, confirmation_id: str) -> TradeRule:
+        async with self._action_lock:
+            return await self._confirm_arm_unlocked(rule_id, confirmation_id)
+
+    async def _confirm_arm_unlocked(self, rule_id: str, confirmation_id: str) -> TradeRule:
         rule = self._require_rule(rule_id)
         expires = self._pending_arms.get(rule.rule_id, 0)
         if expires < time.time():
@@ -382,6 +421,10 @@ class AutoTrader:
         return rule
 
     async def disarm(self, rule_id: str) -> TradeRule:
+        async with self._action_lock:
+            return await self._disarm_unlocked(rule_id)
+
+    async def _disarm_unlocked(self, rule_id: str) -> TradeRule:
         rule = self._require_rule(rule_id)
         runtime = self.store.get_runtime(rule.rule_id)
         if runtime.held_quantity or runtime.orders:
@@ -397,14 +440,18 @@ class AutoTrader:
         return rule
 
     async def action(self, rule_id: str, action: str, confirmation_id: str = "") -> TradeRule:
+        async with self._action_lock:
+            return await self._action_unlocked(rule_id, action, confirmation_id)
+
+    async def _action_unlocked(self, rule_id: str, action: str, confirmation_id: str = "") -> TradeRule:
         action = str(action or "").lower()
         if action == "prepare_arm":
-            await self.prepare_arm(rule_id)
+            await self._prepare_arm_unlocked(rule_id)
             return self._require_rule(rule_id)
         if action == "arm":
-            return await self.confirm_arm(rule_id, confirmation_id)
+            return await self._confirm_arm_unlocked(rule_id, confirmation_id)
         if action == "disarm":
-            return await self.disarm(rule_id)
+            return await self._disarm_unlocked(rule_id)
         rule = self._require_rule(rule_id)
         runtime = self.store.get_runtime(rule.rule_id)
         if action == "pause":
@@ -436,6 +483,10 @@ class AutoTrader:
         return rule
 
     async def stop_all(self) -> dict[str, Any]:
+        async with self._action_lock:
+            return await self._stop_all_unlocked()
+
+    async def _stop_all_unlocked(self) -> dict[str, Any]:
         cancelled: list[str] = []
         errors: list[str] = []
         for rule in list(self.store.rules):
@@ -490,6 +541,10 @@ class AutoTrader:
                 await self._paper_reconcile_listing(rule, quote)
 
     async def drill_paper_cycle(self, rule_id: str) -> dict[str, Any]:
+        async with self._action_lock:
+            return await self._drill_paper_cycle_unlocked(rule_id)
+
+    async def _drill_paper_cycle_unlocked(self, rule_id: str) -> dict[str, Any]:
         """用一次真实盘口快照做隔离的完整模拟，不修改规则运行状态。"""
         rule = self._require_rule(rule_id)
         if rule.live:
@@ -762,15 +817,33 @@ class AutoTrader:
             raise TradeError("该物品存在开放订单，自动买入已暂停")
         before_inventory = await self._inventory_snapshot(rule, token)
         request_ok = True
+        transact_id = self.client.new_transaction_id()
+        submitted = TradeOrder(
+            order_id="",
+            pair_id="",
+            side="BUY",
+            amount=fill,
+            price_raw=rule.buy_price_raw,
+            market_name=rule.market_name,
+            transaction_id=transact_id,
+        )
         try:
-            await self.client.place_buy_order(
+            response = await self.client.place_buy_order(
                 rule.market_name,
                 fill,
                 rule.buy_price_raw,
                 token,
-                transact_id=self.client.new_transaction_id(),
+                transact_id=transact_id,
                 appid=self.config.appid,
                 private_mode=self.store.settings.private_mode,
+            )
+            submitted = self._order_from_response(
+                response,
+                side="BUY",
+                amount=fill,
+                price_raw=rule.buy_price_raw,
+                market_name=rule.market_name,
+                transaction_id=transact_id,
             )
         except TransportError as exc:
             request_ok = False
@@ -783,38 +856,45 @@ class AutoTrader:
             before_inventory,
             fill,
             request_ok=request_ok,
+            submitted=submitted,
         )
         runtime = self.store.get_runtime(rule.rule_id)
         if remaining:
-            runtime.orders = remaining
-            runtime.last_error = "买单存在未撤销余量"
+            runtime.last_error = "检测到无法确认归属或未撤销的开放买单"
             runtime.phase = PHASE_ERROR
             self.store.save_runtime()
-            raise TradeError("买单余量撤销失败，已暂停规则，请到官方市场检查订单")
+            raise TradeError("检测到无法确认归属或未撤销的开放买单，已暂停规则，请到官方市场检查订单")
         if acquired <= 0:
-            raise TradeError("买单回执成功，但库存未检测到新增物品，已暂停并等待人工核对")
+            message = (
+                "买单回执成功，但库存未检测到新增物品，已暂停并等待人工核对"
+                if request_ok
+                else "买单结果不确定，且库存未确认新增物品，已暂停并等待人工核对"
+            )
+            raise TradeError(message)
 
+        actual_cost = self._buy_cost_for_quantity(book, rule.buy_price_raw, acquired)
+        average_price = self._weighted_price(actual_cost, acquired)
         runtime.phase = PHASE_HOLDING
         runtime.held_quantity = acquired
         runtime.listed_quantity = 0
-        runtime.cost_basis_raw = acquired * rule.buy_price_raw
+        runtime.cost_basis_raw = actual_cost
         runtime.assets = allocations
-        runtime.last_buy_price_raw = rule.buy_price_raw
+        runtime.last_buy_price_raw = average_price
         runtime.last_error = ""
         runtime.updated_at = time.time()
-        self.store.ledger.daily_spent_raw += acquired * rule.buy_price_raw
+        self.store.ledger.daily_spent_raw += actual_cost
         self.store.save_runtime()
         self.store.save_ledger()
-        partial = "（部分成交，余量已撤销）" if acquired < rule.quantity else ""
+        partial = "（部分成交）" if acquired < fill else ""
         await self._record(
             rule,
             "buy",
-            f"{rule.title} 实际买入 {acquired}/{fill} 个，限价 {fmt_gjn(rule.buy_price_raw)} GJN{partial}",
+            f"{rule.title} 实际买入 {acquired}/{fill} 个，均价 {fmt_gjn(average_price)} GJN{partial}",
             details={
                 "trade_side": "BUY",
-                "trade_price": fmt_gjn(rule.buy_price_raw),
+                "trade_price": fmt_gjn(average_price),
                 "trade_quantity": acquired,
-                "trade_amount": fmt_gjn(acquired * rule.buy_price_raw),
+                "trade_amount": fmt_gjn(actual_cost),
             },
         )
         await self._live_sell(rule, quote)
@@ -846,53 +926,171 @@ class AutoTrader:
             chunks.extend(self._take_asset_chunks(cursor, remaining, rule.sell_gross_price_raw))
 
         before_orders = await self.client.get_open_orders(token)
-        before_ids = {self._order_id(item) for item in before_orders}
-        request_sent = False
-        request_failed = False
+        unowned_before = self._unowned_market_orders(rule, before_orders, runtime.orders)
+        if unowned_before:
+            raise TradeError("该物品存在无法确认归属的开放订单，自动卖出已暂停")
+        before_ids = {self._order_id(item) for item in before_orders if self._order_id(item)}
+        original_held = runtime.held_quantity
+        submitted: list[TradeOrder] = []
+        submission_success: dict[int, bool] = {}
+        request_error = ""
         for context_id, asset_id, amount, price_raw in chunks:
+            transact_id = self.client.new_transaction_id()
+            submitted_order = TradeOrder(
+                order_id="",
+                pair_id="",
+                side="SELL",
+                amount=amount,
+                price_raw=price_raw,
+                market_name=rule.market_name,
+                transaction_id=transact_id,
+            )
             try:
-                await self.client.place_sell_order(
+                response = await self.client.place_sell_order(
                     context_id,
                     asset_id,
                     amount,
                     price_raw,
                     seller_receives_raw(price_raw),
                     token,
-                    transact_id=self.client.new_transaction_id(),
+                    transact_id=transact_id,
                     appid=self.config.appid,
                     private_mode=self.store.settings.private_mode,
                 )
-                request_sent = True
+                submitted_order = self._order_from_response(
+                    response,
+                    side="SELL",
+                    amount=amount,
+                    price_raw=price_raw,
+                    market_name=rule.market_name,
+                    transaction_id=transact_id,
+                )
+                submission_success[transact_id] = True
             except TransportError as exc:
                 self.logger.warning(f"[GJM Trade] 卖单结果不确定，开始对账: {exc}")
-                request_failed = True
+                submission_success[transact_id] = False
+                request_error = "卖单提交结果不确定，请到官方市场核对订单和库存"
+                break
+            except Exception as exc:
+                self.logger.warning(f"[GJM Trade] 卖单提交失败，开始对账: {exc}")
+                submission_success[transact_id] = False
+                request_error = f"部分卖单提交失败：{exc}"
+                break
+            submitted.append(submitted_order)
+
+        ever_tracked_by_transaction: dict[int, TradeOrder] = {}
+        unknown_orders: list[TradeOrder] = []
+        for attempt in range(SELL_RECONCILE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(SELL_RECONCILE_DELAY)
+            after_orders = await self.client.get_open_orders(token)
+            new_market_orders = [
+                item
+                for item in after_orders
+                if (not self._order_id(item) or self._order_id(item) not in before_ids)
+                and self._order_market(item) == rule.market_name
+            ]
+            unknown_orders = []
+            for item in new_market_orders:
+                match = next(
+                    (
+                        order
+                        for order in submitted
+                        if self._order_side(item) == "SELL" and self._order_matches_submission(order, item)
+                    ),
+                    None,
+                )
+                if match is None:
+                    unknown_orders.append(self._order_from_market(item))
+                    continue
+                tracked = self._order_from_market(item)
+                tracked.transaction_id = match.transaction_id
+                ever_tracked_by_transaction[match.transaction_id] = tracked
+            if unknown_orders:
+                break
+            if len(ever_tracked_by_transaction) == len(submitted):
                 break
 
-        await asyncio.sleep(0.5)
-        after_orders = await self.client.get_open_orders(token)
         tracked = [
-            self._order_from_market(item)
-            for item in after_orders
-            if self._order_id(item) not in before_ids
-            and self._order_market(item) == rule.market_name
-            and self._order_side(item) == "SELL"
+            ever_tracked_by_transaction[order.transaction_id]
+            for order in submitted
+            if order.transaction_id in ever_tracked_by_transaction
         ]
-        listed = min(runtime.held_quantity, sum(order.amount for order in tracked))
-        sold = max(0, runtime.held_quantity - listed)
+        listed = min(original_held, sum(order.amount for order in tracked))
+        missing_successes = [
+            order
+            for order in submitted
+            if order.transaction_id not in ever_tracked_by_transaction
+            and submission_success.get(order.transaction_id, False)
+        ]
+        returned_by_transaction: dict[int, int] = {}
+        returned_total = 0
+        unresolved = bool(unknown_orders or request_error)
+        if missing_successes:
+            try:
+                inventory = await self._inventory_snapshot(rule, token)
+                actual_available = sum(
+                    max(
+                        0,
+                        inventory.get((asset.context_id, asset.asset_id), {}).get("quantity", 0)
+                        - asset.baseline_quantity,
+                    )
+                    for asset in runtime.assets
+                )
+            except Exception as exc:
+                unresolved = True
+                request_error = f"卖单库存对账失败：{exc}"
+            else:
+                returned_total = min(sum(order.amount for order in missing_successes), max(0, actual_available))
+                returned_left = returned_total
+                for order in reversed(missing_successes):
+                    returned_quantity = min(order.amount, returned_left)
+                    returned_by_transaction[order.transaction_id] = returned_quantity
+                    returned_left -= returned_quantity
+
+        sold = 0
+        gross_amount = 0
+        net_proceeds = 0
+        for order in submitted:
+            tracked_order = ever_tracked_by_transaction.get(order.transaction_id)
+            if tracked_order is not None:
+                sold_quantity = max(0, order.amount - tracked_order.amount)
+            elif submission_success.get(order.transaction_id, False):
+                # 经过多次查询仍未出现挂单，视为已即时成交；未知订单出现时不会走这里。
+                sold_quantity = max(
+                    0,
+                    order.amount - returned_by_transaction.get(order.transaction_id, 0),
+                )
+            else:
+                sold_quantity = 0
+                unresolved = True
+            sold += sold_quantity
+            gross_amount += sold_quantity * order.price_raw
+            net_proceeds += sold_quantity * seller_receives_raw(order.price_raw)
+
+        sold = min(original_held, sold)
+        average_gross = self._weighted_price(gross_amount, sold)
+        average_net = self._weighted_price(net_proceeds, sold)
         runtime.orders = tracked
         runtime.listed_quantity = listed
-        runtime.proceeds_raw += sold * rule.sell_net_price_raw
+        runtime.proceeds_raw += net_proceeds
         self._reduce_cost(runtime, sold)
-        if listed > 0:
-            runtime.held_quantity = listed
+        runtime.held_quantity = max(0, original_held - sold)
+        runtime.last_sell_price_raw = average_gross or rule.sell_gross_price_raw
+        if unresolved:
+            runtime.phase = PHASE_ERROR
+            runtime.last_error = (
+                "检测到无法确认归属的开放卖单，请到官方市场核对"
+                if unknown_orders
+                else (request_error or "卖单提交结果不确定，请到官方市场核对订单和库存")
+            )
+        elif runtime.held_quantity <= 0:
+            runtime.phase = PHASE_COMPLETED
+        elif listed > 0:
             runtime.phase = PHASE_LISTING
             self._next_listing_reconcile[rule.rule_id] = time.time() + MAX_LISTING_RECONCILE_SECONDS
         else:
-            runtime.held_quantity = 0
-            runtime.phase = PHASE_COMPLETED if runtime.held_quantity == 0 else PHASE_HOLDING
-        if request_failed:
-            runtime.phase = PHASE_ERROR
-            runtime.last_error = "卖单提交结果不确定，请到官方市场核对订单和库存"
+            runtime.phase = PHASE_HOLDING
         runtime.updated_at = time.time()
         self.store.save_runtime()
 
@@ -900,32 +1098,40 @@ class AutoTrader:
             await self._record(
                 rule,
                 "sell",
-                f"{rule.title} 卖出 {sold} 个，预计税后 {fmt_gjn(sold * rule.sell_net_price_raw)} GJN",
+                f"{rule.title} 卖出 {sold} 个，实际均价 {fmt_gjn(average_gross)} GJN，"
+                f"税后到账 {fmt_gjn(net_proceeds)} GJN",
                 details={
                     "trade_side": "SELL",
-                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_price": fmt_gjn(average_gross),
                     "trade_quantity": sold,
-                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
-                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                    "trade_amount": fmt_gjn(gross_amount),
+                    "trade_net_price": fmt_gjn(average_net),
                 },
             )
         if listed > 0:
+            listed_gross = sum(order.amount * order.price_raw for order in tracked)
+            listed_net = sum(order.amount * seller_receives_raw(order.price_raw) for order in tracked)
             await self._record(
                 rule,
                 "listing",
-                f"{rule.title} 剩余 {listed} 个已挂单，目标税后 {fmt_gjn(rule.sell_net_price_raw)} GJN",
+                f"{rule.title} 剩余 {listed} 个已挂单，预计税后 {fmt_gjn(listed_net)} GJN",
                 details={
                     "trade_side": "SELL",
-                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_price": fmt_gjn(self._weighted_price(listed_gross, listed)),
                     "trade_quantity": listed,
-                    "trade_amount": fmt_gjn(listed * rule.sell_gross_price_raw),
-                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                    "trade_amount": fmt_gjn(listed_gross),
+                    "trade_net_price": fmt_gjn(self._weighted_price(listed_net, listed)),
                 },
             )
-        if request_failed:
+        if returned_total > 0:
+            await self._record(
+                rule,
+                "listing_returned",
+                f"{rule.title} 有 {returned_total} 个卖单未生效或已退回库存",
+                level="warning",
+            )
+        if unresolved:
             raise TradeError(runtime.last_error)
-        if sold <= 0 and listed <= 0 and request_sent:
-            raise TradeError("卖单已提交但未检测到库存变化或挂单，已暂停并等待人工核对")
         if runtime.phase == PHASE_COMPLETED:
             await self._complete_cycle(rule)
 
@@ -937,18 +1143,32 @@ class AutoTrader:
         runtime = self.store.get_runtime(rule.rule_id)
         previous_available = runtime.available_quantity
         current_orders = await self.client.get_open_orders(token)
+        unowned = self._unowned_market_orders(rule, current_orders, runtime.orders)
+        if unowned:
+            raise TradeError("检测到无法确认归属的开放订单，挂单对账已暂停")
         by_id = {self._order_id(item): item for item in current_orders}
+        by_transaction = {
+            self._order_transaction_id(item): item for item in current_orders if self._order_transaction_id(item)
+        }
         missing: list[TradeOrder] = []
         current_tracked: list[TradeOrder] = []
         partial_sold = 0
+        partial_gross = 0
+        partial_net = 0
         for order in runtime.orders:
             item = by_id.get(order.order_id)
+            if item is None and order.transaction_id:
+                item = by_transaction.get(order.transaction_id)
             if item is None:
                 missing.append(order)
                 continue
             amount = max(0, self._order_amount(item))
             if order.amount > amount:
-                partial_sold += order.amount - amount
+                sold_quantity = order.amount - amount
+                price_raw = order.price_raw or rule.sell_gross_price_raw
+                partial_sold += sold_quantity
+                partial_gross += sold_quantity * price_raw
+                partial_net += sold_quantity * seller_receives_raw(price_raw)
                 order.amount = amount
             if amount > 0:
                 current_tracked.append(order)
@@ -966,12 +1186,30 @@ class AutoTrader:
             )
             returned = min(missing_amount, max(0, actual_tracked - previous_available))
 
-        sold = partial_sold + max(0, missing_amount - returned)
+        missing_sold = 0
+        missing_gross = 0
+        missing_net = 0
+        returned_left = returned
+        for order in missing:
+            returned_quantity = min(order.amount, returned_left)
+            returned_left -= returned_quantity
+            sold_quantity = max(0, order.amount - returned_quantity)
+            price_raw = order.price_raw or rule.sell_gross_price_raw
+            missing_sold += sold_quantity
+            missing_gross += sold_quantity * price_raw
+            missing_net += sold_quantity * seller_receives_raw(price_raw)
+
+        sold = partial_sold + missing_sold
+        gross_amount = partial_gross + missing_gross
+        net_proceeds = partial_net + missing_net
+        average_gross = self._weighted_price(gross_amount, sold)
+        average_net = self._weighted_price(net_proceeds, sold)
         runtime.orders = current_tracked
         runtime.listed_quantity = sum(order.amount for order in current_tracked)
         if sold > 0:
             runtime.held_quantity = max(0, runtime.held_quantity - sold)
-            runtime.proceeds_raw += sold * rule.sell_net_price_raw
+            runtime.proceeds_raw += net_proceeds
+            runtime.last_sell_price_raw = average_gross
             self._reduce_cost(runtime, sold)
         runtime.updated_at = time.time()
         self.store.save_runtime()
@@ -980,13 +1218,14 @@ class AutoTrader:
             await self._record(
                 rule,
                 "listing_fill",
-                f"{rule.title} 挂单成交 {sold} 个，预计税后 {fmt_gjn(sold * rule.sell_net_price_raw)} GJN",
+                f"{rule.title} 挂单成交 {sold} 个，实际均价 {fmt_gjn(average_gross)} GJN，"
+                f"税后到账 {fmt_gjn(net_proceeds)} GJN",
                 details={
                     "trade_side": "SELL",
-                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_price": fmt_gjn(average_gross),
                     "trade_quantity": sold,
-                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
-                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                    "trade_amount": fmt_gjn(gross_amount),
+                    "trade_net_price": fmt_gjn(average_net),
                 },
             )
         if runtime.held_quantity <= 0:
@@ -1028,20 +1267,36 @@ class AutoTrader:
         requested: int,
         *,
         request_ok: bool,
+        submitted: TradeOrder,
     ) -> tuple[int, list[TradeAssetAllocation], list[TradeOrder]]:
         before_ids = {self._order_id(item) for item in before_orders}
         await asyncio.sleep(0.6)
         after_orders = await self.client.get_open_orders(token)
-        new_buys = [
+        new_market_orders = [
             item
             for item in after_orders
-            if self._order_id(item) not in before_ids
+            if (not self._order_id(item) or self._order_id(item) not in before_ids)
             and self._order_market(item) == rule.market_name
-            and self._order_side(item) == "BUY"
         ]
+        matched_orders = [
+            item
+            for item in new_market_orders
+            if self._order_side(item) == "BUY" and self._order_matches_submission(submitted, item)
+        ]
+        matched_object_ids = {id(item) for item in matched_orders}
+        unowned_orders = [
+            self._order_from_market(item) for item in new_market_orders if id(item) not in matched_object_ids
+        ]
+        if unowned_orders:
+            # 无法确认这些订单属于本次请求。宁可停止，也不能撤销用户手工创建的订单。
+            return 0, [], unowned_orders
+
         remaining_orders: list[TradeOrder] = []
-        for item in new_buys:
+        for item in matched_orders:
             order = self._order_from_market(item)
+            if not order.pair_id or not order.order_id:
+                remaining_orders.append(order)
+                continue
             try:
                 await self.client.cancel_order(
                     order.pair_id,
@@ -1054,6 +1309,29 @@ class AutoTrader:
                 remaining_orders.append(order)
         if remaining_orders:
             return 0, [], remaining_orders
+        if matched_orders:
+            still_open: list[TradeOrder] = []
+            for attempt in range(BUY_CANCEL_VERIFY_ATTEMPTS):
+                await asyncio.sleep(0.5 + attempt * 0.25)
+                current_orders = await self.client.get_open_orders(token)
+                current_unknown = [
+                    item
+                    for item in current_orders
+                    if (not self._order_id(item) or self._order_id(item) not in before_ids)
+                    and self._order_market(item) == rule.market_name
+                    and not self._order_matches_submission(submitted, item)
+                ]
+                if current_unknown:
+                    return 0, [], [self._order_from_market(item) for item in current_unknown]
+                still_open = [
+                    self._order_from_market(item)
+                    for item in current_orders
+                    if self._order_matches_submission(submitted, item)
+                ]
+                if not still_open:
+                    break
+            if still_open:
+                return 0, [], still_open
 
         acquired = 0
         allocations: list[TradeAssetAllocation] = []
@@ -1270,6 +1548,25 @@ class AutoTrader:
         return str(item.get("id") or item.get("orderId") or item.get("order_id") or "")
 
     @staticmethod
+    def _order_pair_id(item: dict) -> str:
+        return str(item.get("pairId") or item.get("pair_id") or "")
+
+    @staticmethod
+    def _order_transaction_id(item: dict) -> int:
+        value = (
+            item.get("transactid")
+            or item.get("transactId")
+            or item.get("transact_id")
+            or item.get("transactionId")
+            or item.get("transaction_id")
+            or 0
+        )
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def _order_market(item: dict) -> str:
         return str(item.get("market") or item.get("market_name") or item.get("hash_name") or "")
 
@@ -1285,12 +1582,91 @@ class AutoTrader:
     def _order_from_market(cls, item: dict) -> TradeOrder:
         return TradeOrder(
             order_id=cls._order_id(item),
-            pair_id=str(item.get("pairId") or item.get("pair_id") or ""),
+            pair_id=cls._order_pair_id(item),
             side=cls._order_side(item),
             amount=cls._order_amount(item),
             price_raw=int(item.get("price") or item.get("normalPrice") or item.get("localPrice") or 0),
             market_name=cls._order_market(item),
+            transaction_id=cls._order_transaction_id(item),
         )
+
+    @classmethod
+    def _order_from_response(
+        cls,
+        response: Any,
+        *,
+        side: str,
+        amount: int,
+        price_raw: int,
+        market_name: str,
+        transaction_id: int,
+    ) -> TradeOrder:
+        item = cls._find_order_payload(response)
+        return TradeOrder(
+            order_id=cls._order_id(item) if item else "",
+            pair_id=cls._order_pair_id(item) if item else "",
+            side=side,
+            amount=max(0, int(amount)),
+            price_raw=max(0, int(price_raw)),
+            market_name=market_name,
+            transaction_id=max(0, int(transaction_id)),
+        )
+
+    @classmethod
+    def _find_order_payload(cls, value: Any) -> dict:
+        if isinstance(value, dict):
+            if cls._order_id(value) or cls._order_pair_id(value) or cls._order_transaction_id(value):
+                return value
+            for key in ("order", "data", "result", "response", "orders"):
+                if key in value:
+                    found = cls._find_order_payload(value[key])
+                    if found:
+                        return found
+        elif isinstance(value, list):
+            for item in value:
+                found = cls._find_order_payload(item)
+                if found:
+                    return found
+        return {}
+
+    @classmethod
+    def _order_matches_submission(cls, submitted: TradeOrder, item: dict) -> bool:
+        order_id = cls._order_id(item)
+        if submitted.order_id and order_id and submitted.order_id == order_id:
+            return True
+        transaction_id = cls._order_transaction_id(item)
+        if submitted.transaction_id and transaction_id:
+            return submitted.transaction_id == transaction_id
+        return False
+
+    @classmethod
+    def _unowned_market_orders(
+        cls,
+        rule: TradeRule,
+        orders: list[dict],
+        owned: list[TradeOrder] | None = None,
+    ) -> list[TradeOrder]:
+        owned_ids = {order.order_id for order in (owned or []) if order.order_id}
+        owned_transactions = {order.transaction_id for order in (owned or []) if order.transaction_id}
+        return [
+            cls._order_from_market(item)
+            for item in orders
+            if cls._order_market(item) == rule.market_name
+            and cls._order_id(item) not in owned_ids
+            and cls._order_transaction_id(item) not in owned_transactions
+        ]
+
+    @staticmethod
+    def _buy_cost_for_quantity(book: BookSnapshot, limit_raw: int, quantity: int) -> int:
+        remaining = max(0, int(quantity))
+        cost = 0
+        for level in book.sell_levels:
+            if level.price_raw > limit_raw or remaining <= 0:
+                break
+            take = min(remaining, level.amount)
+            cost += take * level.price_raw
+            remaining -= take
+        return cost + remaining * max(0, int(limit_raw))
 
     @staticmethod
     def _quote_raw(value: float | None) -> int:
@@ -1440,7 +1816,7 @@ class AutoTrader:
     async def _fail_rule(self, rule: TradeRule, exc: Exception) -> None:
         runtime = self.store.get_runtime(rule.rule_id)
         if isinstance(exc, AuthExpiredError):
-            message = "市场登录已失效，自动交易暂停，请发送 /gjma login"
+            message = "市场登录已失效，自动交易暂停，请发送 /gjm login"
             runtime.phase = PHASE_ERROR
             rule.enabled = False
         elif isinstance(exc, TradeError):

@@ -24,7 +24,7 @@
       "on_change",
       "always"
     ],
-    "hint": "旧配置默认值；新订阅建议使用 /gjma refresh mode 设置。"
+    "hint": "旧配置默认值；新订阅建议使用 /gjm refresh mode 设置。"
   },
   "mention_users": {
     "description": "推送时 @ 订阅者",

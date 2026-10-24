@@ -149,7 +149,9 @@ class Notifier:
 
     def session_of(self, uid: str) -> str:
         """把 UID 解析成会话（推送 / @ 的前提）。"""
-        return self.storage.resolve_uid(uid) or self._guess_private_session(uid)
+        private_resolver = getattr(self.storage, "resolve_private_uid", None)
+        private_umo = str(private_resolver(uid) or "") if callable(private_resolver) else ""
+        return private_umo or self.storage.resolve_uid(uid) or self._guess_private_session(uid)
 
     def owner_sessions(self, owner_uids: list[str] | None = None) -> list[str]:
         """拥有者 UID -> 会话列表（全局监控项的通知目标）。"""

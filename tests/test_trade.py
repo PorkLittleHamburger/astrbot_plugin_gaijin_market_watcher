@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import tempfile
@@ -87,6 +88,7 @@ class _Client:
         self.balance = 10_000_000
         self.buy_calls: list[dict] = []
         self.sell_calls: list[dict] = []
+        self._transaction_counter = 0
 
     async def fetch_quote(self, *_args, **_kwargs) -> Quote:
         return self.quote
@@ -119,7 +121,12 @@ class _Client:
         self.buy_calls.append(
             {"market": market_name, "amount": amount, "price_raw": price_raw, "token": token, **kwargs}
         )
-        return {"success": True}
+        return {
+            "success": True,
+            "id": f"buy-{len(self.buy_calls)}",
+            "pairId": "pair",
+            "transactid": kwargs.get("transact_id"),
+        }
 
     async def place_sell_order(self, context_id, asset_id, amount, price_raw, wished, token, **kwargs):
         self.sell_calls.append(
@@ -133,11 +140,16 @@ class _Client:
                 **kwargs,
             }
         )
-        return {"success": True}
+        return {
+            "success": True,
+            "id": f"sell-{len(self.sell_calls)}",
+            "pairId": "pair",
+            "transactid": kwargs.get("transact_id"),
+        }
 
-    @staticmethod
-    def new_transaction_id() -> int:
-        return 1234567
+    def new_transaction_id(self) -> int:
+        self._transaction_counter += 1
+        return 1234566 + self._transaction_counter
 
 
 class TradeTests(unittest.IsolatedAsyncioTestCase):
@@ -300,12 +312,108 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         before = {("ctx", "asset-1"): {"quantity": 1, "class_id": "x"}}
         with patch("core.trader.asyncio.sleep", new=AsyncMock()):
             acquired, allocations, remaining = await self.trader._reconcile_buy(
-                rule, "token", [], before, 4, request_ok=True
+                rule,
+                "token",
+                [],
+                before,
+                4,
+                request_ok=True,
+                submitted=TradeOrder(
+                    order_id="new-buy",
+                    pair_id="pair",
+                    side="BUY",
+                    amount=4,
+                    price_raw=80_000,
+                    market_name="item",
+                    transaction_id=1,
+                ),
             )
         self.assertEqual(acquired, 1)
         self.assertEqual(allocations[0].quantity, 1)
         self.assertFalse(remaining)
         self.assertEqual(self.client.cancelled, [("pair", "new-buy")])
+
+    async def test_reconcile_buy_does_not_cancel_unknown_manual_order(self) -> None:
+        self.client.orders = [
+            [
+                {
+                    "id": "manual-buy",
+                    "pairId": "manual-pair",
+                    "type": "BUY",
+                    "market": "item",
+                    "amount": 1,
+                }
+            ]
+        ]
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        with patch("core.trader.asyncio.sleep", new=AsyncMock()):
+            acquired, allocations, remaining = await self.trader._reconcile_buy(
+                rule,
+                "token",
+                [],
+                {},
+                1,
+                request_ok=True,
+                submitted=TradeOrder(
+                    order_id="plugin-buy",
+                    pair_id="plugin-pair",
+                    side="BUY",
+                    amount=1,
+                    price_raw=80_000,
+                    market_name="item",
+                    transaction_id=99,
+                ),
+            )
+        self.assertEqual(acquired, 0)
+        self.assertEqual(allocations, [])
+        self.assertEqual([order.order_id for order in remaining], ["manual-buy"])
+        self.assertEqual(self.client.cancelled, [])
+
+    async def test_reconcile_buy_waits_until_cancelled_order_disappears(self) -> None:
+        repeat_order = {
+            "id": "plugin-buy",
+            "pairId": "plugin-pair",
+            "type": "BUY",
+            "market": "item",
+            "amount": 1,
+            "transactid": 99,
+        }
+        self.client.orders = [[repeat_order], [repeat_order], [repeat_order], [repeat_order]]
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        with patch("core.trader.asyncio.sleep", new=AsyncMock()):
+            acquired, allocations, remaining = await self.trader._reconcile_buy(
+                rule,
+                "token",
+                [],
+                {},
+                1,
+                request_ok=True,
+                submitted=TradeOrder(
+                    order_id="plugin-buy",
+                    pair_id="plugin-pair",
+                    side="BUY",
+                    amount=1,
+                    price_raw=80_000,
+                    market_name="item",
+                    transaction_id=99,
+                ),
+            )
+        self.assertEqual(acquired, 0)
+        self.assertEqual(allocations, [])
+        self.assertEqual([order.order_id for order in remaining], ["plugin-buy"])
+        self.assertEqual(self.client.cancelled, [("plugin-pair", "plugin-buy")])
 
     async def test_live_sell_partially_fills_and_tracks_remaining_listing(self) -> None:
         rule = await self.trader.create_rule(
@@ -333,6 +441,122 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.held_quantity, 1)
         self.assertEqual(runtime.listed_quantity, 1)
         self.assertEqual(len(self.client.sell_calls), 2)
+
+    async def test_live_sell_waits_for_delayed_order_visibility_without_phantom_fill(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=3,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        runtime.held_quantity = 3
+        runtime.cost_basis_raw = 240_000
+        runtime.assets = [TradeAssetAllocation(context_id="ctx", asset_id="asset", quantity=3)]
+        self.client.books = [self._book(buys=[(120_000, 3)])]
+        self.client.orders = [
+            [],
+            [],
+            [
+                {
+                    "id": "sell-1",
+                    "pairId": "pair",
+                    "type": "SELL",
+                    "market": "item",
+                    "amount": 3,
+                    "price": 120_000,
+                }
+            ],
+        ]
+
+        with patch("core.trader.asyncio.sleep", new=AsyncMock()):
+            await self.trader._live_sell(rule, self.client.quote)
+
+        self.assertEqual(runtime.held_quantity, 3)
+        self.assertEqual(runtime.listed_quantity, 3)
+        self.assertEqual(runtime.proceeds_raw, 0)
+        self.assertEqual(runtime.phase, PHASE_LISTING)
+
+    async def test_live_sell_detects_returned_inventory_instead_of_phantom_sale(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        runtime.held_quantity = 1
+        runtime.cost_basis_raw = 80_000
+        runtime.assets = [
+            TradeAssetAllocation(
+                context_id="ctx",
+                asset_id="asset",
+                quantity=1,
+                baseline_quantity=0,
+            )
+        ]
+        self.client.books = [self._book(buys=[(120_000, 1)])]
+        self.client.inventories = [
+            [{"id": "asset", "class": [{"name": "asset_class", "value": "coupon"}], "amount": 1}]
+        ]
+
+        with patch("core.trader.asyncio.sleep", new=AsyncMock()):
+            await self.trader._live_sell(rule, self.client.quote)
+
+        self.assertEqual(runtime.held_quantity, 1)
+        self.assertEqual(runtime.listed_quantity, 0)
+        self.assertEqual(runtime.proceeds_raw, 0)
+        self.assertEqual(runtime.phase, "holding")
+
+    async def test_live_buy_uses_observed_fill_prices_for_cost_basis(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=3,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+        self.client.books = [self._book(sells=[(70_000, 2), (80_000, 1)])]
+        self.client.orders = [
+            [],
+            [
+                {
+                    "id": "buy-1",
+                    "pairId": "pair",
+                    "type": "BUY",
+                    "market": "item",
+                    "amount": 1,
+                    "price": 80_000,
+                }
+            ],
+        ]
+        self.client.inventories = [
+            [],
+            [{"id": "asset", "class": [{"name": "asset_class", "value": "coupon"}], "amount": 2}],
+        ]
+
+        with (
+            patch("core.trader.asyncio.sleep", new=AsyncMock()),
+            patch.object(self.trader, "_live_sell", new=AsyncMock()),
+        ):
+            await self.trader._live_buy(rule, self.client.quote)
+
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        self.assertEqual(runtime.cost_basis_raw, 140_000)
+        self.assertEqual(runtime.last_buy_price_raw, 70_000)
+        self.assertEqual(self.trader.store.ledger.daily_spent_raw, 140_000)
 
     async def test_manual_listing_cancel_is_detected_by_returned_inventory(self) -> None:
         rule = await self.trader.create_rule(
@@ -374,6 +598,18 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         loaded = TradeStore(self.storage, _Logger())
         self.assertTrue(loaded.settings.enabled)
         self.assertEqual(loaded.settings.total_budget_raw, 100_000)
+
+    def test_trade_order_round_trip_preserves_transaction_id(self) -> None:
+        order = TradeOrder(
+            order_id="order-1",
+            pair_id="pair-1",
+            side="SELL",
+            amount=2,
+            price_raw=90_100,
+            market_name="item",
+            transaction_id=987654321,
+        )
+        self.assertEqual(TradeOrder.from_dict(order.to_dict()).transaction_id, 987654321)
 
     def test_trade_view_assets_and_i18n_exist(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -500,6 +736,22 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         persisted = reloaded.get_rule(rule.rule_id)
         self.assertIsNotNone(persisted)
         self.assertFalse(persisted.live)
+
+    async def test_public_trade_mutations_wait_for_action_lock(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        await self.trader._action_lock.acquire()
+        task = asyncio.create_task(self.trader.action(rule.rule_id, "pause"))
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.trader._action_lock.release()
+        await task
+        self.assertFalse(rule.enabled)
 
     def test_watcher_uses_trader_market_names_and_five_second_interval(self) -> None:
         watcher = MarketWatcher(

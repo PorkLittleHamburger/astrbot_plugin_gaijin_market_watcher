@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from core.account_store import AccountStore
+from core.config import PluginConfig
 from core.models import Subscription
 from core.notifier import Notifier
 from core.output_store import DEFAULT_QUOTE_PAYLOAD, DEFAULT_TRADE_PAYLOAD, OutputStore
@@ -158,6 +159,17 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(notifier.owner_sessions(), ["test:FriendMessage:owner-a"])
 
+    def test_group_activity_does_not_replace_known_private_session(self) -> None:
+        self.storage.remember_session("owner", "test:FriendMessage:owner", "test", "Owner")
+        self.storage.remember_session("owner", "test:GroupMessage:group", "test", "Owner")
+        self.assertEqual(self.storage.resolve_private_uid("owner"), "test:FriendMessage:owner")
+        notifier = Notifier(None, self.storage, SimpleNamespace(appid="1067"), _Logger())
+        self.assertEqual(notifier.session_of("owner"), "test:FriendMessage:owner")
+
+    def test_config_validation_uses_runtime_auth_state(self) -> None:
+        hints = PluginConfig({}).validate(auth=SimpleNamespace(jwt="runtime-jwt", refresh_token=""))
+        self.assertFalse(any("尚未配置登录令牌" in hint for hint in hints))
+
     async def test_trade_template_renders_all_event_context_and_falls_back(self) -> None:
         output = SimpleNamespace(trade_payload=DEFAULT_TRADE_PAYLOAD)
         notifier = Notifier(None, self.storage, SimpleNamespace(), _Logger(), output=output)
@@ -227,5 +239,9 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(endpoint, app)
         self.assertIn("完整模拟演练", app)
         self.assertIn("切换到模拟盘", app)
+        self.assertIn("function authIsValid", app)
+        self.assertNotIn('auth.has_jwt ? "有效"', app)
         self.assertIn("insertAdjacentHTML", app)
         self.assertNotIn("renderEvents(data.events", app)
+        subscriptions_source = (root / "core/subscriptions.py").read_text(encoding="utf-8")
+        self.assertNotIn("/gjma", subscriptions_source)

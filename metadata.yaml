@@ -15,7 +15,7 @@ desc: |
   - 模拟演练：读取一次真实盘口后，在隔离状态中完整执行模拟买卖
   - 交易安全：固定 15% 手续费、全局预算、每日限额、急停与订单对账
   - 增量日志：按上海日期追加 JSONL，控制台按游标只更新新增事件
-version: 2.20.1
+version: 2.20.2
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.29.0,<5"

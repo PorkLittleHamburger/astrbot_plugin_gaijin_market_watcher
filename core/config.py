@@ -102,7 +102,7 @@ class PluginConfig:
             min(MAX_POLL_INTERVAL, _as_int(self.raw.get("poll_interval"), DEFAULT_POLL_INTERVAL)),
         )
 
-    def validate(self, *, subscriptions=None, owner_uids=None, output=None) -> list[str]:
+    def validate(self, *, subscriptions=None, owner_uids=None, output=None, auth=None) -> list[str]:
         """返回面向用户的启动提示（不抛异常）。"""
         hints: list[str] = []
         if subscriptions is not None:
@@ -115,7 +115,12 @@ class PluginConfig:
                 )
             if not subscriptions.watched_market_names:
                 hints.append("当前没有行情订阅：可在插件控制台或聊天中订阅物品。")
-        if not (self.jwt_token or self.refresh_token):
+        has_credentials = bool(
+            (getattr(auth, "jwt", "") or getattr(auth, "refresh_token", ""))
+            if auth is not None
+            else (self.jwt_token or self.refresh_token)
+        )
+        if not has_credentials:
             hints.append("尚未配置登录令牌：请在插件控制台完成账号登录。")
         if owner_uids is not None and not owner_uids:
             hints.append("未配置拥有者 UID：聊天登录可回退管理员判定，但自动交易会持续禁用。")

@@ -352,7 +352,7 @@ class SubscriptionStore:
     def remove_by_index(self, uid: str, index: int, target_umo: str | None = None) -> tuple[bool, str]:
         own = self.subscriptions_of(uid, target_umo)
         if not own:
-            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
         if index < 1 or index > len(own):
             return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
         target = own[index - 1]
@@ -485,7 +485,7 @@ class SubscriptionStore:
         if not targets:
             if market_name:
                 return False, "你没有订阅这件物品。"
-            return False, "你还没有订阅任何物品，先用 /gjma sub <物品链接> 订阅。"
+            return False, "你还没有订阅任何物品，先用 /gjm sub <物品链接> 订阅。"
         updated = [self._copy(sub, interval=value) if sub in targets else sub for sub in self._items]
         if not self._commit(updated):
             return False, "保存刷新间隔失败，请检查插件数据目录写入权限或日志。"
@@ -496,7 +496,7 @@ class SubscriptionStore:
     def set_interval_by_index(self, uid: str, seconds: int, index: int, target_umo: str | None = None):
         own = self.subscriptions_of(uid, target_umo)
         if not own:
-            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
         if index < 1 or index > len(own):
             return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
         return self.set_interval(uid, seconds, own[index - 1].market_name, target_umo)
@@ -508,7 +508,7 @@ class SubscriptionStore:
             sub for sub in self._items if sub.uid == uid and (target_umo is None or sub.target_umo == target_umo)
         ]
         if not targets:
-            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
         updated = [self._copy(sub, mode=mode) if sub in targets else sub for sub in self._items]
         if not self._commit(updated):
             return False, "保存刷新模式失败，请检查插件数据目录写入权限或日志。"

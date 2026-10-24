@@ -207,12 +207,24 @@ class PluginStorage:
         if not isinstance(data, dict):
             data = {}
         entry = data.get(uid) if isinstance(data.get(uid), dict) else {}
-        if entry.get("umo") == umo and entry.get("platform") == platform and (not name or entry.get("name") == name):
+        old_umo = str(entry.get("umo") or "")
+        private_umo = str(entry.get("private_umo") or "")
+        if not private_umo and self._is_private_umo(old_umo):
+            private_umo = old_umo
+        if self._is_private_umo(umo):
+            private_umo = umo
+        if (
+            old_umo == umo
+            and entry.get("platform") == platform
+            and (not name or entry.get("name") == name)
+            and str(entry.get("private_umo") or "") == private_umo
+        ):
             return True  # 无变化则不落盘
         data[uid] = {
             "umo": umo,
             "platform": platform or entry.get("platform", ""),
             "name": name or entry.get("name", ""),
+            "private_umo": private_umo,
             "updated_at": time.time(),
         }
         return self._save(self._sessions_file, data)
@@ -228,6 +240,22 @@ class PluginStorage:
         data = self._load(self._sessions_file, {})
         entry = data.get(uid) if isinstance(data, dict) else None
         return str(entry.get("umo") or "") if isinstance(entry, dict) else ""
+
+    def resolve_private_uid(self, uid: str) -> str:
+        """UID -> 最近已知私聊 UMO；群聊消息不会覆盖它。"""
+        data = self._load(self._sessions_file, {})
+        entry = data.get(uid) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return ""
+        private_umo = str(entry.get("private_umo") or "")
+        if private_umo:
+            return private_umo
+        umo = str(entry.get("umo") or "")
+        return umo if self._is_private_umo(umo) else ""
+
+    @staticmethod
+    def _is_private_umo(umo: str) -> bool:
+        return ":FriendMessage:" in str(umo or "")
 
     def known_platforms(self) -> set[str]:
         """已知的平台标识集合（用于给陌生 UID 拼私聊会话）。"""

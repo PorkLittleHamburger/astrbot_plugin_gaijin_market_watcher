@@ -142,7 +142,7 @@ class PluginImportTests(unittest.TestCase):
         self.assertEqual(metadata["name"], "astrbot_plugin_gaijin_market_watcher")
         self.assertEqual(metadata["display_name"], "Gaijin 市场行情监控")
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
-        self.assertEqual(metadata["version"], "2.20.1")
+        self.assertEqual(metadata["version"], "2.20.2")
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
         self.assertIn('@filter.command_group("gjm"', source)
         self.assertIn('"/gjma"', source)
@@ -192,3 +192,27 @@ class PluginImportTests(unittest.TestCase):
             self.assertEqual((target / "trade_rules.json").read_text(encoding="utf-8"), '[{"rule_id":"T1"}]')
             self.assertTrue((target / "logs" / "trade-2026-10-25.jsonl").is_file())
             self.assertTrue((target / self.module.FORMER_MIGRATION_MARKER).is_file())
+
+    def test_legacy_config_is_only_cleared_after_all_migration_writes_succeed(self) -> None:
+        can_cleanup = self.module._can_cleanup_legacy_config
+        self.assertFalse(
+            can_cleanup(
+                legacy_values_present=True,
+                migration_ok=False,
+                data_files_ready=True,
+            )
+        )
+        self.assertFalse(
+            can_cleanup(
+                legacy_values_present=True,
+                migration_ok=True,
+                data_files_ready=False,
+            )
+        )
+        self.assertTrue(
+            can_cleanup(
+                legacy_values_present=True,
+                migration_ok=True,
+                data_files_ready=True,
+            )
+        )

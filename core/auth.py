@@ -13,10 +13,10 @@
   （会话 Cookie + 表单隐藏字段 + 验证码字段名）。这样做的好处：
     * 在 WebUI 页面里点按钮发起登录 -> 填验证码 -> 提交，两步之间可以隔任意长时间；
     * 即使中途插件被重载（AstrBot 保存配置常会触发重载），流程也能接着走；
-    * 用户可以直接在插件配置表单里填验证码，插件检测到后自动提交。
+    * 用户可以在插件控制台账户页提交验证码。
 
 安全说明：
-  * 账号密码只来自插件配置（用户主动填写），本模块不收集、不打印、不外传；
+  * 账号密码只来自插件控制台账户页（用户主动填写），本模块不收集、不打印、不外传；
   * 待提交状态里只有会话 Cookie 与表单字段，**不包含密码**；
   * 落盘文件位于 data/plugin_data/<插件名>/，项目内所有持久化都集中在此处。
 """
@@ -424,7 +424,7 @@ class AuthManager:
         """
         email, password = str(email or "").strip(), str(password or "")
         if not email or not password:
-            raise LoginError("请先在插件配置里填写账号邮箱与密码。")
+            raise LoginError("请先在插件控制台账户页填写账号邮箱与密码。")
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.client.timeout),
@@ -465,7 +465,7 @@ class AuthManager:
             if "password" in code_form_fields:
                 raise LoginError(
                     "登录被拒：站点重新返回了登录页，通常是账号或密码不正确。"
-                    "请核对插件配置里的 account_email / account_password 后重试。"
+                    "请核对插件控制台账户页里的邮箱和密码后重试。"
                 )
 
             code_field = _find_code_field(response.text)
@@ -490,7 +490,7 @@ class AuthManager:
                 message=(
                     "账号密码已提交，站点要求输入验证码。\n"
                     f"验证码字段：{code_field}\n"
-                    "请在下方输入验证码并提交（或在插件配置里填写 twofa_code 后保存）。"
+                    "请在插件控制台账户页输入验证码并提交。"
                 ),
             )
 

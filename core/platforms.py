@@ -60,7 +60,7 @@ NO_AT_PLATFORMS: frozenset[str] = frozenset(
 #: 明确不支持主动推送（非用户触发）的平台。
 NO_PROACTIVE_PLATFORMS: frozenset[str] = frozenset({"wecom"})
 
-#: 主动推送的额外前提（人话说明，用于配置体检与 /gjma debug）。
+#: 主动推送的额外前提（人话说明，用于配置体检与 /gjm debug）。
 PROACTIVE_NOTES: dict[str, str] = {
     "weixin_oc": "需要用户先给机器人发过消息（context_token 过期后要再发一次，否则推送会被跳过）",
     "weixin_official_account": "受微信客服消息时限约束（用户互动后的一段时间内可推送）",
@@ -156,7 +156,7 @@ def proactive_hint(platform_type: str, declared_flag: bool | None = None) -> str
 
 
 def mention_style_text(plan: MentionPlan) -> str:
-    """把人话版的 @ 结论写出来（供 /gjma debug 与文档复用）。"""
+    """把人话版的 @ 结论写出来（供 /gjm debug 与文档复用）。"""
     if plan.style == STYLE_MARKDOWN_TEXT:
         return f"文本内嵌标记（markdown 通道）：{plan.text}"
     if plan.style == STYLE_PLAIN_TEXT:
@@ -167,7 +167,7 @@ def mention_style_text(plan: MentionPlan) -> str:
 
 
 def describe(platform_id: str, platform_type: str, declared_flag: bool | None = None) -> str:
-    """一行平台能力说明，供 /gjma debug 使用。"""
+    """一行平台能力说明，供 /gjm debug 使用。"""
     plan = mention_plan(platform_type, "UID", "某人")
     at_text = mention_style_text(plan)
     if platform_type in TEXT_MENTION_TEMPLATES:
