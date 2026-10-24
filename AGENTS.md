@@ -93,9 +93,12 @@ Test-only work must not change plugin code.
 
 ### QQ private and group matrix
 
-- Use the same bot mention in private and group chats, currently `@真珠`.
-- Send exactly one command at a time. Activate QQ, choose the native mention,
-  enter one command, send it, and immediately activate the Codex window again.
+- Private chat commands do not use an @ mention; send `/gjm ...` directly.
+- Group chat commands must start with the bot's native mention, currently
+  `@真珠`; plain typed text is not a valid substitute.
+- Send exactly one command at a time. For private chat, activate QQ and enter
+  the command directly. For group chat, choose the native mention first. Send
+  one command, then immediately activate the Codex window again.
 - After switching back, verify the QQ composer is empty and only observe the
   reply without activating another input. Never leave a queued draft.
 - Private checks include `/sid`, `/gjm trade list`, `/gjm help`, `/gjm status`,
