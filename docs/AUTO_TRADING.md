@@ -1,6 +1,6 @@
 # Gaijin Market 自动交易
 
-> 版本 `2.20.0`　|　首版仅支持 `COMMODITY` 普通商品
+> 版本 `2.20.1`　|　首版仅支持 `COMMODITY` 普通商品
 
 ## 安全边界
 
@@ -48,7 +48,7 @@
 
 ## 数据文件
 
-位于 `data/plugin_data/astrbot_plugin_gaijin_market_autotrader/`：
+位于 `data/plugin_data/astrbot_plugin_gaijin_market_watcher/`：
 
 | 文件 | 内容 |
 | --- | --- |

@@ -1,6 +1,6 @@
-# Gaijin 市场自动交易插件（独立版）· 数据清单
+# Gaijin 市场行情监控与自动交易 · 数据清单
 
-> 版本 `v2.20.0`　|　更新日期 2026-10-25　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
+> 版本 `v2.20.1`　|　更新日期 2026-10-25　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
 
 ---
 
@@ -81,7 +81,7 @@ depth      = SELL 570 / BUY 2168
 
 | 字段 | 示例 | 插件是否使用 |
 | --- | --- | --- |
-| `userId` | `155305772` | 用（`/gjma debug`） |
+| `userId` | `155305772` | 用（`/gjm debug`） |
 | `nick` | `PorkLittleBurger` | 用（状态显示） |
 | `mail` | `h***@outlook.com` | **不用、不落地** |
 | `country` | `JP` | 不用 |
@@ -97,11 +97,11 @@ depth      = SELL 570 / BUY 2168
 **登录态信息**（插件内部）：`refresh_token` 是否存在、JWT 剩余秒数、是否正等待验证码、续期错误。
 
 > 🔒 隐私说明：`mail`（邮箱）属于个人信息。插件的 `check_auth` 虽会取回整个对象，但**只读 `nick`/`userId`**，
-> 不写入任何落盘文件、不进入推送内容。你在 `/gjma debug` 里能看到的是 `nick` 与 `userId`。
+> 不写入任何落盘文件、不进入推送内容。你在 `/gjm debug` 里能看到的是 `nick` 与 `userId`。
 
 ---
 
-## 六、插件本地落盘　`data/plugin_data/astrbot_plugin_gaijin_market_autotrader/`
+## 六、插件本地落盘　`data/plugin_data/astrbot_plugin_gaijin_market_watcher/`
 
 群聊快照按 `group_push_interval` 周期主动刷新群内全部订阅物品。同一物品只保留一个行情块，
 该物品的全部群订阅者都会出现在对应 @ 列表中；没有成功行情时显示占位。

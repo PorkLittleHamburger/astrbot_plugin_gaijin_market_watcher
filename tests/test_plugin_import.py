@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+
+from core.storage import PluginStorage
 
 
 class _Group:
@@ -117,8 +120,8 @@ class PluginImportTests(unittest.TestCase):
 
     def test_main_module_imports_with_astrbot_api_surface(self) -> None:
         self.assertTrue(hasattr(self.module, "GaijinMarketWatcher"))
-        self.assertEqual(self.module.PLUGIN_NAME, "astrbot_plugin_gaijin_market_autotrader")
-        self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjma"))
+        self.assertEqual(self.module.PLUGIN_NAME, "astrbot_plugin_gaijin_market_watcher")
+        self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjm"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjm_trade_add"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "_trade_web_overview"))
         for handler in (
@@ -136,8 +139,13 @@ class PluginImportTests(unittest.TestCase):
         ):
             self.assertTrue(hasattr(self.module.GaijinMarketWatcher, handler), handler)
         metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["name"], "astrbot_plugin_gaijin_market_watcher")
+        self.assertEqual(metadata["display_name"], "Gaijin 市场行情监控")
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
-        self.assertEqual(metadata["version"], "2.20.0")
+        self.assertEqual(metadata["version"], "2.20.1")
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn('@filter.command_group("gjm"', source)
+        self.assertIn('"/gjma"', source)
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher
@@ -154,3 +162,33 @@ class PluginImportTests(unittest.TestCase):
         fake_self.accounts.owner_uids = ["owner"]
         fake_self._is_owner = lambda _event: False
         self.assertIn("仅插件拥有者", watcher_class._trade_access_error(fake_self, private_event))
+
+    def test_former_autotrader_trade_data_is_merged_once(self) -> None:
+        class _Logger:
+            def warning(self, *_args, **_kwargs) -> None:
+                pass
+
+            def info(self, *_args, **_kwargs) -> None:
+                pass
+
+        watcher_class = self.module.GaijinMarketWatcher
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_data = Path(tmp) / "plugin_data"
+            target = plugin_data / self.module.PLUGIN_NAME
+            source = plugin_data / self.module.FORMER_AUTOTRADER_PLUGIN_NAME
+            target.mkdir(parents=True)
+            (source / "logs").mkdir(parents=True)
+            (source / "trade_rules.json").write_text('[{"rule_id":"T1"}]', encoding="utf-8")
+            (source / "logs" / "trade-2026-10-25.jsonl").write_text('{"event_id":1}\n', encoding="utf-8")
+
+            logger = _Logger()
+            fake_self = SimpleNamespace(
+                storage=PluginStorage(target, logger),
+                data_dir=target,
+                logger=logger,
+            )
+            watcher_class._migrate_former_autotrader_data(fake_self)
+
+            self.assertEqual((target / "trade_rules.json").read_text(encoding="utf-8"), '[{"rule_id":"T1"}]')
+            self.assertTrue((target / "logs" / "trade-2026-10-25.jsonl").is_file())
+            self.assertTrue((target / self.module.FORMER_MIGRATION_MARKER).is_file())
