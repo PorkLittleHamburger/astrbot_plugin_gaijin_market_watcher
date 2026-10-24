@@ -31,7 +31,7 @@
 
 ### 1. 安装
 
-需要 AstrBot ≥ 4.26.0、Python ≥ 3.10（自动交易 WebUI 页面依赖插件可视化视图 API）。
+需要 AstrBot ≥ 4.29.0、Python ≥ 3.10（自动交易 WebUI 使用 `views/` 与 `AstrBotPluginView` 接口）。
 
 通过 AstrBot WebUI 上传本插件的 ZIP 包安装。源码仓库：
 ```text
