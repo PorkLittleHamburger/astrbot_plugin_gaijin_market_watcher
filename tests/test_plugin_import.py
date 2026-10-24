@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 
 class _Group:
     def __init__(self, function=None) -> None:
@@ -117,6 +119,8 @@ class PluginImportTests(unittest.TestCase):
         self.assertTrue(hasattr(self.module, "GaijinMarketWatcher"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjm_trade_add"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "_trade_web_overview"))
+        metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher
