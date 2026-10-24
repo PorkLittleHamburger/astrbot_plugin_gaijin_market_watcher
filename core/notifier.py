@@ -37,7 +37,7 @@ from . import platforms
 from .charts import render_price_chart
 from .constants import PUSH_ALWAYS, PUSH_ON_TRIGGER
 from .models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent, fmt_delta, fmt_price
-from .payload import render_message
+from .payload import TRADE_KNOWN_FIELDS, render_message
 
 #: 分隔行：真正的空行会被 QQ 的 markdown 渲染折叠掉，
 #: 所以放一个零宽空格（U+200B）—— 它不是空白字符，str.strip()/客户端 trim 都删不掉，
@@ -349,7 +349,7 @@ class Notifier:
         context.setdefault("trade_kind", event.kind)
         context.setdefault("trade_level", event.level)
         context.setdefault("trade_message", event.message)
-        model = render_message(template, context)
+        model = render_message(template, context, known_fields=TRADE_KNOWN_FIELDS)
         if model.ok:
             return model.text
         if not self._payload_warned:

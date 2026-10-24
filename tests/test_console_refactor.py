@@ -100,11 +100,13 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         trade_preview = store.preview(store.trade_payload, "trade")
         self.assertTrue(trade_preview["ok"])
         self.assertIn("交易", trade_preview["text"])
+        self.assertEqual(trade_preview["unknown_fields"], [])
         quote_preview = store.preview(store.quote_payload, "quote")
         self.assertTrue(quote_preview["ok"])
         self.assertIn("F-16XL", quote_preview["text"])
         field_preview = store.preview('{"trade":"$trade_side $trade_quantity $trade_fee"}', "trade")
         self.assertEqual(field_preview["text"], "SELL 1 15%")
+        self.assertEqual(field_preview["unknown_fields"], [])
         unknown_preview = store.preview('{"unknown":"$does_not_exist"}', "trade")
         self.assertIn("does_not_exist", unknown_preview["unknown_fields"])
         with self.assertRaises(ValueError):

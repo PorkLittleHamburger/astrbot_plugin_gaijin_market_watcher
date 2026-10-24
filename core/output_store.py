@@ -172,7 +172,11 @@ class OutputStore:
                     "buy_highest_price": "43.00",
                 }
             )
-        model = render_message(template, sample)
+        model = render_message(
+            template,
+            sample,
+            known_fields=TRADE_KNOWN_FIELDS if kind == "trade" else None,
+        )
         return {
             "ok": not model.error,
             "text": model.text,

@@ -241,10 +241,16 @@ def _resolve(name: str) -> str:
     return ALIASES.get(name, name)
 
 
-def substitute(template: str, context: dict[str, Any]) -> tuple[str, bool, list[str]]:
+def substitute(
+    template: str,
+    context: dict[str, Any],
+    *,
+    known_fields: frozenset[str] | set[str] | None = None,
+) -> tuple[str, bool, list[str]]:
     """替换 `$变量`，返回 (文本, 是否用了 @, 未知字段列表)。"""
     unknown: list[str] = []
     used_mention = False
+    allowed = known_fields or KNOWN_FIELDS
 
     def _do(match: re.Match) -> str:
         nonlocal used_mention
@@ -252,7 +258,7 @@ def substitute(template: str, context: dict[str, Any]) -> tuple[str, bool, list[
             return "$"
         raw_name = match.group(1)
         name = _resolve(raw_name)
-        if name not in KNOWN_FIELDS:
+        if name not in allowed:
             unknown.append(raw_name)
         value = context.get(name, "")
         if value is None:
@@ -270,7 +276,12 @@ def substitute(template: str, context: dict[str, Any]) -> tuple[str, bool, list[
     return text, used_mention, sorted(set(unknown))
 
 
-def render_message(template: str, context: dict[str, Any]) -> RenderedMessage:
+def render_message(
+    template: str,
+    context: dict[str, Any],
+    *,
+    known_fields: frozenset[str] | set[str] | None = None,
+) -> RenderedMessage:
     """渲染一条消息。
 
     以 `{` 开头 = JSON 骨架（解析失败**不会**原样吐出模板，而是明确报错并回退）；
@@ -284,16 +295,21 @@ def render_message(template: str, context: dict[str, Any]) -> RenderedMessage:
         skeleton, parse_error = load_skeleton(raw)
         if skeleton is None:
             return RenderedMessage(error=f"JSON 解析失败：{parse_error}（常见原因：多了一个逗号、用了中文引号）")
-        return _render_skeleton(skeleton, context)
+        return _render_skeleton(skeleton, context, known_fields=known_fields)
 
-    text, used_mention, unknown = substitute(raw, context)
+    text, used_mention, unknown = substitute(raw, context, known_fields=known_fields)
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
         return RenderedMessage(error="模板渲染结果为空", used_mention=used_mention)
     return RenderedMessage(lines=lines, used_mention=used_mention, unknown_fields=unknown)
 
 
-def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> RenderedMessage:
+def _render_skeleton(
+    skeleton: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    known_fields: frozenset[str] | set[str] | None = None,
+) -> RenderedMessage:
     """按 JSON 的书写顺序逐段取值并拼行。"""
     result = RenderedMessage()
     unknown: list[str] = []
@@ -311,7 +327,7 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
         # ---- 图片类键：普通图片附件 ----
         if lowered in IMAGE_KEYS:
             if isinstance(raw_value, str):
-                value, used_mention, names = substitute(raw_value, context)
+                value, used_mention, names = substitute(raw_value, context, known_fields=known_fields)
                 _consume("", used_mention, names)
                 value = value.strip()
                 if value:
@@ -321,7 +337,7 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
         # ---- @ 类键 ----
         if lowered in MENTION_KEYS:
             if isinstance(raw_value, str):
-                value, used_mention, names = substitute(raw_value, context)
+                value, used_mention, names = substitute(raw_value, context, known_fields=known_fields)
                 _consume("", used_mention, names)
                 if value.strip():
                     result.used_mention = True
@@ -333,7 +349,7 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
             for item in raw_value:
                 if not isinstance(item, str):
                     item = json.dumps(item, ensure_ascii=False)
-                value, used_mention, names = substitute(item, context)
+                value, used_mention, names = substitute(item, context, known_fields=known_fields)
                 _consume("", used_mention, names)
                 value = single_line(value)
                 if value:
@@ -341,7 +357,7 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
             continue
 
         if isinstance(raw_value, str):
-            value, used_mention, names = substitute(raw_value, context)
+            value, used_mention, names = substitute(raw_value, context, known_fields=known_fields)
             _consume("", used_mention, names)
             for line in value.splitlines() or [""]:
                 if line.strip():
@@ -398,7 +414,7 @@ def validate_payload(
         )
         for alias, target in ALIASES.items():
             values[alias] = values.get(target, "")
-    model = render_message(template, values)
+    model = render_message(template, values, known_fields=allowed)
     notes = []
     if model.unknown_fields:
         notes.append("含未知字段：" + "、".join(model.unknown_fields))
