@@ -102,6 +102,11 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("交易", trade_preview["text"])
         quote_preview = store.preview(store.quote_payload, "quote")
         self.assertTrue(quote_preview["ok"])
+        self.assertIn("F-16XL", quote_preview["text"])
+        field_preview = store.preview('{"trade":"$trade_side $trade_quantity $trade_fee"}', "trade")
+        self.assertEqual(field_preview["text"], "SELL 1 15%")
+        unknown_preview = store.preview('{"unknown":"$does_not_exist"}', "trade")
+        self.assertIn("does_not_exist", unknown_preview["unknown_fields"])
         with self.assertRaises(ValueError):
             store.save(quote_payload="{broken", trade_payload=DEFAULT_TRADE_PAYLOAD)
 
@@ -201,6 +206,8 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         app = (root / "views/trade/app.js").read_text(encoding="utf-8")
         for tab in ("monitor", "trade", "account", "output"):
             self.assertIn(f'data-tab="{tab}"', html)
+        tab_positions = [html.index(f'data-tab="{tab}"') for tab in ("monitor", "trade", "output", "account")]
+        self.assertEqual(tab_positions, sorted(tab_positions))
         for endpoint in (
             "account/overview",
             "account/save",
@@ -212,5 +219,11 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
             "output/overview",
             "output/save",
             "output/preview",
+            "trade/rules/drill",
+            "trade/logs",
         ):
             self.assertIn(endpoint, app)
+        self.assertIn("完整模拟演练", app)
+        self.assertIn("切换到模拟盘", app)
+        self.assertIn("insertAdjacentHTML", app)
+        self.assertNotIn("renderEvents(data.events", app)

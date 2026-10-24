@@ -132,11 +132,12 @@ class PluginImportTests(unittest.TestCase):
             "_output_web_overview",
             "_output_web_save",
             "_output_web_preview",
+            "_trade_web_drill",
         ):
             self.assertTrue(hasattr(self.module.GaijinMarketWatcher, handler), handler)
         metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
-        self.assertEqual(metadata["version"], "2.19.0")
+        self.assertEqual(metadata["version"], "2.20.0")
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher

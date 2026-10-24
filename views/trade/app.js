@@ -9,6 +9,8 @@ let toastTimer = null;
 let modalResolver = null;
 let outputDirty = false;
 let accountDirty = false;
+let tradeLogCursor = 0;
+const tradeLogIds = new Set();
 
 const phaseLabels = {
   waiting_buy: "等待买点",
@@ -98,7 +100,7 @@ function activateTab(name) {
   if (name === "monitor") void loadMonitor();
   if (name === "account") void loadAccount();
   if (name === "output") void loadOutput();
-  if (name === "trade") void refreshTrade();
+  if (name === "trade") void refreshTrade({ resetLogs: true });
 }
 
 document.querySelectorAll(".tab").forEach((button) => {
@@ -512,7 +514,10 @@ function renderRules(rules) {
     const actions = [
       actionButton("编辑", "edit", rule.rule_id),
       actionButton(rule.enabled ? "暂停" : "恢复", rule.enabled ? "pause" : "resume", rule.rule_id),
-      rule.live ? actionButton("退出实盘", "disarm", rule.rule_id) : actionButton("切换实盘", "arm", rule.rule_id, "danger"),
+      rule.live
+        ? actionButton("切换到模拟盘", "disarm", rule.rule_id, "secondary")
+        : actionButton("切换到实盘", "arm", rule.rule_id, "danger"),
+      !rule.live ? actionButton("完整模拟演练", "drill", rule.rule_id, "secondary") : "",
       hasOrders ? actionButton("撤销自动订单", "cancel_orders", rule.rule_id, "danger") : "",
       actionButton("删除", "delete", rule.rule_id, "ghost"),
     ].join("");
@@ -553,17 +558,40 @@ function renderOrders(orders) {
     </div>`).join("");
 }
 
-function renderEvents(events) {
-  const container = $("logsList");
-  if (!events.length) {
-    container.innerHTML = '<p class="muted empty">暂无日志</p>';
-    return;
-  }
-  container.innerHTML = events.slice().reverse().map((item) => `
-    <div class="stack-item">
+function logEventHtml(item) {
+  return `
+    <div class="stack-item" data-log-id="${escapeHtml(item.event_id || item.timestamp)}">
       <strong>${escapeHtml(item.message)}</strong>
-      <small>${formatTimestamp(item.timestamp)} · ${escapeHtml(item.rule_id || "-")} · ${escapeHtml(item.kind || "event")}</small>
-    </div>`).join("");
+      <small>${escapeHtml(item.occurred_at || formatTimestamp(item.timestamp))} · ${escapeHtml(item.rule_id || "-")} · ${escapeHtml(item.kind || "event")}</small>
+    </div>`;
+}
+
+function renderLogEvents(events, { reset = false } = {}) {
+  const container = $("logsList");
+  if (reset) {
+    tradeLogIds.clear();
+    tradeLogCursor = 0;
+    container.innerHTML = '<p class="muted empty">暂无日志</p>';
+  }
+  const fresh = events.filter((item) => {
+    const key = String(item.event_id || `${item.timestamp}:${item.rule_id}:${item.kind}:${item.message}`);
+    if (tradeLogIds.has(key)) return false;
+    tradeLogIds.add(key);
+    return true;
+  });
+  if (!fresh.length) return;
+  container.querySelector(".empty")?.remove();
+  container.insertAdjacentHTML("afterbegin", fresh.slice().reverse().map(logEventHtml).join(""));
+}
+
+async function loadTradeLogs({ reset = false } = {}) {
+  try {
+    const data = await apiGet("trade/logs", { after: reset ? 0 : tradeLogCursor, limit: 100 });
+    renderLogEvents(data.events || [], { reset });
+    if (data.next_cursor) tradeLogCursor = Number(data.next_cursor);
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
 }
 
 function renderTrade(data) {
@@ -575,12 +603,12 @@ function renderTrade(data) {
   fillSettings(data.settings);
   renderRules(data.rules || []);
   renderOrders(data.orders || []);
-  renderEvents(data.events || []);
 }
 
-async function refreshTrade() {
+async function refreshTrade({ resetLogs = false } = {}) {
   try {
     renderTrade(await apiGet("trade/overview"));
+    await loadTradeLogs({ reset: resetLogs });
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -628,9 +656,37 @@ async function armRule(ruleId) {
   }
 }
 
+async function drillRule(ruleId) {
+  try {
+    const result = await apiPost("trade/rules/drill", { rule_id: ruleId });
+    const lines = [
+      `演练编号：${result.drill_id}`,
+      `规则：${result.rule_title}（${result.rule_id}）`,
+      ...(result.steps || []).map((step) => `${step.title}：${step.detail}`),
+      `模拟盈亏：${result.summary?.profit || "0.00"} GJN`,
+    ];
+    await openModal({
+      title: "完整模拟演练结果",
+      message: lines.join("\n"),
+      confirmText: "关闭",
+    });
+    await refreshTrade();
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
 async function runRuleAction(action, ruleId) {
   if (action === "edit") return editRule(ruleId);
   if (action === "arm") return armRule(ruleId);
+  if (action === "drill") return drillRule(ruleId);
+  if (action === "disarm") {
+    const confirmed = await openModal({
+      title: "切换到模拟盘",
+      message: `确认将规则 ${ruleId} 切换为模拟盘？存在持仓或自动挂单时操作会被拒绝。`,
+    });
+    if (confirmed === null) return;
+  }
   if (action === "delete") {
     const confirmed = await openModal({ title: "删除规则", message: `确认删除规则 ${ruleId}？` });
     if (confirmed === null) return;
@@ -721,7 +777,7 @@ $("stopAllBtn").addEventListener("click", async () => {
 
 $("refreshBtn").addEventListener("click", async () => {
   await loadAccount();
-  if (activeTab === "trade") await refreshTrade();
+  if (activeTab === "trade") await refreshTrade({ resetLogs: true });
   if (activeTab === "monitor") await loadMonitor();
   if (activeTab === "output") await loadOutput();
 });
@@ -742,7 +798,7 @@ await bridge.ready();
 document.title = bridge.t("views.trade.title", "Gaijin Market 控制台");
 await loadAccount();
 await loadMonitor();
-if (activeTab === "trade") await refreshTrade();
+if (activeTab === "trade") await refreshTrade({ resetLogs: true });
 setInterval(() => {
   void loadAccount();
   if (activeTab === "trade") void refreshTrade();

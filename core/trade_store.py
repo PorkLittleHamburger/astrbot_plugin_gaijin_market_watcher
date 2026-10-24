@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from .trade_log_store import TradeLogStorageError, TradeLogStore
 from .trade_models import TradeEvent, TradeLedger, TradeRule, TradeRuntime, TradeSettings
 
 RULES_FILE = "trade_rules.json"
 RUNTIME_FILE = "trade_runtime.json"
 SETTINGS_FILE = "trade_settings.json"
 LEDGER_FILE = "trade_ledger.json"
-EVENTS_FILE = "trade_events.json"
 MAX_EVENTS = 500
 
 
@@ -32,6 +32,7 @@ class TradeStore:
         self.settings = TradeSettings()
         self.ledger = TradeLedger()
         self.events: list[TradeEvent] = []
+        self.log_store = TradeLogStore(storage, logger, memory_limit=MAX_EVENTS)
         self.reload()
 
     # ------------------------------------------------------------------ 载入
@@ -71,25 +72,7 @@ class TradeStore:
         except Exception:
             self.ledger = TradeLedger()
 
-        raw_events = self.storage.load_aux_json(EVENTS_FILE, [])
-        self.events = []
-        for item in raw_events if isinstance(raw_events, list) else []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                self.events.append(
-                    TradeEvent(
-                        timestamp=float(item.get("timestamp") or 0),
-                        rule_id=str(item.get("rule_id") or ""),
-                        kind=str(item.get("kind") or ""),
-                        message=str(item.get("message") or ""),
-                        level=str(item.get("level") or "info"),
-                        details=item.get("details") if isinstance(item.get("details"), dict) else {},
-                    )
-                )
-            except Exception:
-                continue
-        self.events = self.events[-MAX_EVENTS:]
+        self.events = self.log_store.recent(MAX_EVENTS)
 
     # ------------------------------------------------------------------ 规则
 
@@ -121,19 +104,21 @@ class TradeStore:
         if not self.storage.save_aux_json(LEDGER_FILE, self.ledger.to_dict()):
             raise TradeStorageError("交易账本写入失败")
 
-    def save_events(self) -> None:
-        data = [event.to_dict() for event in self.events[-MAX_EVENTS:]]
-        if not self.storage.save_aux_json(EVENTS_FILE, data):
-            raise TradeStorageError("交易日志写入失败")
-
-    def append_event(self, event: TradeEvent) -> None:
-        self.events.append(event)
-        self.events = self.events[-MAX_EVENTS:]
+    def append_event(self, event: TradeEvent) -> TradeEvent:
         try:
-            self.save_events()
-        except TradeStorageError as exc:
+            self.log_store.append(event)
+            self.events = self.log_store.recent(MAX_EVENTS)
+        except TradeLogStorageError as exc:
             # 日志写失败不应阻止交易主流程，但必须在插件日志里留下痕迹。
             self.logger.warning(str(exc))
+        return event
+
+    def events_after(self, event_id: int, limit: int = 100) -> list[TradeEvent]:
+        return self.log_store.after(event_id, limit)
+
+    @property
+    def log_cursor(self) -> int:
+        return self.log_store.next_cursor
 
     def overview(self) -> dict[str, Any]:
         return {

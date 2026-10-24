@@ -489,6 +489,155 @@ class AutoTrader:
             else:
                 await self._paper_reconcile_listing(rule, quote)
 
+    async def drill_paper_cycle(self, rule_id: str) -> dict[str, Any]:
+        """用一次真实盘口快照做隔离的完整模拟，不修改规则运行状态。"""
+        rule = self._require_rule(rule_id)
+        if rule.live:
+            raise TradeError("实盘规则不能执行模拟演练，请先切换到模拟盘")
+
+        token = await self.auth.get_token()
+        book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
+        if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
+            raise TradeError("该物品不是可模拟的普通商品")
+
+        initial_best_sell = book.best_sell
+        initial_best_buy = book.best_buy
+        initial_sell_depth = sum(level.amount for level in book.sell_levels)
+        initial_buy_depth = sum(level.amount for level in book.buy_levels)
+
+        live_buy_quantity, live_buy_cost = self._fillable_buy(book, rule.buy_price_raw, rule.quantity)
+        synthetic_buy_quantity = max(0, rule.quantity - live_buy_quantity)
+        total_buy_cost = live_buy_cost + synthetic_buy_quantity * rule.buy_price_raw
+        average_buy_price = self._weighted_price(total_buy_cost, rule.quantity)
+
+        sim_runtime = TradeRuntime.from_dict(self.store.get_runtime(rule.rule_id).to_dict())
+        sim_runtime.reset_for_cycle()
+        sim_runtime.held_quantity = rule.quantity
+        sim_runtime.cost_basis_raw = total_buy_cost
+        sim_runtime.last_buy_price_raw = average_buy_price
+        sim_runtime.phase = PHASE_HOLDING
+
+        live_sell_quantity, live_sell_proceeds, _ = self._fillable_sell(
+            book,
+            rule.sell_net_price_raw,
+            rule.quantity,
+        )
+        synthetic_sell_quantity = max(0, rule.quantity - live_sell_quantity)
+        total_sell_proceeds = live_sell_proceeds + synthetic_sell_quantity * rule.sell_net_price_raw
+        average_net_price = (
+            int(Decimal(total_sell_proceeds) / Decimal(rule.quantity))
+            if total_sell_proceeds > 0 and rule.quantity > 0
+            else 0
+        )
+
+        sim_runtime.held_quantity = 0
+        sim_runtime.listed_quantity = 0
+        sim_runtime.proceeds_raw = total_sell_proceeds
+        sim_runtime.cost_basis_raw = 0
+        sim_runtime.last_sell_price_raw = rule.sell_gross_price_raw
+        sim_runtime.phase = PHASE_COMPLETED
+        sim_runtime.cycle_count = 1
+
+        profit_raw = total_sell_proceeds - total_buy_cost
+        drill_id = "D" + secrets.token_hex(4).upper()
+        steps = [
+            {
+                "kind": "market",
+                "title": "读取初始盘口",
+                "detail": (
+                    f"最低卖价 {fmt_gjn(initial_best_sell) if initial_best_sell else '无'} GJN，"
+                    f"最高求购 {fmt_gjn(initial_best_buy) if initial_best_buy else '无'} GJN；"
+                    f"卖单深度 {initial_sell_depth}，求购深度 {initial_buy_depth}"
+                ),
+            },
+            {
+                "kind": "buy",
+                "title": "模拟买入",
+                "detail": (
+                    f"盘口成交 {live_buy_quantity} 个，虚拟补足 {synthetic_buy_quantity} 个；"
+                    f"均价 {fmt_gjn(average_buy_price)} GJN，成本 {fmt_gjn(total_buy_cost)} GJN"
+                ),
+            },
+            {
+                "kind": "sell",
+                "title": "模拟卖出",
+                "detail": (
+                    f"盘口求购成交 {live_sell_quantity} 个，虚拟补足 {synthetic_sell_quantity} 个；"
+                    f"税后均价 {fmt_gjn(average_net_price)} GJN，到账 {fmt_gjn(total_sell_proceeds)} GJN"
+                ),
+            },
+            {
+                "kind": "complete",
+                "title": "模拟周期完成",
+                "detail": (
+                    f"共 {rule.quantity} 个，模拟盈亏 {raw_to_decimal(profit_raw):+.2f} GJN；规则实际状态未改变"
+                ),
+            },
+        ]
+        message = f"完整模拟演练 {drill_id}：{rule.title}，模拟盈亏 {raw_to_decimal(profit_raw):+.2f} GJN"
+        details = self._event_context(
+            rule,
+            sim_runtime,
+            "paper_drill",
+            message,
+            "info",
+            {
+                "drill_id": drill_id,
+                "drill_initial_best_sell": fmt_gjn(initial_best_sell) if initial_best_sell else "",
+                "drill_initial_best_buy": fmt_gjn(initial_best_buy) if initial_best_buy else "",
+                "drill_buy_quantity": rule.quantity,
+                "drill_live_buy_quantity": live_buy_quantity,
+                "drill_synthetic_buy_quantity": synthetic_buy_quantity,
+                "drill_buy_cost": fmt_gjn(total_buy_cost),
+                "drill_sell_quantity": rule.quantity,
+                "drill_live_sell_quantity": live_sell_quantity,
+                "drill_synthetic_sell_quantity": synthetic_sell_quantity,
+                "drill_sell_proceeds": fmt_gjn(total_sell_proceeds),
+                "drill_profit": f"{raw_to_decimal(profit_raw):+.2f}",
+                "trade_cost_basis": fmt_gjn(total_buy_cost),
+                "trade_profit": f"{raw_to_decimal(profit_raw):+.2f}",
+            },
+        )
+        event = TradeEvent(
+            timestamp=time.time(),
+            rule_id=rule.rule_id,
+            kind="paper_drill",
+            message=message,
+            details=details,
+        )
+        self.store.append_event(event)
+        return {
+            "drill_id": drill_id,
+            "rule_id": rule.rule_id,
+            "rule_title": rule.title,
+            "initial": {
+                "best_sell": fmt_gjn(initial_best_sell) if initial_best_sell else "",
+                "best_buy": fmt_gjn(initial_best_buy) if initial_best_buy else "",
+                "sell_depth": initial_sell_depth,
+                "buy_depth": initial_buy_depth,
+            },
+            "buy": {
+                "quantity": rule.quantity,
+                "live_quantity": live_buy_quantity,
+                "synthetic_quantity": synthetic_buy_quantity,
+                "average_price": fmt_gjn(average_buy_price),
+                "cost": fmt_gjn(total_buy_cost),
+            },
+            "sell": {
+                "quantity": rule.quantity,
+                "live_quantity": live_sell_quantity,
+                "synthetic_quantity": synthetic_sell_quantity,
+                "average_net_price": fmt_gjn(average_net_price),
+                "proceeds": fmt_gjn(total_sell_proceeds),
+            },
+            "summary": {
+                "profit": f"{raw_to_decimal(profit_raw):+.2f}",
+                "profit_per_unit": f"{raw_to_decimal(profit_raw) / Decimal(rule.quantity):+.2f}",
+                "logged": bool(event.event_id),
+            },
+            "steps": steps,
+        }
+
     async def _paper_buy(self, rule: TradeRule, quote: Quote) -> None:
         token = await self.auth.get_token()
         book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
@@ -1177,6 +1326,7 @@ class AutoTrader:
         "paper_listing": "模拟挂单",
         "listing_fill": "挂单成交",
         "paper_listing_fill": "模拟挂单成交",
+        "paper_drill": "完整模拟演练",
         "stop_all": "急停",
         "partial_bought": "部分买入",
         "sold": "卖出成交",

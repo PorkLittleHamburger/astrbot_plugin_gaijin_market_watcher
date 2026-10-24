@@ -1,6 +1,6 @@
 # Gaijin Market 自动交易
 
-> 版本 `2.19.0`　|　首版仅支持 `COMMODITY` 普通商品
+> 版本 `2.20.0`　|　首版仅支持 `COMMODITY` 普通商品
 
 ## 安全边界
 
@@ -8,6 +8,7 @@
 - 未配置拥有者 UID 时自动交易直接禁用，不回退 AstrBot 管理员判定。
 - WebUI 交易页由 AstrBot Dashboard 登录保护，所有 Dashboard 管理员均可操作。
 - 新规则默认模拟运行；切换实盘必须二次确认规则 ID。
+- 模拟规则可执行隔离的“完整模拟演练”：只读取一次真实盘口，后续成交由模拟深度补足，不修改规则持仓或累计收益。
 - 实盘要求总开关开启，且总预算、每日限额、单笔上限、最大数量均大于 0。
 - 交易事件只发送到拥有者私聊；没有私聊会话时只写事件日志。
 
@@ -55,7 +56,9 @@
 | `trade_settings.json` | 总开关与风险额度 |
 | `trade_runtime.json` | 状态机、持仓、资产分配、自动订单 |
 | `trade_ledger.json` | 上海时区每日买入额 |
-| `trade_events.json` | 最近 500 条交易事件 |
+| `logs/trade-YYYY-MM-DD.jsonl` | 按上海日期追加的交易事件，每条一行，保留 30 天 |
+
+旧版 `trade_events.json` 首次升级时会迁移到按日 JSONL，并保留原文件作为备份。
 
 ## WebUI API
 
@@ -63,5 +66,6 @@
 - `POST trade/settings`
 - `POST trade/rules/save`
 - `POST trade/rules/action`
+- `POST trade/rules/drill`
 - `POST trade/stop-all`
-- `GET  trade/logs`
+- `GET  trade/logs?after=<event_id>&limit=<N>`

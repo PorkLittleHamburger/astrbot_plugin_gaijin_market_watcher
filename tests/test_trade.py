@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from core.api_client import GaijinMarketClient
+from core.auth import LoginRequiredError
 from core.models import Quote
 from core.storage import PluginStorage
 from core.trade_models import (
@@ -205,6 +207,84 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rule.enabled)
         self.assertEqual(runtime.cycle_count, 1)
 
+    async def test_paper_drill_uses_initial_book_and_is_isolated(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=3,
+            sell_net_price="9.00",
+            mode="loop",
+        )
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        runtime.phase = PHASE_LISTING
+        runtime.held_quantity = 2
+        runtime.listed_quantity = 2
+        runtime.cost_basis_raw = 170_000
+        runtime.proceeds_raw = 123_000
+        before = runtime.to_dict()
+        self.client.books = [
+            self._book(
+                sells=[(80_000, 1)],
+                buys=[(120_000, 1)],
+            )
+        ]
+
+        result = await self.trader.drill_paper_cycle(rule.rule_id)
+
+        self.assertEqual(self.client.books, [])
+        self.assertEqual(self.client.buy_calls, [])
+        self.assertEqual(self.client.sell_calls, [])
+        self.assertEqual(runtime.to_dict(), before)
+        self.assertEqual(result["initial"]["best_sell"], "8.00")
+        self.assertEqual(result["initial"]["best_buy"], "12.00")
+        self.assertEqual(result["buy"]["live_quantity"], 1)
+        self.assertEqual(result["buy"]["synthetic_quantity"], 2)
+        self.assertEqual(result["buy"]["cost"], "24.00")
+        self.assertEqual(result["sell"]["live_quantity"], 1)
+        self.assertEqual(result["sell"]["synthetic_quantity"], 2)
+        self.assertEqual(result["sell"]["proceeds"], "28.20")
+        self.assertEqual(result["summary"]["profit"], "+4.20")
+
+        log_files = list((Path(self.tmp.name) / "logs").glob("trade-*.jsonl"))
+        self.assertEqual(len(log_files), 1)
+        events = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+        drill_events = [event for event in events if event["kind"] == "paper_drill"]
+        self.assertEqual(len(drill_events), 1)
+        self.assertGreater(drill_events[0]["event_id"], 0)
+        self.assertEqual(drill_events[0]["details"]["drill_profit"], "+4.20")
+        self.assertEqual(drill_events[0]["details"]["trade_profit"], "+4.20")
+        reloaded = TradeStore(self.storage, _Logger())
+        self.assertTrue(any(event.kind == "paper_drill" for event in reloaded.events))
+
+    async def test_paper_drill_rejects_live_rule(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        with self.assertRaises(TradeError):
+            await self.trader.drill_paper_cycle(rule.rule_id)
+
+    async def test_paper_drill_requires_market_login(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+
+        class _NoAuth:
+            async def get_token(self, **_kwargs):
+                raise LoginRequiredError("未登录")
+
+        self.trader.auth = _NoAuth()
+        with self.assertRaises(LoginRequiredError):
+            await self.trader.drill_paper_cycle(rule.rule_id)
+
     async def test_reconcile_buy_cancels_remainder_and_tracks_inventory_delta(self) -> None:
         self.client.orders = [[{"id": "new-buy", "pairId": "pair", "type": "BUY", "market": "item", "amount": 3}]]
         self.client.inventories = [
@@ -385,6 +465,41 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         await self.trader.prepare_arm(rule.rule_id)
         armed = await self.trader.confirm_arm(rule.rule_id, rule.rule_id)
         self.assertTrue(armed.live)
+
+    async def test_switch_to_paper_requires_clear_position(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        runtime.held_quantity = 1
+        runtime.phase = PHASE_LISTING
+        with self.assertRaises(TradeError):
+            await self.trader.action(rule.rule_id, "disarm")
+
+    async def test_switch_to_paper_resets_and_persists_rule(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        rule.live = True
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        runtime.cycle_count = 2
+        runtime.last_error = ""
+        switched = await self.trader.action(rule.rule_id, "disarm")
+        self.assertFalse(switched.live)
+        self.assertFalse(switched.enabled)
+        reloaded = TradeStore(self.storage, _Logger())
+        persisted = reloaded.get_rule(rule.rule_id)
+        self.assertIsNotNone(persisted)
+        self.assertFalse(persisted.live)
 
     def test_watcher_uses_trader_market_names_and_five_second_interval(self) -> None:
         watcher = MarketWatcher(

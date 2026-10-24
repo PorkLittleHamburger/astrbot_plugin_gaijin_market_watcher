@@ -342,6 +342,8 @@ class TradeEvent:
     message: str
     level: str = "info"
     details: dict[str, Any] = field(default_factory=dict)
+    event_id: int = 0
+    occurred_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -351,4 +353,6 @@ class TradeEvent:
             "message": self.message,
             "level": self.level,
             "details": self.details,
+            "event_id": int(self.event_id),
+            "occurred_at": self.occurred_at,
         }

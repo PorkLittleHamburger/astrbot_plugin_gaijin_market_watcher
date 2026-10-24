@@ -103,7 +103,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "独立版 Gaijin Market 控制台插件，使用 /gjma 指令命名空间；"
         "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.19.0",
+    "2.20.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -466,6 +466,7 @@ class GaijinMarketWatcher(Star):
             ("trade/settings", self._trade_web_settings, ["POST"]),
             ("trade/rules/save", self._trade_web_save_rule, ["POST"]),
             ("trade/rules/action", self._trade_web_action, ["POST"]),
+            ("trade/rules/drill", self._trade_web_drill, ["POST"]),
             ("trade/stop-all", self._trade_web_stop_all, ["POST"]),
             ("trade/logs", self._trade_web_logs, ["GET"]),
         ]
@@ -708,15 +709,22 @@ class GaijinMarketWatcher(Star):
             "nick": auth.get("nick") or "",
             "seconds_left": int(auth.get("seconds_left") or 0),
         }
-        data["events"] = [event.to_dict() for event in self.trader.store.events[-100:]]
         return json_response(data)
 
     async def _trade_web_logs(self):
         try:
             limit = max(1, min(500, int(request.query.get("limit", 100))))
+            after = max(0, int(request.query.get("after", 0)))
         except (TypeError, ValueError):
-            return error_response("limit 必须是整数", status_code=400)
-        return json_response({"events": [event.to_dict() for event in self.trader.store.events[-limit:]]})
+            return error_response("limit 和 after 必须是整数", status_code=400)
+        events = self.trader.store.events_after(after, limit)
+        next_cursor = int(events[-1].event_id) if events else after
+        return json_response(
+            {
+                "events": [event.to_dict() for event in events],
+                "next_cursor": next_cursor,
+            }
+        )
 
     async def _trade_web_settings(self):
         payload = await request.json(default={})
@@ -784,6 +792,23 @@ class GaijinMarketWatcher(Star):
             return error_response("执行交易操作失败", status_code=500)
         self.logger.info(f"[GJM Trade] WebUI 操作 {action} / {rule_id} / {self._trade_web_actor()}")
         return json_response({"rule": self.trader.rule_view(rule)})
+
+    async def _trade_web_drill(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        rule_id = str(payload.get("rule_id") or "").strip()
+        try:
+            result = await self.trader.drill_paper_cycle(rule_id)
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] 模拟演练失败: {exc}")
+            return error_response("模拟演练失败", status_code=500)
+        self.logger.info(f"[GJM Trade] WebUI 模拟演练 {rule_id} / {self._trade_web_actor()}")
+        return json_response(result)
 
     async def _trade_web_stop_all(self):
         payload = await request.json(default={})
