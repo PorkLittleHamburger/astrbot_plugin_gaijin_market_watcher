@@ -132,7 +132,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "Gaijin 市场行情监控插件升级版，使用 /gjm 指令命名空间；"
         "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.20.2",
+    "2.20.3",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:

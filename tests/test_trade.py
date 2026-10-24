@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from core.api_client import GaijinMarketClient
+from core.api_client import GaijinMarketClient, MarketApiError
 from core.auth import LoginRequiredError
 from core.models import Quote
 from core.storage import PluginStorage
@@ -680,6 +680,31 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args[2]["seller_should_get"], 90_100)
             self.assertEqual(args[2]["transactid"], 654321)
             self.assertEqual(kwargs["retries"], 0)
+
+    async def test_fetch_book_falls_back_to_brief_for_commodity(self) -> None:
+        client = GaijinMarketClient(min_interval=0)
+        brief = {
+            "success": True,
+            "type": "COMMODITY",
+            "SELL": [[451_000, 2]],
+            "BUY": [[430_000, 1]],
+        }
+        with patch.object(
+            client,
+            "_post",
+            new=AsyncMock(
+                side_effect=[
+                    MarketApiError("cln_books", "REQUIRE_NONCOMMODITY_PAIR"),
+                    brief,
+                ]
+            ),
+        ) as post:
+            book = await client.fetch_book("item", "token")
+
+        self.assertEqual(post.await_count, 2)
+        self.assertEqual(post.await_args_list[1].args[1], "cln_books_brief")
+        self.assertEqual(book.best_sell, 451_000)
+        self.assertEqual(book.best_buy, 430_000)
 
     async def test_arm_requires_prepare_confirmation(self) -> None:
         rule = await self.trader.create_rule(

@@ -176,6 +176,23 @@ class LoginRequiredError(Exception):
     """没有任何可用凭据，需要用户先完成登录。"""
 
 
+def user_facing_auth_error(error: str) -> str:
+    """把内部鉴权异常转换成用户可理解的状态文案。"""
+    text = str(error or "").strip()
+    upper = text.upper()
+    if not text:
+        return ""
+    if "BAD_REFRESH_TOKEN" in upper:
+        return "续期令牌已失效，请在账户页重新登录。"
+    if "TOKEN_REQUIRED" in upper or "INVALID_TOKEN" in upper:
+        return "登录令牌已失效，请在账户页重新登录。"
+    if any(marker in upper for marker in ("HTTP 5", "HTTP 429", "TIMEOUT", "请求失败", "TRANSPORT")):
+        return "Gaijin 服务暂时不可用，请稍后重试。"
+    if "JWT 已更新到内存，但持久化失败" in text:
+        return text
+    return text
+
+
 @dataclass
 class LoginStep:
     """一次登录动作的结果。"""
@@ -331,7 +348,8 @@ class AuthManager:
             "nick": info.get("nick"),
             "uid": info.get("uid"),
             "two_step": info.get("has_2step"),
-            "last_error": self._last_refresh_error,
+            "last_error": user_facing_auth_error(self._last_refresh_error),
+            "last_error_detail": self._last_refresh_error,
             "has_account": bool(self.accounts and self.accounts.email and self.accounts.password),
             "pending_login": pending is not None and not pending.expired(),
             "pending_code_field": pending.code_field if pending else "",

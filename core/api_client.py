@@ -327,12 +327,14 @@ class GaijinMarketClient:
 
     async def fetch_book(self, market_name: str, token: str, *, appid: str = DEFAULT_APPID) -> BookSnapshot:
         """抓取完整盘口。返回价格、数量和可用的订单 ID。"""
-        body = await self._post(
-            EP_TRADE,
-            ACT_BOOKS,
-            {"appid": appid, "market_name": market_name, "count": 100, "skip": 0},
-            with_token=token,
-        )
+        params = {"appid": appid, "market_name": market_name, "count": 100, "skip": 0}
+        try:
+            body = await self._post(EP_TRADE, ACT_BOOKS, params, with_token=token)
+        except MarketApiError as exc:
+            if exc.error != "REQUIRE_NONCOMMODITY_PAIR":
+                raise
+            # cln_books 仅适用于非普通商品；COMMODITY 使用与行情查询相同的盘口接口。
+            body = await self._post(EP_TRADE, ACT_BOOKS_BRIEF, params, with_token=token)
         if not isinstance(body, dict):
             raise MarketApiError(ACT_BOOKS, "BAD_RESPONSE", "盘口响应格式不正确")
         sell = self._book_levels(body.get("SELL"))

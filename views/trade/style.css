@@ -7,8 +7,8 @@
   --text: #172033;
   --muted: #657089;
   --line: #dfe4ec;
-  --primary: #1677ff;
-  --primary-strong: #0958d9;
+  --primary: #0958d9;
+  --primary-strong: #003eb3;
   --danger: #d4380d;
   --success: #15803d;
   --warning: #b45309;
@@ -24,8 +24,8 @@
   --text: #ecf1fa;
   --muted: #9ba7ba;
   --line: #303a4b;
-  --primary: #4c9aff;
-  --primary-strong: #77b1ff;
+  --primary: #1d6fd1;
+  --primary-strong: #4c9aff;
   --danger: #ff6b4a;
   --success: #4ade80;
   --warning: #fbbf24;
@@ -51,6 +51,7 @@ body {
 
 .tabs { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 18px; padding: 5px; border: 1px solid var(--line); background: var(--surface); border-radius: 13px; box-shadow: var(--shadow); }
 .tab { flex: 1 0 140px; border: 0; background: transparent; color: var(--muted); padding: 10px 14px; border-radius: 9px; cursor: pointer; font: inherit; font-weight: 750; }
+.tab { transition: background-color .15s ease, color .15s ease, transform .08s ease, filter .08s ease; }
 .tab:hover { background: var(--surface-2); color: var(--text); }
 .tab.active { background: var(--primary); color: white; }
 .login-hint { display: flex; justify-content: space-between; align-items: center; gap: 14px; border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--line)); background: color-mix(in srgb, var(--warning) 10%, var(--surface)); padding: 11px 14px; border-radius: 11px; margin-bottom: 16px; }
@@ -59,25 +60,26 @@ body {
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
 .grid { display: grid; gap: 18px; }
 .two-column { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 18px; }
-.card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 20px; box-shadow: var(--shadow); }
+.card { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 20px; box-shadow: var(--shadow); }
 .metric span { color: var(--muted); display: block; margin-bottom: 5px; }
 .metric strong { font-size: 24px; letter-spacing: -0.03em; }
 .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
 .section-heading h2 { margin: 0 0 3px; font-size: 19px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
-.form-grid label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.form-grid > * { min-width: 0; }
+.form-grid label { min-width: 0; display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .form-grid label > span { letter-spacing: 0.02em; }
 .span-2 { grid-column: span 2; }
 .switch-row { flex-direction: row !important; justify-content: space-between; align-items: center; background: var(--surface-2); border: 1px solid var(--line); padding: 10px 12px; border-radius: 10px; }
-.switch-row input { width: 18px; height: 18px; }
+.switch-row input { width: 24px; height: 24px; min-width: 24px; }
 input, select, textarea {
-  width: 100%; color: var(--text); background: var(--surface-2); border: 1px solid var(--line);
+  min-width: 0; width: 100%; color: var(--text); background: var(--surface-2); border: 1px solid var(--line);
   border-radius: 9px; padding: 9px 11px; font: inherit; outline: none;
 }
 textarea { resize: vertical; min-height: 74px; }
 input:focus, select:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent); }
 .form-actions { display: flex; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
-.button { border: 1px solid transparent; border-radius: 9px; padding: 8px 13px; cursor: pointer; font: inherit; font-weight: 750; color: var(--text); background: var(--surface-2); }
+.button { border: 1px solid transparent; border-radius: 9px; padding: 8px 13px; cursor: pointer; font: inherit; font-weight: 750; color: var(--text); background: var(--surface-2); transition: transform .08s ease, filter .08s ease, opacity .15s ease; }
 .button:hover { filter: brightness(0.97); }
 .button:disabled { opacity: 0.55; cursor: not-allowed; }
 .button.primary { color: white; background: var(--primary); }
@@ -128,7 +130,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); box-sh
 .field-group { border-top: 1px solid var(--line); padding-top: 8px; }
 .field-group strong { display: block; font-size: 12px; margin-bottom: 6px; }
 .field-chips { display: flex; gap: 5px; flex-wrap: wrap; }
-.field-chip { border: 1px solid var(--line); border-radius: 999px; background: var(--surface-2); color: var(--primary); padding: 3px 8px; font: 11px/1.4 monospace; cursor: pointer; }
+.field-chip { border: 1px solid var(--line); border-radius: 999px; background: var(--surface-2); color: var(--primary); padding: 3px 8px; font: 11px/1.4 monospace; cursor: pointer; transition: transform .08s ease, filter .08s ease; }
 .field-chip:hover { background: var(--surface-3); }
 .preview-box { margin: 12px 0 0; min-height: 110px; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: 12px/1.55 "Cascadia Code", Consolas, monospace; }
 .preview-box.error { color: var(--danger); }
@@ -145,6 +147,43 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); box-sh
 .modal-message { margin: 0 0 14px; white-space: pre-wrap; word-break: break-word; font: inherit; color: var(--muted); }
 .modal-input { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; }
+
+button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.tab-panel:focus-visible,
+#rulesList:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+.button:not(:disabled):active,
+.tab:not(:disabled):active,
+.field-chip:not(:disabled):active {
+  transform: translateY(1px) scale(0.98);
+  filter: brightness(0.92);
+}
+
+.button[aria-busy="true"],
+.field-chip[aria-busy="true"] {
+  cursor: wait;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button,
+  .tab,
+  .field-chip {
+    transition: none;
+  }
+
+  .button:not(:disabled):active,
+  .tab:not(:disabled):active,
+  .field-chip:not(:disabled):active {
+    transform: none;
+  }
+}
 
 @media (max-width: 1000px) {
   .output-layout { grid-template-columns: 1fr; }

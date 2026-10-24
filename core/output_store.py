@@ -67,6 +67,56 @@ TRADE_SAMPLE_VALUES: dict[str, str] = {
     "trade_order_id": "order-demo-123",
 }
 
+QUOTE_SAMPLE_VALUES: dict[str, str | float | int | list[str] | list[dict[str, str]]] = {
+    "title": "Gaijin 行情",
+    "datetime": "2026-10-24-21-30-00",
+    "datetime_plain": "2026-10-24 21:30:00",
+    "timestamp": 1790266200,
+    "digest": "F-16XL\n  售出 45.10 GJN  ▲ +1.20 (+2.7%)\n  求购 43.00 GJN  持平",
+    "count": 1,
+    "uid": "demo-user",
+    "user": "示例用户",
+    "group": "",
+    "platform": "qq_official",
+    "mention": "@示例用户",
+    "mode": "only_change",
+    "failures": "",
+    "failures_json": [],
+    "appid": "1067",
+    "name": "F-16XL",
+    "market_name": "id50381_f_16xl_usa",
+    "content": "F-16XL\n  售出 45.10 GJN  ▲ +1.20 (+2.7%)\n  求购 43.00 GJN  持平",
+    "sell": 45.1,
+    "buy": 43.0,
+    "sell_text": "45.10",
+    "buy_text": "43.00",
+    "sell_change_amount": "+1.20",
+    "sell_change_rate": "+2.7%",
+    "buy_change_amount": "0.00",
+    "buy_change_rate": "0.0%",
+    "sell_delta": "▲ +1.20 (+2.7%)",
+    "buy_delta": "持平",
+    "sell_depth": 570,
+    "buy_depth": 2168,
+    "sell_count_change_amount": "+10",
+    "sell_count_change_rate": "+1.8%",
+    "buy_count_change_amount": "-5",
+    "buy_count_change_rate": "-0.2%",
+    "url": "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa",
+    "icon": "https://example.invalid/f-16xl.png",
+    "tags": "type:aircraft、quality:ultraRare",
+    "tags_json": ["type:aircraft", "quality:ultraRare"],
+    "rarity": "超稀有",
+    "color": "C816C1",
+    "reasons": "最低售价 45.10 <= 阈值 50.00",
+    "reasons_json": ["最低售价 45.10 <= 阈值 50.00"],
+    "reason": "最低售价 45.10 <= 阈值 50.00",
+    "kind": "COMMODITY",
+    "error": "",
+    "item_time": "2026-10-24 21:30:00",
+    "item_timestamp": 1790266200,
+}
+
 
 @dataclass(slots=True)
 class OutputSettings:
@@ -159,19 +209,7 @@ class OutputStore:
             sample = {name: name for name in TRADE_FIELDS}
             sample.update(TRADE_SAMPLE_VALUES)
         else:
-            sample = {name: name for name in (*ROUND_FIELDS, *ITEM_FIELDS)}
-            sample.update(
-                {
-                    "title": "Gaijin 行情",
-                    "datetime": "2026-10-24-21-30-00",
-                    "name": "F-16XL",
-                    "item_name": "F-16XL",
-                    "sell_text": "45.10",
-                    "sell_lowest_price": "45.10",
-                    "buy_text": "43.00",
-                    "buy_highest_price": "43.00",
-                }
-            )
+            sample = dict(QUOTE_SAMPLE_VALUES)
         model = render_message(
             template,
             sample,

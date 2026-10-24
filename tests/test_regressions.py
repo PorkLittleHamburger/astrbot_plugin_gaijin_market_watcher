@@ -622,7 +622,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(TransportError):
             await auth.get_token(force_refresh=True)
-        self.assertIn("503", auth.status()["last_error"])
+        status = auth.status()
+        self.assertIn("503", status["last_error_detail"])
+        self.assertIn("暂时不可用", status["last_error"])
 
     async def test_invalid_refresh_token_requires_login(self) -> None:
         class _Config:
@@ -650,6 +652,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(LoginRequiredError):
             await auth.get_token(force_refresh=True)
+        status = auth.status()
+        self.assertIn("BAD_REFRESH_TOKEN", status["last_error_detail"])
+        self.assertIn("续期令牌已失效", status["last_error"])
 
     async def test_force_refresh_does_not_reuse_rejected_unexpired_token(self) -> None:
         payload = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 3600}).encode()).decode()

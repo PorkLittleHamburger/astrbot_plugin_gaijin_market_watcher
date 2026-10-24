@@ -20,22 +20,22 @@
         </div>
       </header>
 
-      <nav class="tabs" aria-label="功能切换">
-        <button class="tab active" type="button" data-tab="monitor">行情订阅</button>
-        <button class="tab" type="button" data-tab="trade">自动交易</button>
-        <button class="tab" type="button" data-tab="output">输出模板</button>
-        <button class="tab" type="button" data-tab="account">账户登录</button>
+      <nav class="tabs" role="tablist" aria-label="功能切换">
+        <button id="tab-button-monitor" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="tab-monitor" tabindex="0" data-tab="monitor">行情订阅</button>
+        <button id="tab-button-trade" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-trade" tabindex="-1" data-tab="trade">自动交易</button>
+        <button id="tab-button-output" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-output" tabindex="-1" data-tab="output">输出模板</button>
+        <button id="tab-button-account" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tab-account" tabindex="-1" data-tab="account">账户登录</button>
       </nav>
 
-      <div id="loginHint" class="login-hint" hidden>
+      <div id="loginHint" class="login-hint" role="status" aria-live="polite" hidden>
         <span>当前未登录 Gaijin，行情监控与交易功能不可用。</span>
         <button class="button small primary" type="button" data-go-tab="account">前往账户登录</button>
       </div>
 
-      <div id="toast" class="toast" hidden></div>
+      <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 
       <div id="modalBackdrop" class="modal-backdrop" hidden>
-        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMessage">
           <h3 id="modalTitle">确认操作</h3>
           <pre id="modalMessage" class="modal-message"></pre>
           <label id="modalInputWrap" class="modal-input" hidden>
@@ -49,7 +49,7 @@
         </section>
       </div>
 
-      <section id="tab-monitor" class="tab-panel">
+      <section id="tab-monitor" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-monitor" tabindex="0">
         <section class="metrics">
           <article class="card metric"><span>订阅组</span><strong id="monitorGroupCount">--</strong></article>
           <article class="card metric"><span>订阅物品</span><strong id="monitorItemCount">--</strong></article>
@@ -92,7 +92,7 @@
         </section>
       </section>
 
-      <section id="tab-trade" class="tab-panel" hidden>
+      <section id="tab-trade" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-trade" tabindex="0" hidden>
         <section class="metrics">
           <article class="card metric"><span>交易总开关</span><strong id="masterState">--</strong></article>
           <article class="card metric"><span>当前投入</span><strong id="exposure">-- GJN</strong></article>
@@ -149,7 +149,7 @@
         </section>
       </section>
 
-      <section id="tab-account" class="tab-panel" hidden>
+      <section id="tab-account" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-account" tabindex="0" hidden>
         <section class="grid two-column">
           <article class="card">
             <div class="section-heading">
@@ -176,12 +176,12 @@
               <label class="span-2"><span>两步验证码</span><input id="loginCode" type="text" inputmode="numeric" autocomplete="one-time-code" /></label>
               <button id="loginCodeBtn" type="button" class="button primary">提交验证码</button>
             </div>
-            <div id="accountMessage" class="inline-message" hidden></div>
+            <div id="accountMessage" class="inline-message" role="status" aria-live="polite" aria-atomic="true" hidden></div>
           </article>
         </section>
       </section>
 
-      <section id="tab-output" class="tab-panel" hidden>
+      <section id="tab-output" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-output" tabindex="0" hidden>
         <section class="output-layout">
           <article class="card output-editor-card">
             <div class="section-heading">

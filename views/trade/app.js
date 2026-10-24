@@ -7,10 +7,47 @@ let lastAccount = null;
 let activeTab = "monitor";
 let toastTimer = null;
 let modalResolver = null;
+let modalReturnFocus = null;
 let outputDirty = false;
 let accountDirty = false;
 let tradeLogCursor = 0;
 const tradeLogIds = new Set();
+
+async function runWithBusy(button, label, task) {
+  if (!button || button.dataset.busy === "1") return undefined;
+  const hadFocus = document.activeElement === button;
+  const returnSelector = focusSelector(button);
+  const original = {
+    text: button.textContent,
+    disabled: button.disabled,
+    ariaLabel: button.getAttribute("aria-label"),
+  };
+  button.dataset.busy = "1";
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.setAttribute("aria-label", label);
+  button.textContent = label;
+  try {
+    return await task();
+  } finally {
+    button.dataset.busy = "";
+    button.disabled = original.disabled;
+    button.removeAttribute("aria-busy");
+    if (original.ariaLabel === null) button.removeAttribute("aria-label");
+    else button.setAttribute("aria-label", original.ariaLabel);
+    button.textContent = original.text;
+    if (hadFocus) {
+      setTimeout(() => {
+        const target = returnSelector ? document.querySelector(returnSelector) : button;
+        if (target instanceof HTMLElement && !target.disabled) target.focus();
+      }, 0);
+    }
+  }
+}
+
+function formSubmitter(event) {
+  return event.submitter || event.currentTarget.querySelector('button[type="submit"]');
+}
 
 const phaseLabels = {
   waiting_buy: "等待买点",
@@ -25,10 +62,39 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
+function cssEscape(value) {
+  const text = String(value ?? "");
+  return window.CSS?.escape ? CSS.escape(text) : text.replace(/["\\]/g, "\\$&");
+}
+
+function focusSelector(element) {
+  if (!(element instanceof Element) || element === document.body) return "";
+  if (element.id) return `#${cssEscape(element.id)}`;
+  const { action, rule, subAction, market, goTab } = element.dataset;
+  if (action && rule) {
+    return `button[data-action="${cssEscape(action)}"][data-rule="${cssEscape(rule)}"]`;
+  }
+  if (subAction && market) {
+    return `button[data-sub-action="${cssEscape(subAction)}"][data-market="${cssEscape(market)}"]`;
+  }
+  if (subAction) return `button[data-sub-action="${cssEscape(subAction)}"]`;
+  if (goTab) return `button[data-go-tab="${cssEscape(goTab)}"]`;
+  return "";
+}
+
+function focusSelectorTarget(selector) {
+  if (!selector) return null;
+  const target = document.querySelector(selector);
+  return target instanceof HTMLElement && !target.disabled ? target : null;
+}
+
 function showToast(message, kind = "") {
   const el = $("toast");
   el.textContent = message;
   el.className = `toast ${kind}`.trim();
+  el.setAttribute("role", kind === "error" ? "alert" : "status");
+  el.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
+  el.setAttribute("aria-atomic", "true");
   el.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, 4800);
@@ -36,6 +102,7 @@ function showToast(message, kind = "") {
 
 function openModal({ title, message, requireText = false, placeholder = "", confirmText = "确认" }) {
   if (modalResolver) modalResolver(null);
+  modalReturnFocus = document.activeElement;
   $("modalTitle").textContent = title;
   $("modalMessage").textContent = message;
   $("modalInputWrap").hidden = !requireText;
@@ -54,6 +121,9 @@ function closeModal(value) {
   const resolve = modalResolver;
   modalResolver = null;
   if (resolve) resolve(value);
+  const returnFocus = modalReturnFocus;
+  modalReturnFocus = null;
+  if (returnFocus?.isConnected) setTimeout(() => returnFocus.focus(), 0);
 }
 
 function apiError(error) {
@@ -93,10 +163,14 @@ function showInlineMessage(elementId, message, kind = "") {
   el.hidden = !message;
 }
 
-function activateTab(name) {
+function activateTab(name, { focus = false } = {}) {
   activeTab = name;
   document.querySelectorAll(".tab").forEach((button) => {
-    button.classList.toggle("active", button.dataset.tab === name);
+    const selected = button.dataset.tab === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", selected ? "true" : "false");
+    button.tabIndex = selected ? 0 : -1;
+    if (selected && focus) button.focus();
   });
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.hidden = panel.id !== `tab-${name}`;
@@ -107,8 +181,20 @@ function activateTab(name) {
   if (name === "trade") void refreshTrade({ resetLogs: true });
 }
 
-document.querySelectorAll(".tab").forEach((button) => {
+const tabButtons = [...document.querySelectorAll(".tab")];
+tabButtons.forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.tab));
+  button.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const current = tabButtons.indexOf(button);
+    let next = current;
+    if (event.key === "ArrowLeft") next = (current - 1 + tabButtons.length) % tabButtons.length;
+    if (event.key === "ArrowRight") next = (current + 1) % tabButtons.length;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = tabButtons.length - 1;
+    activateTab(tabButtons[next].dataset.tab, { focus: true });
+  });
 });
 document.querySelectorAll("[data-go-tab]").forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.goTab));
@@ -154,8 +240,10 @@ function renderAccount(data) {
 async function loadAccount() {
   try {
     renderAccount(await apiGet("account/overview"));
+    return true;
   } catch (error) {
     showToast(apiError(error), "error");
+    return false;
   }
 }
 
@@ -215,13 +303,22 @@ async function submitLoginCode() {
 $("accountForm").addEventListener("input", () => { accountDirty = true; });
 $("accountForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  await saveAccount();
+  await runWithBusy(formSubmitter(event), "保存中…", () => saveAccount());
 });
-$("loginStartBtn").addEventListener("click", startLogin);
-$("loginCodeBtn").addEventListener("click", submitLoginCode);
-$("accountRefreshBtn").addEventListener("click", () => { accountDirty = false; void loadAccount(); });
+$("loginStartBtn").addEventListener("click", () => {
+  void runWithBusy($("loginStartBtn"), "登录中…", startLogin);
+});
+$("loginCodeBtn").addEventListener("click", () => {
+  void runWithBusy($("loginCodeBtn"), "提交中…", submitLoginCode);
+});
+$("accountRefreshBtn").addEventListener("click", () => {
+  void runWithBusy($("accountRefreshBtn"), "刷新中…", async () => {
+    accountDirty = false;
+    if (await loadAccount()) showToast("登录状态已刷新", "success");
+  });
+});
 $("loginCode").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") submitLoginCode();
+  if (event.key === "Enter") $("loginCodeBtn").click();
 });
 
 // ---------------------------------------------------------------- 行情订阅
@@ -333,51 +430,60 @@ function subscriptionPayloadFromForm() {
   };
 }
 
-async function saveSubscription(payload) {
-  try {
-    const data = await apiPost("monitor/subscriptions/save", payload);
-    renderMonitor(data);
-    showToast(data.message || "订阅已保存", "success");
-    return true;
-  } catch (error) {
-    showToast(apiError(error), "error");
-    return false;
-  }
+async function saveSubscription(payload, button = null) {
+  const persist = async () => {
+    try {
+      const data = await apiPost("monitor/subscriptions/save", payload);
+      renderMonitor(data);
+      showToast(data.message || "订阅已保存", "success");
+      return true;
+    } catch (error) {
+      showToast(apiError(error), "error");
+      return false;
+    }
+  };
+  return button ? runWithBusy(button, "保存中…", persist) : persist();
 }
 
-async function deleteSubscription(uid, target, market = "") {
+async function deleteSubscription(uid, target, market = "", button = null) {
   const confirmed = await openModal({
     title: market ? "删除订阅物品" : "删除订阅组",
     message: market ? `确认删除物品 ${market}？` : `确认删除 ${uid} 在 ${target} 的整组订阅？`,
   });
   if (confirmed === null) return;
-  try {
-    const data = await apiPost("monitor/subscriptions/delete", { uid, target_umo: target, market_name: market });
-    renderMonitor(data);
-    showToast(data.message || "订阅已删除", "success");
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+  const remove = async () => {
+    try {
+      const data = await apiPost("monitor/subscriptions/delete", { uid, target_umo: target, market_name: market });
+      renderMonitor(data);
+      showToast(data.message || "订阅已删除", "success");
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "删除中…", remove) : remove());
 }
 
-async function toggleSubscriptionGroup(uid, target) {
+async function toggleSubscriptionGroup(uid, target, button = null) {
   const group = (lastMonitor?.groups || []).find((item) => item.uid === uid && item.target_umo === target);
   if (!group) return;
-  await saveSubscription({
-    original_uid: group.uid,
-    original_target: group.target_umo,
-    uid: group.uid,
-    target_umo: group.target_umo,
-    enabled: !group.enabled,
-    interval: group.interval,
-    mode: group.mode,
-    items: (group.items || []).map((item) => ({ url: item.url, display_name: item.display_name })),
-  });
+  await saveSubscription(
+    {
+      original_uid: group.uid,
+      original_target: group.target_umo,
+      uid: group.uid,
+      target_umo: group.target_umo,
+      enabled: !group.enabled,
+      interval: group.interval,
+      mode: group.mode,
+      items: (group.items || []).map((item) => ({ url: item.url, display_name: item.display_name })),
+    },
+    button,
+  );
 }
 
 $("subscriptionForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const ok = await saveSubscription(subscriptionPayloadFromForm());
+  const ok = await saveSubscription(subscriptionPayloadFromForm(), formSubmitter(event));
   if (ok) resetSubForm();
 });
 $("resetSubBtn").addEventListener("click", resetSubForm);
@@ -396,9 +502,9 @@ $("subscriptionList").addEventListener("click", (event) => {
   const target = card?.dataset.groupTarget || "";
   const action = button.dataset.subAction;
   if (action === "edit") editSubscriptionGroup(uid, target);
-  if (action === "toggle") toggleSubscriptionGroup(uid, target);
-  if (action === "delete-group") deleteSubscription(uid, target);
-  if (action === "delete-item") deleteSubscription(uid, target, button.dataset.market || "");
+  if (action === "toggle") void toggleSubscriptionGroup(uid, target, button);
+  if (action === "delete-group") void deleteSubscription(uid, target, "", button);
+  if (action === "delete-item") void deleteSubscription(uid, target, button.dataset.market || "", button);
 });
 
 // ---------------------------------------------------------------- 输出模板
@@ -408,7 +514,7 @@ function renderFieldPalette(elementId, groups, targetId, prefix = "") {
     <div class="field-group">
       <strong>${escapeHtml(groupName)}</strong>
       <div class="field-chips">
-        ${Object.keys(fields).map((field) => `<button class="field-chip" type="button" data-field="${escapeHtml(prefix + field)}" data-target="${escapeHtml(targetId)}">$${escapeHtml(prefix + field)}</button>`).join("")}
+        ${Object.keys(fields).map((field) => `<button class="field-chip" type="button" data-field="$${escapeHtml(prefix + field)}" data-target="${escapeHtml(targetId)}">$${escapeHtml(prefix + field)}</button>`).join("")}
       </div>
     </div>`).join("");
 }
@@ -439,35 +545,41 @@ async function loadOutput() {
   }
 }
 
-async function previewTemplate(kind) {
+async function previewTemplate(kind, button = null) {
   const target = kind === "trade" ? $("tradePayload") : $("quotePayload");
   const preview = kind === "trade" ? $("tradePreview") : $("quotePreview");
-  try {
-    const result = await apiPost("output/preview", { kind, template: target.value });
-    const notes = [];
-    if (result.error) notes.push(result.error);
-    if (result.unknown_fields?.length) notes.push(`未知字段：${result.unknown_fields.join("、")}`);
-    if (result.note) notes.push(result.note);
-    preview.textContent = [notes.join("\n"), result.text || (result.images?.length ? `[图片] ${result.images.length} 张` : "")].filter(Boolean).join("\n\n") || "无可见内容";
-    preview.classList.toggle("error", Boolean(result.error));
-  } catch (error) {
-    preview.textContent = apiError(error);
-    preview.classList.add("error");
-  }
+  const run = async () => {
+    try {
+      const result = await apiPost("output/preview", { kind, template: target.value });
+      const notes = [];
+      if (result.error) notes.push(result.error);
+      if (result.unknown_fields?.length) notes.push(`未知字段：${result.unknown_fields.join("、")}`);
+      if (result.note) notes.push(result.note);
+      preview.textContent = [notes.join("\n"), result.text || (result.images?.length ? `[图片] ${result.images.length} 张` : "")].filter(Boolean).join("\n\n") || "无可见内容";
+      preview.classList.toggle("error", Boolean(result.error));
+    } catch (error) {
+      preview.textContent = apiError(error);
+      preview.classList.add("error");
+    }
+  };
+  await (button ? runWithBusy(button, "校验中…", run) : run());
 }
 
-async function saveOutput() {
-  try {
-    const data = await apiPost("output/save", {
-      quote_payload: $("quotePayload").value,
-      trade_payload: $("tradePayload").value,
-    });
-    outputDirty = false;
-    renderOutput(data);
-    showToast(data.message || "输出模板已保存", "success");
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+async function saveOutput(button = null) {
+  const run = async () => {
+    try {
+      const data = await apiPost("output/save", {
+        quote_payload: $("quotePayload").value,
+        trade_payload: $("tradePayload").value,
+      });
+      outputDirty = false;
+      renderOutput(data);
+      showToast(data.message || "输出模板已保存", "success");
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "保存中…", run) : run());
 }
 
 document.addEventListener("click", (event) => {
@@ -478,9 +590,9 @@ document.addEventListener("click", (event) => {
 });
 $("quotePayload").addEventListener("input", () => { outputDirty = true; });
 $("tradePayload").addEventListener("input", () => { outputDirty = true; });
-$("previewQuoteBtn").addEventListener("click", () => previewTemplate("quote"));
-$("previewTradeBtn").addEventListener("click", () => previewTemplate("trade"));
-$("saveOutputBtn").addEventListener("click", saveOutput);
+$("previewQuoteBtn").addEventListener("click", () => previewTemplate("quote", $("previewQuoteBtn")));
+$("previewTradeBtn").addEventListener("click", () => previewTemplate("trade", $("previewTradeBtn")));
+$("saveOutputBtn").addEventListener("click", () => saveOutput($("saveOutputBtn")));
 $("resetQuoteBtn").addEventListener("click", () => {
   $("quotePayload").value = lastOutput?.defaults?.quote_payload || "";
   outputDirty = true;
@@ -509,8 +621,13 @@ function actionButton(label, action, ruleId, kind = "", extra = "") {
 
 function renderRules(rules) {
   const container = $("rulesList");
+  const focusReturn = focusSelector(document.activeElement?.closest("#rulesList button[data-action]"));
   if (!rules.length) {
     container.innerHTML = '<p class="muted empty">暂无规则</p>';
+    if (focusReturn) {
+      container.tabIndex = -1;
+      container.focus();
+    }
     return;
   }
   container.innerHTML = rules.map((rule) => {
@@ -549,6 +666,14 @@ function renderRules(rules) {
         ${runtime.last_error ? `<div class="error-text">${escapeHtml(runtime.last_error)}</div>` : ""}
       </article>`;
   }).join("");
+  if (focusReturn) {
+    const target = focusSelectorTarget(focusReturn);
+    if (target) target.focus();
+    else {
+      container.tabIndex = -1;
+      container.focus();
+    }
+  }
 }
 
 function renderOrders(orders) {
@@ -643,49 +768,55 @@ function editRule(ruleId) {
   $("ruleForm").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-async function armRule(ruleId) {
-  try {
-    const prepared = await apiPost("trade/rules/action", { rule_id: ruleId, action: "prepare_arm" });
-    const typed = await openModal({
-      title: "切换实盘",
-      message: prepared.message,
-      requireText: true,
-      placeholder: ruleId,
-      confirmText: "确认切换实盘",
-    });
-    if (typed === null) return;
-    await apiPost("trade/rules/action", { rule_id: ruleId, action: "arm", confirmation_id: typed });
-    showToast("规则已切换实盘", "success");
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+async function armRule(ruleId, button = null) {
+  const run = async () => {
+    try {
+      const prepared = await apiPost("trade/rules/action", { rule_id: ruleId, action: "prepare_arm" });
+      const typed = await openModal({
+        title: "切换实盘",
+        message: prepared.message,
+        requireText: true,
+        placeholder: ruleId,
+        confirmText: "确认切换实盘",
+      });
+      if (typed === null) return;
+      await apiPost("trade/rules/action", { rule_id: ruleId, action: "arm", confirmation_id: typed });
+      showToast("规则已切换实盘", "success");
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "处理中…", run) : run());
 }
 
-async function drillRule(ruleId) {
-  try {
-    const result = await apiPost("trade/rules/drill", { rule_id: ruleId });
-    const lines = [
-      `演练编号：${result.drill_id}`,
-      `规则：${result.rule_title}（${result.rule_id}）`,
-      ...(result.steps || []).map((step) => `${step.title}：${step.detail}`),
-      `模拟盈亏：${result.summary?.profit || "0.00"} GJN`,
-    ];
-    await openModal({
-      title: "完整模拟演练结果",
-      message: lines.join("\n"),
-      confirmText: "关闭",
-    });
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+async function drillRule(ruleId, button = null) {
+  const run = async () => {
+    try {
+      const result = await apiPost("trade/rules/drill", { rule_id: ruleId });
+      const lines = [
+        `演练编号：${result.drill_id}`,
+        `规则：${result.rule_title}（${result.rule_id}）`,
+        ...(result.steps || []).map((step) => `${step.title}：${step.detail}`),
+        `模拟盈亏：${result.summary?.profit || "0.00"} GJN`,
+      ];
+      await openModal({
+        title: "完整模拟演练结果",
+        message: lines.join("\n"),
+        confirmText: "关闭",
+      });
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "演练中…", run) : run());
 }
 
-async function runRuleAction(action, ruleId) {
+async function runRuleAction(action, ruleId, button = null) {
   if (action === "edit") return editRule(ruleId);
-  if (action === "arm") return armRule(ruleId);
-  if (action === "drill") return drillRule(ruleId);
+  if (action === "arm") return armRule(ruleId, button);
+  if (action === "drill") return drillRule(ruleId, button);
   if (action === "disarm") {
     const confirmed = await openModal({
       title: "切换到模拟盘",
@@ -701,38 +832,43 @@ async function runRuleAction(action, ruleId) {
     const confirmed = await openModal({ title: "撤销自动订单", message: `确认撤销 ${ruleId} 的全部自动订单并暂停规则？` });
     if (confirmed === null) return;
   }
-  try {
-    await apiPost("trade/rules/action", { rule_id: ruleId, action });
-    showToast("操作完成", "success");
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+  const run = async () => {
+    try {
+      await apiPost("trade/rules/action", { rule_id: ruleId, action });
+      showToast("操作完成", "success");
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "处理中…", run) : run());
 }
 
 $("rulesList").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
-  runRuleAction(button.dataset.action, button.dataset.rule);
+  void runRuleAction(button.dataset.action, button.dataset.rule, button);
 });
 
 $("settingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  try {
-    await apiPost("trade/settings", {
-      enabled: $("settingEnabled").checked,
-      total_budget: $("settingTotal").value,
-      daily_limit: $("settingDaily").value,
-      max_order: $("settingMaxOrder").value,
-      max_quantity: Number($("settingMaxQty").value || 0),
-      poll_interval: Number($("settingInterval").value || 5),
-      private_mode: $("settingPrivate").checked,
-    });
-    showToast("设置已保存", "success");
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+  await runWithBusy(formSubmitter(event), "保存中…", async () => {
+    try {
+      await apiPost("trade/settings", {
+        enabled: $("settingEnabled").checked,
+        total_budget: $("settingTotal").value,
+        daily_limit: $("settingDaily").value,
+        max_order: $("settingMaxOrder").value,
+        max_quantity: Number($("settingMaxQty").value || 0),
+        poll_interval: Number($("settingInterval").value || 5),
+        private_mode: $("settingPrivate").checked,
+      });
+      showToast("设置已保存", "success");
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  });
 });
 
 $("ruleForm").addEventListener("submit", async (event) => {
@@ -747,15 +883,17 @@ $("ruleForm").addEventListener("submit", async (event) => {
   };
   const editId = $("editRuleId").value;
   if (editId) payload.rule_id = editId;
-  try {
-    await apiPost("trade/rules/save", payload);
-    showToast(editId ? "规则已更新" : "规则已创建", "success");
-    $("ruleUrl").disabled = false;
-    resetRuleForm();
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+  await runWithBusy(formSubmitter(event), "保存中…", async () => {
+    try {
+      await apiPost("trade/rules/save", payload);
+      showToast(editId ? "规则已更新" : "规则已创建", "success");
+      $("ruleUrl").disabled = false;
+      resetRuleForm();
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  });
 });
 
 $("resetRuleBtn").addEventListener("click", () => {
@@ -772,20 +910,24 @@ $("stopAllBtn").addEventListener("click", async () => {
     confirmText: "执行急停",
   });
   if (confirmation === null) return;
-  try {
-    await apiPost("trade/stop-all", { confirmation });
-    showToast("自动交易已急停", "success");
-    await refreshTrade();
-  } catch (error) {
-    showToast(apiError(error), "error");
-  }
+  await runWithBusy($("stopAllBtn"), "急停中…", async () => {
+    try {
+      await apiPost("trade/stop-all", { confirmation });
+      showToast("自动交易已急停", "success");
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  });
 });
 
 $("refreshBtn").addEventListener("click", async () => {
-  await loadAccount();
-  if (activeTab === "trade") await refreshTrade({ resetLogs: true });
-  if (activeTab === "monitor") await loadMonitor();
-  if (activeTab === "output") await loadOutput();
+  await runWithBusy($("refreshBtn"), "刷新中…", async () => {
+    await loadAccount();
+    if (activeTab === "trade") await refreshTrade({ resetLogs: true });
+    if (activeTab === "monitor") await loadMonitor();
+    if (activeTab === "output") await loadOutput();
+  });
 });
 
 $("modalCancel").addEventListener("click", () => closeModal(null));
@@ -795,6 +937,21 @@ $("modalInput").addEventListener("keydown", (event) => {
 });
 $("modalBackdrop").addEventListener("click", (event) => {
   if (event.target === $("modalBackdrop")) closeModal(null);
+});
+$("modalBackdrop").addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const focusables = [...$("modalBackdrop").querySelectorAll("button:not(:disabled), input:not(:disabled)")]
+    .filter((element) => element.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("modalBackdrop").hidden) closeModal(null);
