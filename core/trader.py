@@ -39,6 +39,7 @@ from .trade_models import (
     TradeSettings,
     fmt_gjn,
     parse_gjn_raw,
+    raw_to_decimal,
     seller_receives_raw,
 )
 from .trade_store import TradeStorageError, TradeStore
@@ -54,10 +55,11 @@ class TradeError(RuntimeError):
 
 
 class AutoTrader:
-    def __init__(self, *, client, auth, storage, config, notifier, logger, on_watch_change=None) -> None:
+    def __init__(self, *, client, auth, storage, config, accounts=None, notifier, logger, on_watch_change=None) -> None:
         self.client = client
         self.auth = auth
         self.config = config
+        self.accounts = accounts or config
         self.notifier = notifier
         self.logger = logger
         self.store = TradeStore(storage, logger)
@@ -306,7 +308,7 @@ class AutoTrader:
         self._changed()
         await self._record_system(
             "settings",
-            "【GJM 自动交易】安全设置已更新\n"
+            "安全设置已更新\n"
             f"总开关：{'开' if settings.enabled else '关'}\n"
             f"总投入预算：{fmt_gjn(settings.total_budget_raw)} GJN\n"
             f"每日限额：{fmt_gjn(settings.daily_limit_raw)} GJN\n"
@@ -330,8 +332,8 @@ class AutoTrader:
             raise TradeError("请先设置总预算、每日限额和单笔上限，且均需大于 0")
         if settings.max_quantity <= 0:
             raise TradeError("请先设置最大交易数量")
-        if not self.config.owner_uids:
-            raise TradeError("必须配置 owner_uids，交易不会回退到 AstrBot 管理员判定")
+        if not self.accounts.owner_uids:
+            raise TradeError("必须配置拥有者 UID，交易不会回退到 AstrBot 管理员判定")
         cost = rule.buy_price_raw * rule.quantity
         if cost > settings.max_order_raw:
             raise TradeError(f"规则最大买入额 {fmt_gjn(cost)} 超过单笔上限 {fmt_gjn(settings.max_order_raw)}")
@@ -449,7 +451,7 @@ class AutoTrader:
         self.store.save_rules()
         self.store.save_runtime()
         self._changed()
-        text = "【GJM 自动交易急停】\n所有规则已暂停。"
+        text = "自动交易急停：\n所有规则已暂停。"
         if cancelled:
             text += f"\n已撤销订单：{', '.join(cancelled)}"
         if errors:
@@ -505,6 +507,12 @@ class AutoTrader:
             rule,
             "paper_buy",
             f"[模拟] {rule.title} 买入 {fill}/{rule.quantity} 个，成本 {fmt_gjn(cost)} GJN",
+            details={
+                "trade_side": "BUY",
+                "trade_price": fmt_gjn(runtime.last_buy_price_raw),
+                "trade_quantity": fill,
+                "trade_amount": fmt_gjn(cost),
+            },
         )
         await self._paper_sell(rule, quote)
 
@@ -534,12 +542,26 @@ class AutoTrader:
                 rule,
                 "paper_sell",
                 f"[模拟] {rule.title} 立即卖出 {sold} 个（求购覆盖 {immediate}），税后 {fmt_gjn(proceeds)} GJN",
+                details={
+                    "trade_side": "SELL",
+                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_quantity": sold,
+                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
+                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                },
             )
         if runtime.held_quantity > 0:
             await self._record(
                 rule,
                 "paper_listing",
                 f"[模拟] 剩余 {runtime.held_quantity} 个按 {fmt_gjn(rule.sell_gross_price_raw)} GJN 挂单",
+                details={
+                    "trade_side": "SELL",
+                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_quantity": runtime.held_quantity,
+                    "trade_amount": fmt_gjn(runtime.held_quantity * rule.sell_gross_price_raw),
+                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                },
             )
         else:
             await self._complete_cycle(rule)
@@ -562,6 +584,13 @@ class AutoTrader:
             rule,
             "paper_listing_fill",
             f"[模拟] {rule.title} 挂单成交 {sold} 个，税后 {fmt_gjn(proceeds)} GJN",
+            details={
+                "trade_side": "SELL",
+                "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                "trade_quantity": sold,
+                "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
+                "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+            },
         )
         if runtime.held_quantity <= 0:
             await self._complete_cycle(rule)
@@ -632,6 +661,12 @@ class AutoTrader:
             rule,
             "buy",
             f"{rule.title} 实际买入 {acquired}/{fill} 个，限价 {fmt_gjn(rule.buy_price_raw)} GJN{partial}",
+            details={
+                "trade_side": "BUY",
+                "trade_price": fmt_gjn(rule.buy_price_raw),
+                "trade_quantity": acquired,
+                "trade_amount": fmt_gjn(acquired * rule.buy_price_raw),
+            },
         )
         await self._live_sell(rule, quote)
 
@@ -717,12 +752,26 @@ class AutoTrader:
                 rule,
                 "sell",
                 f"{rule.title} 卖出 {sold} 个，预计税后 {fmt_gjn(sold * rule.sell_net_price_raw)} GJN",
+                details={
+                    "trade_side": "SELL",
+                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_quantity": sold,
+                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
+                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                },
             )
         if listed > 0:
             await self._record(
                 rule,
                 "listing",
                 f"{rule.title} 剩余 {listed} 个已挂单，目标税后 {fmt_gjn(rule.sell_net_price_raw)} GJN",
+                details={
+                    "trade_side": "SELL",
+                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_quantity": listed,
+                    "trade_amount": fmt_gjn(listed * rule.sell_gross_price_raw),
+                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                },
             )
         if request_failed:
             raise TradeError(runtime.last_error)
@@ -783,6 +832,13 @@ class AutoTrader:
                 rule,
                 "listing_fill",
                 f"{rule.title} 挂单成交 {sold} 个，预计税后 {fmt_gjn(sold * rule.sell_net_price_raw)} GJN",
+                details={
+                    "trade_side": "SELL",
+                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
+                    "trade_quantity": sold,
+                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
+                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
+                },
             )
         if runtime.held_quantity <= 0:
             await self._complete_cycle(rule)
@@ -1103,6 +1159,92 @@ class AutoTrader:
             return 0
         return parse_gjn_raw(value)
 
+    _KIND_LABELS = {
+        "created": "规则创建",
+        "updated": "规则更新",
+        "settings": "安全设置",
+        "armed": "切换实盘",
+        "disarmed": "退出实盘",
+        "paused": "规则暂停",
+        "resumed": "规则恢复",
+        "deleted": "规则删除",
+        "orders_cancelled": "撤销挂单",
+        "buy": "买入成交",
+        "paper_buy": "模拟买入",
+        "sell": "卖出成交",
+        "paper_sell": "模拟卖出",
+        "listing": "挂卖出单",
+        "paper_listing": "模拟挂单",
+        "listing_fill": "挂单成交",
+        "paper_listing_fill": "模拟挂单成交",
+        "stop_all": "急停",
+        "partial_bought": "部分买入",
+        "sold": "卖出成交",
+        "partial_sold": "部分卖出",
+        "listed": "挂出卖单",
+        "listing_returned": "卖单退回",
+        "cycle_complete": "周期完成",
+        "error": "交易异常",
+        "reconciled": "订单对账",
+    }
+
+    def _event_context(
+        self,
+        rule: TradeRule | None,
+        runtime: TradeRuntime | None,
+        kind: str,
+        message: str,
+        level: str,
+        extra: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        context: dict[str, Any] = {
+            "trade_kind": str(kind),
+            "trade_kind_text": AutoTrader._KIND_LABELS.get(str(kind), str(kind)),
+            "trade_level": str(level),
+            "trade_message": str(message),
+            "trade_datetime": time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(now)),
+            "trade_datetime_plain": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "trade_timestamp": int(now),
+            "trade_fee": "15%",
+        }
+        if rule is not None:
+            context.update(
+                {
+                    "trade_rule_id": rule.rule_id,
+                    "trade_name": rule.title,
+                    "trade_market_name": rule.market_name,
+                    "trade_url": f"https://trade.gaijin.net/market/{self.config.appid}/{rule.market_name}",
+                    "trade_item_type": rule.item_type,
+                    "trade_mode": rule.mode,
+                    "trade_live": "是" if rule.live else "否",
+                    "trade_enabled": "是" if rule.enabled else "否",
+                    "trade_buy_price": fmt_gjn(rule.buy_price_raw),
+                    "trade_sell_net_price": fmt_gjn(rule.sell_net_price_raw),
+                    "trade_sell_gross_price": fmt_gjn(rule.sell_gross_price_raw),
+                }
+            )
+        if runtime is not None:
+            context.update(
+                {
+                    "trade_phase": runtime.phase,
+                    "trade_last_error": runtime.last_error,
+                    "trade_held_qty": int(runtime.held_quantity),
+                    "trade_listed_qty": int(runtime.listed_quantity),
+                    "trade_available_qty": int(runtime.available_quantity),
+                    "trade_cost_basis": fmt_gjn(runtime.cost_basis_raw),
+                    "trade_proceeds": fmt_gjn(runtime.proceeds_raw),
+                    "trade_cycle_count": int(runtime.cycle_count),
+                    "trade_last_buy_price": fmt_gjn(runtime.last_buy_price_raw),
+                    "trade_last_sell_price": fmt_gjn(runtime.last_sell_price_raw),
+                }
+            )
+            profit_raw = runtime.proceeds_raw - runtime.cost_basis_raw
+            context["trade_profit"] = f"{raw_to_decimal(profit_raw):+.2f}"
+        if extra:
+            context.update({str(key): value for key, value in extra.items() if value is not None})
+        return context
+
     async def _record(
         self,
         rule: TradeRule,
@@ -1112,30 +1254,35 @@ class AutoTrader:
         level: str = "info",
         details: dict[str, Any] | None = None,
     ) -> None:
+        runtime = self.store.get_runtime(rule.rule_id)
+        context = self._event_context(rule, runtime, kind, message, level, details)
         event = TradeEvent(
             timestamp=time.time(),
             rule_id=rule.rule_id,
             kind=kind,
             message=message,
             level=level,
-            details=details or {},
+            details=context,
         )
         self.store.append_event(event)
-        await self._notify(f"【GJM 自动交易】{message}")
+        await self._notify_event(event)
 
-    async def _record_system(self, kind: str, message: str) -> None:
-        self.store.append_event(TradeEvent(timestamp=time.time(), rule_id="", kind=kind, message=message))
-        await self._notify(message)
+    async def _record_system(self, kind: str, message: str, details: dict[str, Any] | None = None) -> None:
+        context = self._event_context(None, None, kind, message, "info", details)
+        event = TradeEvent(timestamp=time.time(), rule_id="", kind=kind, message=message, details=context)
+        self.store.append_event(event)
+        await self._notify_event(event)
 
-    async def _notify(self, text: str) -> None:
+    async def _notify_event(self, event: TradeEvent) -> None:
         umos = []
         for umo in self.notifier.owner_sessions():
             if platforms.session_type_of(umo) == platforms.SESSION_TYPE_FRIEND and umo not in umos:
                 umos.append(umo)
         if not umos:
-            self.logger.info(f"[GJM Trade] 没有拥有者私聊会话：{text}")
+            self.logger.info(f"[GJM Trade] 没有拥有者私聊会话：{event.message}")
             return
         try:
+            text = self.notifier.render_trade_event(event)
             await self.notifier.push(text, umos)
         except Exception as exc:
             self.logger.warning(f"[GJM Trade] 私聊通知发送失败: {exc}")

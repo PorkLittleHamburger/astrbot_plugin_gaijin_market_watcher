@@ -1,24 +1,4 @@
 {
-  "account_email": {
-    "description": "账号邮箱",
-    "type": "string",
-    "default": "",
-    "hint": "登录用。"
-  },
-  "account_password": {
-    "description": "账号密码",
-    "type": "string",
-    "default": "",
-    "secret": true,
-    "hint": "登录用；已有登录态时可留空。"
-  },
-  "twofa_code": {
-    "description": "两步验证码（备用）",
-    "type": "string",
-    "default": "",
-    "secret": true,
-    "hint": "平时用 /gjma login <验证码> 提交；填这里保存也会自动提交并清空。"
-  },
   "appid": {
     "description": "游戏 appid",
     "type": "string",
@@ -50,12 +30,6 @@
     "description": "推送时 @ 订阅者",
     "type": "bool",
     "default": true
-  },
-  "payload": {
-    "description": "输出模板（payload）",
-    "type": "text",
-    "default": "{\n    \"title\":\"$item_name行情报告\",\n    \"datetime\":\"时间：$datetime\",\n    \"content\":[\"卖单最低$sell_lowest_price，较上次变化$sell_change_amount($sell_change_rate)\",\n                \"买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)\",\n                \"卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)\",\n                \"买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)\"]\n}",
-    "hint": "JSON 骨架：键名不出现，按书写顺序逐行输出值；数组值一行一项。留空=可读文本；字段见 docs/PAYLOAD_FIELDS.md。"
   },
   "push_batch_seconds": {
     "description": "私聊推送合并窗口（秒）",
@@ -121,63 +95,70 @@
     },
     "hint": "同一轮内多个物品之间的请求间隔。"
   },
+  "account_email": {
+    "description": "账号邮箱（已迁移到插件控制台）",
+    "type": "string",
+    "default": "",
+    "invisible": true,
+    "hint": "兼容字段：请使用插件控制台的账户登录页。"
+  },
+  "account_password": {
+    "description": "账号密码（已迁移到插件控制台）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "invisible": true,
+    "hint": "兼容字段：请使用插件控制台的账户登录页。"
+  },
+  "twofa_code": {
+    "description": "两步验证码（已废弃）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "invisible": true,
+    "hint": "兼容字段：验证码请在插件控制台提交。"
+  },
   "owner_uids": {
-    "description": "拥有者 UID",
+    "description": "拥有者 UID（已迁移到插件控制台）",
     "type": "list",
     "default": [],
-    "hint": "/gjma login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空时登录可回退 AstrBot 管理员判定，但自动交易会直接禁用。"
+    "invisible": true,
+    "hint": "兼容字段：请使用插件控制台的账户登录页。"
   },
   "user_subscriptions": {
-    "description": "用户订阅",
+    "description": "用户订阅（已迁移到插件控制台）",
     "type": "template_list",
+    "default": [],
+    "invisible": true,
     "templates": {
       "user_entry": {
         "name": "用户订阅",
         "display_item": "uid",
         "items": {
+          "uid": {
+            "description": "订阅者 UID",
+            "type": "string",
+            "default": ""
+          },
+          "target": {
+            "description": "订阅所属会话",
+            "type": "string",
+            "default": ""
+          },
           "enabled": {
             "description": "启用",
             "type": "bool",
             "default": true
           },
-          "uid": {
-            "description": "订阅者 UID",
-            "type": "string",
-            "default": "",
-            "hint": "可发送 AstrBot 内置命令 /sid 查看。"
-          },
-          "target": {
-            "description": "订阅所属会话",
-            "type": "string",
-            "default": "",
-            "hint": "由插件在用户执行订阅命令时自动填写；旧配置留空时会根据 UID 的最近会话自动迁移。"
-          },
-          "note": {
-            "description": "备注",
-            "type": "string",
-            "default": "",
-            "hint": "仅用于你自己辨认。"
-          },
           "interval": {
             "description": "刷新间隔（秒）",
             "type": "int",
-            "default": 30,
-            "slider": {
-              "min": 1,
-              "max": 3600,
-              "step": 1
-            },
-            "hint": "always 模式使用，且仅对私聊订阅生效；群聊统一使用 group_push_interval。"
+            "default": 30
           },
           "mode": {
             "description": "刷新模式",
             "type": "string",
-            "default": "only_change",
-            "options": [
-              "always",
-              "only_change"
-            ],
-            "hint": "控制私聊推送；群聊统一周期性发送全量快照，不使用这里的模式。"
+            "default": "only_change"
           },
           "items": {
             "description": "订阅物品",
@@ -190,19 +171,12 @@
                   "url": {
                     "description": "物品页链接",
                     "type": "string",
-                    "default": "",
-                    "hint": "例如 https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
+                    "default": ""
                   },
                   "interval": {
                     "description": "单独刷新间隔（秒）",
                     "type": "int",
-                    "default": 30,
-                    "slider": {
-                      "min": 1,
-                      "max": 3600,
-                      "step": 1
-                    },
-                    "hint": "仅 always 模式使用；同一物品多人订阅时仍按最快策略抓取。"
+                    "default": 30
                   }
                 }
               }
@@ -211,5 +185,12 @@
         }
       }
     }
+  },
+  "payload": {
+    "description": "行情输出模板（已迁移到插件控制台）",
+    "type": "text",
+    "default": "{\n    \"title\":\"$item_name行情报告\",\n    \"datetime\":\"时间：$datetime\",\n    \"content\":[\"卖单最低$sell_lowest_price，较上次变化$sell_change_amount($sell_change_rate)\",\n                \"买单最高$buy_highest_price，较上次变化$buy_change_amount($buy_change_rate)\",\n                \"卖单数$sell_count,较上次变化$sell_count_change_amount($sell_count_change_rate)\",\n                \"买单数$buy_count,较上次变化$buy_count_change_amount($buy_count_change_rate)\"]\n}",
+    "invisible": true,
+    "hint": "兼容字段：请使用插件控制台输出模板页。"
   }
 }

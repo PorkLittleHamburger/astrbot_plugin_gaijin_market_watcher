@@ -1,11 +1,11 @@
 # Gaijin Market 自动交易
 
-> 版本 `2.18.0`　|　首版仅支持 `COMMODITY` 普通商品
+> 版本 `2.19.0`　|　首版仅支持 `COMMODITY` 普通商品
 
 ## 安全边界
 
-- 聊天中的交易指令只接受与 `owner_uids` 匹配的 `FriendMessage` 私聊。
-- 未配置 `owner_uids` 时自动交易直接禁用，不回退 AstrBot 管理员判定。
+- 聊天中的交易指令只接受与 插件控制台账户页配置的拥有者 UID 匹配的 `FriendMessage` 私聊。
+- 未配置拥有者 UID 时自动交易直接禁用，不回退 AstrBot 管理员判定。
 - WebUI 交易页由 AstrBot Dashboard 登录保护，所有 Dashboard 管理员均可操作。
 - 新规则默认模拟运行；切换实盘必须二次确认规则 ID。
 - 实盘要求总开关开启，且总预算、每日限额、单笔上限、最大数量均大于 0。

@@ -1,8 +1,13 @@
-# payload 输出模板 · 字段清单
+# 行情 / 交易输出模板 · 字段清单
 
-> 插件版本 `v2.17.7`
+> 插件版本 `v2.19.0`
 
-配置项 `payload` 决定一条推送**长什么样**。**出厂已预填下面的模板**；清空该项 = 回到默认可读文本。
+插件控制台的“输出模板”标签页提供两套独立模板：
+
+- **行情推送模板**：用于订阅行情推送，默认值与旧 `payload` 完全一致；清空 = 回到默认可读文本。
+- **交易事件模板**：用于规则管理、设置、买入、卖出、挂单、周期完成和异常通知。
+
+下面是行情模板的字段及拼装规则。
 
 ## 写法（JSON 骨架）
 
@@ -136,3 +141,72 @@ F-16XL（美国）行情报告
 - `$datetime` → `2026-09-24-17-40-12`（全横线，按你的示例）；
 - `$datetime_plain` → `2026-09-24 17:40:12`（常规写法）；
 - `$timestamp` → Unix 秒。
+
+
+## 六、交易事件模板字段
+
+交易模板使用独立的 `$trade_...` 字段，按事件、规则、持仓和成交四组提供。模板语法仍与行情模板相同：JSON 骨架按书写顺序逐行输出，数组每个元素一行，空值自动省略。
+
+### 事件
+
+| 字段 | 说明 |
+| --- | --- |
+| `$trade_kind` | 事件类型标识，如 `buy`、`sell`、`cycle_complete` |
+| `$trade_kind_text` | 事件中文名称 |
+| `$trade_level` | `info` / `warning` / `error` |
+| `$trade_message` | 事件正文 |
+| `$trade_datetime` | 事件时间（YYYY-MM-DD-HH-MM-SS） |
+| `$trade_datetime_plain` | 事件时间（YYYY-MM-DD HH:MM:SS） |
+| `$trade_timestamp` | 事件 Unix 秒 |
+
+### 规则
+
+| 字段 | 说明 |
+| --- | --- |
+| `$trade_rule_id` | 交易规则 ID |
+| `$trade_name` | 物品显示名称 |
+| `$trade_market_name` | 市场 slug |
+| `$trade_url` | 物品页链接 |
+| `$trade_item_type` | 物品类型（首版为 commodity） |
+| `$trade_mode` | `once` / `loop` |
+| `$trade_live` | 是否实盘（是/否） |
+| `$trade_enabled` | 是否启用 |
+| `$trade_phase` | 当前交易阶段 |
+| `$trade_last_error` | 最近错误 |
+
+### 持仓
+
+| 字段 | 说明 |
+| --- | --- |
+| `$trade_held_qty` | 当前持仓数量 |
+| `$trade_listed_qty` | 已挂售数量 |
+| `$trade_available_qty` | 可卖数量 |
+| `$trade_cost_basis` | 当前持仓成本（GJN） |
+| `$trade_proceeds` | 累计税后到账（GJN） |
+| `$trade_profit` | 当前周期模拟盈亏（GJN） |
+| `$trade_cycle_count` | 已完成周期数 |
+| `$trade_buy_price` | 买入限价（GJN） |
+| `$trade_sell_net_price` | 税后目标价（GJN） |
+| `$trade_sell_gross_price` | 税前挂单价（GJN） |
+| `$trade_last_buy_price` | 最近买入价（GJN） |
+| `$trade_last_sell_price` | 最近卖出价（GJN） |
+
+### 成交
+
+| 字段 | 说明 |
+| --- | --- |
+| `$trade_side` | `BUY` / `SELL` |
+| `$trade_price` | 成交或挂单价格（GJN） |
+| `$trade_quantity` | 成交或挂单数量 |
+| `$trade_amount` | 成交或挂单金额（GJN） |
+| `$trade_fee` | 固定手续费比例，恒为 `15%` |
+| `$trade_net_price` | 税后单价（GJN） |
+| `$trade_order_id` | 订单 ID |
+
+默认交易模板：
+
+```json
+{"text":"【GJM 自动交易】$trade_message"}
+```
+
+交易模板无法解析或渲染为空时，插件会回退到同样的可读文本，不会阻断交易状态机。

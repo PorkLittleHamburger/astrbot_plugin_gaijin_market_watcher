@@ -2,7 +2,7 @@
 
 轮询与投递是两件事，这里刻意分开处理：
 
-  轮询：`config.watched_market_names` 是「全局监控清单」与「用户订阅」的并集，
+  轮询：`SubscriptionStore.watched_market_names` 是当前启用的用户订阅清单，
         每件物品**只抓一次**，避免多人订阅同一物品时重复打接口。
 
   投递：
@@ -43,6 +43,7 @@ class MarketWatcher:
         auth,
         storage,
         config,
+        subscriptions=None,
         notifier,
         logger,
         on_auth_failure=None,
@@ -54,6 +55,7 @@ class MarketWatcher:
         self.auth = auth
         self.storage = storage
         self.config = config
+        self.subscriptions = subscriptions or config
         self.notifier = notifier
         self.logger = logger
         #: 须要用户介入时（如令牌全部失效）的回调：async def (reason: str) -> None
@@ -103,10 +105,11 @@ class MarketWatcher:
         self._running = True
         self._sync_group_schedule(time.time())
         self._task = asyncio.create_task(self._loop(), name="gaijin-market-watcher")
+        max_interval = max(list(self.subscriptions.intervals.values()) or [0])
         self.logger.info(
             f"行情监控已启动：{len(self._private_market_names())} 个物品、"
-            f"{len(self.config.enabled_subscriptions)} 条用户订阅，"
-            f"间隔 {self.config.min_interval}~{max(list(self.config.intervals.values()) or [0])} 秒（各自独立）。"
+            f"{len(self.subscriptions.enabled_subscriptions)} 条用户订阅，"
+            f"间隔 {self.subscriptions.min_interval}~{max_interval} 秒（各自独立）。"
         )
         return True
 
@@ -136,8 +139,8 @@ class MarketWatcher:
         for market_name in [name for name in self._next_due if name not in watched]:
             self._next_due.pop(market_name, None)
 
-        active = {sub.key for sub in self.config.enabled_subscriptions}
-        for sub in self.config.enabled_subscriptions:
+        active = {sub.key for sub in self.subscriptions.enabled_subscriptions}
+        for sub in self.subscriptions.enabled_subscriptions:
             key = sub.key
             if key not in self._last_pushed:
                 continue
@@ -187,7 +190,7 @@ class MarketWatcher:
 
     def _group_targets(self) -> list[str]:
         groups: list[str] = []
-        for sub in self.config.enabled_subscriptions:
+        for sub in self.subscriptions.enabled_subscriptions:
             target = self._target_of(sub)
             if target and platforms.is_group_session(platforms.session_type_of(target)) and target not in groups:
                 groups.append(target)
@@ -195,7 +198,7 @@ class MarketWatcher:
 
     def _private_market_names(self) -> list[str]:
         names: list[str] = []
-        for sub in self.config.enabled_subscriptions:
+        for sub in self.subscriptions.enabled_subscriptions:
             target = self._target_of(sub)
             if not platforms.is_group_session(platforms.session_type_of(target)) and sub.market_name not in names:
                 names.append(sub.market_name)
@@ -207,7 +210,7 @@ class MarketWatcher:
         return names
 
     def _interval_for(self, market_name: str) -> int:
-        base = int(self.config.interval_of(market_name))
+        base = int(self.subscriptions.interval_of(market_name))
         names = []
         if callable(self.extra_market_names):
             with suppress(Exception):
@@ -261,7 +264,7 @@ class MarketWatcher:
 
         due_set = set(due)
         markets: list[str] = []
-        for sub in self.config.enabled_subscriptions:
+        for sub in self.subscriptions.enabled_subscriptions:
             target = self._target_of(sub)
             if target in due_set and sub.market_name not in markets:
                 markets.append(sub.market_name)
@@ -350,7 +353,7 @@ class MarketWatcher:
             self._next_due[market_name] = time.time() + self._interval_for(market_name)
             self._last_attempt_at[market_name] = time.time()
 
-            display = self.config.display_name_of(market_name) or self.storage.get_item_name(market_name)
+            display = self.subscriptions.display_name_of(market_name) or self.storage.get_item_name(market_name)
             try:
                 quote = await self.client.fetch_quote(market_name, token, appid=self.config.appid, display_name=display)
             except AuthExpiredError as exc:
@@ -507,7 +510,7 @@ class MarketWatcher:
     def _build_group_snapshot(self, target_umo: str) -> list[SnapshotItem]:
         """构造某个群的完整订阅快照，同物多人只保留一个物品块。"""
         grouped: dict[str, list] = {}
-        for sub in self.config.enabled_subscriptions:
+        for sub in self.subscriptions.enabled_subscriptions:
             target = self._target_of(sub)
             if target == target_umo:
                 grouped.setdefault(sub.market_name, []).append(sub)
@@ -515,7 +518,7 @@ class MarketWatcher:
         items: list[SnapshotItem] = []
         for market_name, subscribers in grouped.items():
             first = subscribers[0]
-            display = self.config.display_name_of(market_name) or self.storage.get_item_name(market_name)
+            display = self.subscriptions.display_name_of(market_name) or self.storage.get_item_name(market_name)
             quote = self.storage.get_last_quote(market_name)
             if quote is not None and (not quote.ok or (quote.sell_min is None and quote.buy_max is None)):
                 quote = None
@@ -576,7 +579,7 @@ class MarketWatcher:
         now = time.time()
         alive: set[tuple[str, str, str]] = set()
 
-        for sub in self.config.enabled_subscriptions:
+        for sub in self.subscriptions.enabled_subscriptions:
             target_umo = self._target_of(sub)
             if platforms.is_group_session(platforms.session_type_of(target_umo)):
                 continue
@@ -617,7 +620,7 @@ class MarketWatcher:
             latest[event.quote.market_name] = event.quote
 
         subscriptions = {
-            (self._target_of(sub), sub.uid, sub.market_name): sub for sub in self.config.enabled_subscriptions
+            (self._target_of(sub), sub.uid, sub.market_name): sub for sub in self.subscriptions.enabled_subscriptions
         }
         for market_name, quote in latest.items():
             key = (target_umo, uid, market_name)
@@ -661,9 +664,9 @@ class MarketWatcher:
             "poll_count": self.poll_count,
             "last_poll_at": self.last_poll_at,
             "last_error": self.last_poll_error,
-            "poll_interval": self.config.min_interval,
-            "intervals": self.config.intervals,
-            "subscriptions": len(self.config.enabled_subscriptions),
+            "poll_interval": self.subscriptions.min_interval,
+            "intervals": self.subscriptions.intervals,
+            "subscriptions": len(self.subscriptions.enabled_subscriptions),
             "watched": len(self._private_market_names()),
             "groups": len(self._group_targets()),
             "group_push_interval": self.config.group_push_interval,

@@ -20,13 +20,12 @@ from core.api_client import (
 )
 from core.auth import AuthManager, LoginRequiredError
 from core.charts import render_price_chart
-from core.config import PluginConfig
 from core.models import MonitorSpec, Quote, SnapshotItem, Subscription, TriggerEvent
 from core.notifier import DeliveryBlock, Notifier
 from core.payload import render_message, substitute
 from core.resolver import extract_link_reference
 from core.storage import PluginStorage
-from core.subscriptions import SubscriptionStore
+from core.subscriptions import SubscriptionStore, parse_legacy_subscriptions
 from core.watcher import MarketWatcher
 
 
@@ -166,7 +165,15 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("refresh_token", schema)
         self.assertEqual(schema["group_push_interval"]["default"], 30)
         self.assertEqual(schema["chart_history_points"]["default"], 5)
-        self.assertIn("target", schema["user_subscriptions"]["templates"]["user_entry"]["items"])
+        for key in (
+            "account_email",
+            "account_password",
+            "twofa_code",
+            "owner_uids",
+            "user_subscriptions",
+            "payload",
+        ):
+            self.assertTrue(schema[key]["invisible"])
 
     def test_batching_is_keyed_by_umo_and_uid(self) -> None:
         notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())
@@ -360,50 +367,49 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
     def test_config_parses_per_item_interval_and_refresh_mode(self) -> None:
         link = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
-        config = PluginConfig(
-            {
-                "user_subscriptions": [
-                    {
-                        "uid": "fast",
-                        "interval": 30,
-                        "mode": "always",
-                        "items": [{"url": link, "interval": 9}],
-                    },
-                    {
-                        "uid": "slow",
-                        "interval": 30,
-                        "mode": "only_change",
-                        "items": [link],
-                    },
-                ]
-            }
+        items = parse_legacy_subscriptions(
+            [
+                {
+                    "uid": "fast",
+                    "interval": 30,
+                    "mode": "always",
+                    "items": [{"url": link, "interval": 9}],
+                },
+                {
+                    "uid": "slow",
+                    "interval": 30,
+                    "mode": "only_change",
+                    "items": [link],
+                },
+            ]
         )
+        store = SubscriptionStore(lambda _subs: True, items=items)
 
-        fast = config.subscriptions_of("fast")[0]
-        slow = config.subscriptions_of("slow")[0]
+        fast = store.subscriptions_of("fast")[0]
+        slow = store.subscriptions_of("slow")[0]
         self.assertEqual((fast.interval, fast.mode), (9, "always"))
         self.assertEqual((slow.interval, slow.mode), (30, "only_change"))
-        self.assertEqual(config.interval_of("id50381_f_16xl_usa"), 5)
+        self.assertEqual(store.interval_of("id50381_f_16xl_usa"), 5)
 
     def test_config_parses_subscription_target_and_hydrates_legacy(self) -> None:
         link = "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa"
-        config = PluginConfig(
-            {
-                "user_subscriptions": [
-                    {"uid": "known", "target": "test:GroupMessage:known", "items": [link]},
-                    {"uid": "legacy", "items": [link]},
-                ]
-            }
+        items = parse_legacy_subscriptions(
+            [
+                {"uid": "known", "target": "test:GroupMessage:known", "items": [link]},
+                {"uid": "legacy", "items": [link]},
+            ]
+        )
+        store = SubscriptionStore(
+            lambda _subs: True,
+            items=items,
+            resolve_target=lambda uid: "test:GroupMessage:legacy" if uid == "legacy" else "",
         )
 
         self.assertEqual(
-            config.subscriptions_of("known", target_umo="test:GroupMessage:known")[0].target_umo,
+            store.subscriptions_of("known", target_umo="test:GroupMessage:known")[0].target_umo,
             "test:GroupMessage:known",
         )
-        changed = config.hydrate_subscription_targets(lambda uid: "test:GroupMessage:legacy" if uid == "legacy" else "")
-
-        self.assertEqual(changed, 1)
-        self.assertEqual(config.subscriptions_of("legacy")[0].target_umo, "test:GroupMessage:legacy")
+        self.assertEqual(store.subscriptions_of("legacy")[0].target_umo, "test:GroupMessage:legacy")
 
     def test_refresh_modes_differ_on_unchanged_quote(self) -> None:
         notifier = Notifier(None, _Storage(), _NotifierConfig(), _Logger())

@@ -1,8 +1,14 @@
 const bridge = window.AstrBotPluginView;
 const $ = (id) => document.getElementById(id);
 let lastOverview = null;
+let lastMonitor = null;
+let lastOutput = null;
+let lastAccount = null;
+let activeTab = "monitor";
 let toastTimer = null;
 let modalResolver = null;
+let outputDirty = false;
+let accountDirty = false;
 
 const phaseLabels = {
   waiting_buy: "等待买点",
@@ -65,6 +71,418 @@ function formatTimestamp(ts) {
   return new Date(Number(ts) * 1000).toLocaleString();
 }
 
+function formatDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (!value) return "无";
+  if (value >= 86400) return `${(value / 86400).toFixed(1)} 天`;
+  if (value >= 3600) return `${(value / 3600).toFixed(1)} 小时`;
+  if (value >= 60) return `${Math.floor(value / 60)} 分钟`;
+  return `${Math.floor(value)} 秒`;
+}
+
+function showInlineMessage(elementId, message, kind = "") {
+  const el = $(elementId);
+  el.textContent = message || "";
+  el.className = `inline-message ${kind}`.trim();
+  el.hidden = !message;
+}
+
+function activateTab(name) {
+  activeTab = name;
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === name);
+  });
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.hidden = panel.id !== `tab-${name}`;
+  });
+  if (name === "monitor") void loadMonitor();
+  if (name === "account") void loadAccount();
+  if (name === "output") void loadOutput();
+  if (name === "trade") void refreshTrade();
+}
+
+document.querySelectorAll(".tab").forEach((button) => {
+  button.addEventListener("click", () => activateTab(button.dataset.tab));
+});
+document.querySelectorAll("[data-go-tab]").forEach((button) => {
+  button.addEventListener("click", () => activateTab(button.dataset.goTab));
+});
+
+// ---------------------------------------------------------------- 账户登录
+function renderAccount(data) {
+  lastAccount = data;
+  const account = data.account || {};
+  const auth = data.auth || {};
+  const editingAccount = $("accountForm").contains(document.activeElement);
+  if (!editingAccount && !accountDirty) {
+    $("accountEmail").value = account.email || "";
+    $("ownerUids").value = (account.owner_uids || []).join("\n");
+    $("accountPassword").value = "";
+  }
+  $("accountPassword").placeholder = account.password_configured ? "已保存，留空保持不变" : "请输入账号密码";
+
+  const statusItems = [
+    ["登录令牌", auth.has_jwt ? "有效" : "未登录"],
+    ["Gaijin 账号", auth.nick || "未知"],
+    ["令牌剩余", formatDuration(auth.seconds_left)],
+    ["续期令牌", auth.has_refresh_token ? "已保存" : "无"],
+    ["账号密码", account.password_configured ? "已保存" : "未配置"],
+    ["拥有者 UID", `${(account.owner_uids || []).length} 个`],
+  ];
+  if (auth.pending_login) statusItems.push(["验证码", `等待提交（已 ${formatDuration(auth.pending_age)}）`]);
+  if (auth.last_error) statusItems.push(["最近错误", auth.last_error]);
+  $("accountStatus").innerHTML = statusItems
+    .map(([label, value]) => `<div class="status-item"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`)
+    .join("");
+  $("codePanel").hidden = !auth.pending_login;
+
+  const badge = $("authBadge");
+  badge.textContent = auth.has_jwt ? `已登录 · ${auth.nick || "Gaijin"}` : (auth.pending_login ? "等待验证码" : "未登录");
+  badge.className = `badge ${auth.has_jwt ? "ok" : "bad"}`;
+  $("loginHint").hidden = Boolean(auth.has_jwt);
+  $("monitorStatus").textContent = auth.has_jwt ? "已登录" : "未登录";
+}
+
+async function loadAccount() {
+  try {
+    renderAccount(await apiGet("account/overview"));
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
+function accountPayload() {
+  return {
+    email: $("accountEmail").value.trim(),
+    password: $("accountPassword").value,
+    owner_uids: $("ownerUids").value.split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean),
+  };
+}
+
+async function saveAccount({ silent = false } = {}) {
+  try {
+    const data = await apiPost("account/save", accountPayload());
+    accountDirty = false;
+    renderAccount(data);
+    if (!silent) showToast("账号设置已保存", "success");
+    return data;
+  } catch (error) {
+    if (!silent) showToast(apiError(error), "error");
+    else throw error;
+    return null;
+  }
+}
+
+async function startLogin() {
+  try {
+    await saveAccount({ silent: true });
+    const data = await apiPost("account/login/start", {});
+    renderAccount(data);
+    showInlineMessage("accountMessage", data.message || "登录请求已完成", data.need_code ? "" : "ok");
+    showToast(data.need_code ? "请输入两步验证码" : "登录状态已更新", data.need_code ? "" : "success");
+  } catch (error) {
+    showInlineMessage("accountMessage", apiError(error), "error");
+    showToast(apiError(error), "error");
+  }
+}
+
+async function submitLoginCode() {
+  const code = $("loginCode").value.trim();
+  if (!code) {
+    showToast("请输入验证码", "error");
+    return;
+  }
+  try {
+    const data = await apiPost("account/login/code", { code });
+    $("loginCode").value = "";
+    renderAccount(data);
+    showInlineMessage("accountMessage", data.message || "验证码已提交", "ok");
+    showToast("登录状态已更新", "success");
+  } catch (error) {
+    showInlineMessage("accountMessage", apiError(error), "error");
+    showToast(apiError(error), "error");
+  }
+}
+
+$("accountForm").addEventListener("input", () => { accountDirty = true; });
+$("accountForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await saveAccount();
+});
+$("loginStartBtn").addEventListener("click", startLogin);
+$("loginCodeBtn").addEventListener("click", submitLoginCode);
+$("accountRefreshBtn").addEventListener("click", () => { accountDirty = false; void loadAccount(); });
+$("loginCode").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") submitLoginCode();
+});
+
+// ---------------------------------------------------------------- 行情订阅
+function sessionsFromMonitor() {
+  return lastMonitor?.sessions || [];
+}
+
+function fillSessionOptions() {
+  const select = $("subSessionSelect");
+  const current = select.value;
+  const sessions = sessionsFromMonitor();
+  select.innerHTML = '<option value="">手工填写 UMO</option>' + sessions
+    .map((item) => `<option value="${escapeHtml(item.umo)}">${escapeHtml(item.name || item.uid)} · ${escapeHtml(item.umo)}</option>`)
+    .join("");
+  if ([...select.options].some((option) => option.value === current)) select.value = current;
+}
+
+function renderMonitor(data) {
+  lastMonitor = data;
+  const groups = data.groups || [];
+  const itemCount = groups.reduce((sum, group) => sum + (group.items || []).length, 0);
+  $("monitorGroupCount").textContent = String(groups.length);
+  $("monitorItemCount").textContent = String(itemCount);
+  $("monitorWatchedCount").textContent = String((data.watched_market_names || []).length);
+  $("monitorStatus").textContent = lastAccount?.auth?.has_jwt ? "已登录" : "未登录";
+  fillSessionOptions();
+
+  const container = $("subscriptionList");
+  if (!groups.length) {
+    container.innerHTML = '<p class="muted empty">暂无订阅</p>';
+    return;
+  }
+  container.innerHTML = groups.map((group) => `
+    <article class="stack-item" data-group-uid="${escapeHtml(group.uid)}" data-group-target="${escapeHtml(group.target_umo)}">
+      <div class="stack-head">
+        <div>
+          <strong>${escapeHtml(group.note || group.uid)}</strong>
+          <small>${escapeHtml(group.uid)} · ${escapeHtml(group.target_umo)}</small>
+          <small>${group.enabled ? "启用" : "停用"} · ${escapeHtml(group.mode)} · ${escapeHtml(group.interval)} 秒</small>
+        </div>
+        <div class="stack-actions">
+          <button class="button small secondary" type="button" data-sub-action="edit">编辑</button>
+          <button class="button small ${group.enabled ? "ghost" : "primary"}" type="button" data-sub-action="toggle">${group.enabled ? "停用" : "启用"}</button>
+          <button class="button small danger" type="button" data-sub-action="delete-group">删除组</button>
+        </div>
+      </div>
+      <ul class="sub-items">
+        ${(group.items || []).map((item) => `
+          <li>
+            <span>${escapeHtml(item.display_name || item.market_name)} <small>${escapeHtml(item.url)}</small></span>
+            <button class="button small ghost" type="button" data-sub-action="delete-item" data-market="${escapeHtml(item.market_name)}">删除</button>
+          </li>`).join("")}
+      </ul>
+    </article>`).join("");
+}
+
+async function loadMonitor() {
+  try {
+    renderMonitor(await apiGet("monitor/overview"));
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
+function resetSubForm() {
+  $("subOriginalUid").value = "";
+  $("subOriginalTarget").value = "";
+  $("subUid").value = "";
+  $("subTarget").value = "";
+  $("subSessionSelect").value = "";
+  $("subInterval").value = String(lastMonitor?.defaults?.interval || 30);
+  $("subMode").value = lastMonitor?.defaults?.mode || "only_change";
+  $("subEnabled").checked = true;
+  $("subItems").value = "";
+  $("subscriptionFormTitle").textContent = "新增订阅组";
+}
+
+function editSubscriptionGroup(uid, target) {
+  const group = (lastMonitor?.groups || []).find((item) => item.uid === uid && item.target_umo === target);
+  if (!group) return;
+  $("subOriginalUid").value = group.uid;
+  $("subOriginalTarget").value = group.target_umo;
+  $("subUid").value = group.uid;
+  $("subTarget").value = group.target_umo;
+  $("subSessionSelect").value = group.target_umo;
+  $("subInterval").value = String(group.interval);
+  $("subMode").value = group.mode;
+  $("subEnabled").checked = Boolean(group.enabled);
+  $("subItems").value = (group.items || []).map((item) => item.url).join("\n");
+  $("subscriptionFormTitle").textContent = `编辑订阅组 · ${group.note || group.uid}`;
+  $("subscriptionForm").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function subscriptionPayloadFromForm() {
+  const lines = $("subItems").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  const existing = (lastMonitor?.groups || []).find(
+    (group) => group.uid === $("subOriginalUid").value && group.target_umo === $("subOriginalTarget").value,
+  );
+  const names = new Map((existing?.items || []).map((item) => [item.url, item.display_name]));
+  return {
+    original_uid: $("subOriginalUid").value,
+    original_target: $("subOriginalTarget").value,
+    uid: $("subUid").value.trim(),
+    target_umo: $("subTarget").value.trim(),
+    enabled: $("subEnabled").checked,
+    interval: Number($("subInterval").value || 30),
+    mode: $("subMode").value,
+    items: lines.map((url) => ({ url, display_name: names.get(url) || "" })),
+  };
+}
+
+async function saveSubscription(payload) {
+  try {
+    const data = await apiPost("monitor/subscriptions/save", payload);
+    renderMonitor(data);
+    showToast(data.message || "订阅已保存", "success");
+    return true;
+  } catch (error) {
+    showToast(apiError(error), "error");
+    return false;
+  }
+}
+
+async function deleteSubscription(uid, target, market = "") {
+  const confirmed = await openModal({
+    title: market ? "删除订阅物品" : "删除订阅组",
+    message: market ? `确认删除物品 ${market}？` : `确认删除 ${uid} 在 ${target} 的整组订阅？`,
+  });
+  if (confirmed === null) return;
+  try {
+    const data = await apiPost("monitor/subscriptions/delete", { uid, target_umo: target, market_name: market });
+    renderMonitor(data);
+    showToast(data.message || "订阅已删除", "success");
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
+async function toggleSubscriptionGroup(uid, target) {
+  const group = (lastMonitor?.groups || []).find((item) => item.uid === uid && item.target_umo === target);
+  if (!group) return;
+  await saveSubscription({
+    original_uid: group.uid,
+    original_target: group.target_umo,
+    uid: group.uid,
+    target_umo: group.target_umo,
+    enabled: !group.enabled,
+    interval: group.interval,
+    mode: group.mode,
+    items: (group.items || []).map((item) => ({ url: item.url, display_name: item.display_name })),
+  });
+}
+
+$("subscriptionForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const ok = await saveSubscription(subscriptionPayloadFromForm());
+  if (ok) resetSubForm();
+});
+$("resetSubBtn").addEventListener("click", resetSubForm);
+$("subSessionSelect").addEventListener("change", () => {
+  const session = sessionsFromMonitor().find((item) => item.umo === $("subSessionSelect").value);
+  if (session) {
+    $("subTarget").value = session.umo;
+    $("subUid").value = session.uid;
+  }
+});
+$("subscriptionList").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-sub-action]");
+  if (!button) return;
+  const card = button.closest("[data-group-uid]");
+  const uid = card?.dataset.groupUid || "";
+  const target = card?.dataset.groupTarget || "";
+  const action = button.dataset.subAction;
+  if (action === "edit") editSubscriptionGroup(uid, target);
+  if (action === "toggle") toggleSubscriptionGroup(uid, target);
+  if (action === "delete-group") deleteSubscription(uid, target);
+  if (action === "delete-item") deleteSubscription(uid, target, button.dataset.market || "");
+});
+
+// ---------------------------------------------------------------- 输出模板
+function renderFieldPalette(elementId, groups, targetId, prefix = "") {
+  const container = $(elementId);
+  container.innerHTML = Object.entries(groups || {}).map(([groupName, fields]) => `
+    <div class="field-group">
+      <strong>${escapeHtml(groupName)}</strong>
+      <div class="field-chips">
+        ${Object.keys(fields).map((field) => `<button class="field-chip" type="button" data-field="${escapeHtml(prefix + field)}" data-target="${escapeHtml(targetId)}">$${escapeHtml(prefix + field)}</button>`).join("")}
+      </div>
+    </div>`).join("");
+}
+
+function insertAtCursor(textarea, text) {
+  const start = textarea.selectionStart ?? textarea.value.length;
+  const end = textarea.selectionEnd ?? textarea.value.length;
+  textarea.setRangeText(text, start, end, "end");
+  textarea.focus();
+  outputDirty = true;
+}
+
+function renderOutput(data) {
+  lastOutput = data;
+  if (!outputDirty) {
+    $("quotePayload").value = data.quote_payload || "";
+    $("tradePayload").value = data.trade_payload || "";
+  }
+  renderFieldPalette("quoteFields", data.fields?.quote || {}, "quotePayload", "");
+  renderFieldPalette("tradeFields", data.fields?.trade || {}, "tradePayload", "");
+}
+
+async function loadOutput() {
+  try {
+    renderOutput(await apiGet("output/overview"));
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
+async function previewTemplate(kind) {
+  const target = kind === "trade" ? $("tradePayload") : $("quotePayload");
+  const preview = kind === "trade" ? $("tradePreview") : $("quotePreview");
+  try {
+    const result = await apiPost("output/preview", { kind, template: target.value });
+    const notes = [];
+    if (result.error) notes.push(result.error);
+    if (result.unknown_fields?.length) notes.push(`未知字段：${result.unknown_fields.join("、")}`);
+    if (result.note) notes.push(result.note);
+    preview.textContent = [notes.join("\n"), result.text || (result.images?.length ? `[图片] ${result.images.length} 张` : "")].filter(Boolean).join("\n\n") || "无可见内容";
+    preview.classList.toggle("error", Boolean(result.error));
+  } catch (error) {
+    preview.textContent = apiError(error);
+    preview.classList.add("error");
+  }
+}
+
+async function saveOutput() {
+  try {
+    const data = await apiPost("output/save", {
+      quote_payload: $("quotePayload").value,
+      trade_payload: $("tradePayload").value,
+    });
+    outputDirty = false;
+    renderOutput(data);
+    showToast(data.message || "输出模板已保存", "success");
+  } catch (error) {
+    showToast(apiError(error), "error");
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const chip = event.target.closest(".field-chip[data-field]");
+  if (!chip) return;
+  const target = $(chip.dataset.target);
+  if (target) insertAtCursor(target, chip.dataset.field);
+});
+$("quotePayload").addEventListener("input", () => { outputDirty = true; });
+$("tradePayload").addEventListener("input", () => { outputDirty = true; });
+$("previewQuoteBtn").addEventListener("click", () => previewTemplate("quote"));
+$("previewTradeBtn").addEventListener("click", () => previewTemplate("trade"));
+$("saveOutputBtn").addEventListener("click", saveOutput);
+$("resetQuoteBtn").addEventListener("click", () => {
+  $("quotePayload").value = lastOutput?.defaults?.quote_payload || "";
+  outputDirty = true;
+});
+$("resetTradeBtn").addEventListener("click", () => {
+  $("tradePayload").value = lastOutput?.defaults?.trade_payload || "";
+  outputDirty = true;
+});
+
+// ---------------------------------------------------------------- 自动交易
 function fillSettings(settings) {
   const form = $("settingsForm");
   if (form.contains(document.activeElement)) return;
@@ -94,25 +512,18 @@ function renderRules(rules) {
     const actions = [
       actionButton("编辑", "edit", rule.rule_id),
       actionButton(rule.enabled ? "暂停" : "恢复", rule.enabled ? "pause" : "resume", rule.rule_id),
-      rule.live
-        ? actionButton("退出实盘", "disarm", rule.rule_id)
-        : actionButton("切换实盘", "arm", rule.rule_id, "danger"),
+      rule.live ? actionButton("退出实盘", "disarm", rule.rule_id) : actionButton("切换实盘", "arm", rule.rule_id, "danger"),
       hasOrders ? actionButton("撤销自动订单", "cancel_orders", rule.rule_id, "danger") : "",
       actionButton("删除", "delete", rule.rule_id, "ghost"),
     ].join("");
     return `
       <article class="rule-card" data-rule-card="${escapeHtml(rule.rule_id)}">
-        <div class="rule-top">
-          <div>
-            <div class="rule-title">
-              <strong>${escapeHtml(rule.title)}</strong>
-              <span class="pill ${rule.live ? "live" : ""}">${rule.live ? "实盘" : "模拟"}</span>
-              <span class="pill ${rule.enabled ? "" : "off"}">${rule.enabled ? "启用" : "停用"}</span>
-              <span class="pill">${escapeHtml(phase)}</span>
-            </div>
-            <p class="muted">${escapeHtml(rule.rule_id)} · ${escapeHtml(rule.mode)} · 完成 ${runtime.cycle_count || 0} 轮</p>
-          </div>
-        </div>
+        <div class="rule-top"><div><div class="rule-title">
+          <strong>${escapeHtml(rule.title)}</strong>
+          <span class="pill ${rule.live ? "live" : ""}">${rule.live ? "实盘" : "模拟"}</span>
+          <span class="pill ${rule.enabled ? "" : "off"}">${rule.enabled ? "启用" : "停用"}</span>
+          <span class="pill">${escapeHtml(phase)}</span>
+        </div><p class="muted">${escapeHtml(rule.rule_id)} · ${escapeHtml(rule.mode)} · 完成 ${runtime.cycle_count || 0} 轮</p></div></div>
         <div class="rule-meta">
           <div><span>买入限价</span><b>${escapeHtml(rule.buy_price)} GJN</b></div>
           <div><span>税后目标</span><b>${escapeHtml(rule.sell_net_price)} GJN</b></div>
@@ -155,24 +566,21 @@ function renderEvents(events) {
     </div>`).join("");
 }
 
-function render(data) {
+function renderTrade(data) {
   lastOverview = data;
   $("masterState").textContent = data.settings.enabled ? "已开启" : "未开启";
   $("exposure").textContent = `${data.exposure} GJN`;
   $("budgetRemaining").textContent = `${data.budget_remaining} GJN`;
   $("dailySpent").textContent = `${data.ledger.daily_spent} GJN`;
-  const authBadge = $("authBadge");
-  authBadge.textContent = data.auth?.has_jwt ? `已登录 · ${data.auth.nick || "Gaijin"}` : "未登录";
-  authBadge.className = `badge ${data.auth?.has_jwt ? "ok" : "bad"}`;
   fillSettings(data.settings);
   renderRules(data.rules || []);
   renderOrders(data.orders || []);
   renderEvents(data.events || []);
 }
 
-async function refresh() {
+async function refreshTrade() {
   try {
-    render(await apiGet("trade/overview"));
+    renderTrade(await apiGet("trade/overview"));
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -198,9 +606,7 @@ function editRule(ruleId) {
   $("ruleSellNet").value = rule.sell_net_price;
   $("ruleMode").value = rule.mode;
   $("ruleFormTitle").textContent = `编辑 ${rule.rule_id}`;
-  [...document.querySelectorAll("[data-rule-card]")]
-    .find((element) => element.dataset.ruleCard === ruleId)
-    ?.scrollIntoView({ behavior: "smooth" });
+  $("ruleForm").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function armRule(ruleId) {
@@ -216,7 +622,7 @@ async function armRule(ruleId) {
     if (typed === null) return;
     await apiPost("trade/rules/action", { rule_id: ruleId, action: "arm", confirmation_id: typed });
     showToast("规则已切换实盘", "success");
-    await refresh();
+    await refreshTrade();
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -230,16 +636,13 @@ async function runRuleAction(action, ruleId) {
     if (confirmed === null) return;
   }
   if (action === "cancel_orders") {
-    const confirmed = await openModal({
-      title: "撤销自动订单",
-      message: `确认撤销 ${ruleId} 的全部自动订单并暂停规则？`,
-    });
+    const confirmed = await openModal({ title: "撤销自动订单", message: `确认撤销 ${ruleId} 的全部自动订单并暂停规则？` });
     if (confirmed === null) return;
   }
   try {
     await apiPost("trade/rules/action", { rule_id: ruleId, action });
     showToast("操作完成", "success");
-    await refresh();
+    await refreshTrade();
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -264,7 +667,7 @@ $("settingsForm").addEventListener("submit", async (event) => {
       private_mode: $("settingPrivate").checked,
     });
     showToast("设置已保存", "success");
-    await refresh();
+    await refreshTrade();
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -287,7 +690,7 @@ $("ruleForm").addEventListener("submit", async (event) => {
     showToast(editId ? "规则已更新" : "规则已创建", "success");
     $("ruleUrl").disabled = false;
     resetRuleForm();
-    await refresh();
+    await refreshTrade();
   } catch (error) {
     showToast(apiError(error), "error");
   }
@@ -297,8 +700,6 @@ $("resetRuleBtn").addEventListener("click", () => {
   $("ruleUrl").disabled = false;
   resetRuleForm();
 });
-
-$("refreshBtn").addEventListener("click", refresh);
 
 $("stopAllBtn").addEventListener("click", async () => {
   const confirmation = await openModal({
@@ -312,10 +713,17 @@ $("stopAllBtn").addEventListener("click", async () => {
   try {
     await apiPost("trade/stop-all", { confirmation });
     showToast("自动交易已急停", "success");
-    await refresh();
+    await refreshTrade();
   } catch (error) {
     showToast(apiError(error), "error");
   }
+});
+
+$("refreshBtn").addEventListener("click", async () => {
+  await loadAccount();
+  if (activeTab === "trade") await refreshTrade();
+  if (activeTab === "monitor") await loadMonitor();
+  if (activeTab === "output") await loadOutput();
 });
 
 $("modalCancel").addEventListener("click", () => closeModal(null));
@@ -331,9 +739,14 @@ document.addEventListener("keydown", (event) => {
 });
 
 await bridge.ready();
-document.title = bridge.t("views.trade.title", "Gaijin 自动交易");
-await refresh();
-setInterval(refresh, 3000);
+document.title = bridge.t("views.trade.title", "Gaijin Market 控制台");
+await loadAccount();
+await loadMonitor();
+if (activeTab === "trade") await refreshTrade();
+setInterval(() => {
+  void loadAccount();
+  if (activeTab === "trade") void refreshTrade();
+}, 3000);
 bridge.onContext(() => {
-  document.title = bridge.t("views.trade.title", "Gaijin 自动交易");
+  document.title = bridge.t("views.trade.title", "Gaijin Market 控制台");
 });

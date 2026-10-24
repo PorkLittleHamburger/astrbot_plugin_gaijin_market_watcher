@@ -117,6 +117,59 @@ ITEM_FIELDS: dict[str, str] = {
     "item_timestamp": "该物品行情时间（Unix 秒）",
 }
 
+#: 交易事件字段（按用途分组，供控制台字段面板使用）
+TRADE_FIELD_GROUPS: dict[str, dict[str, str]] = {
+    "事件": {
+        "trade_kind": "事件类型标识",
+        "trade_kind_text": "事件类型中文名称",
+        "trade_level": "事件级别 info/warning/error",
+        "trade_message": "事件正文",
+        "trade_datetime": "事件时间（YYYY-MM-DD-HH-MM-SS）",
+        "trade_datetime_plain": "事件时间（YYYY-MM-DD HH:MM:SS）",
+        "trade_timestamp": "事件时间（Unix 秒）",
+    },
+    "规则": {
+        "trade_rule_id": "交易规则 ID",
+        "trade_name": "物品显示名称",
+        "trade_market_name": "市场 slug",
+        "trade_url": "物品页链接",
+        "trade_item_type": "物品类型",
+        "trade_mode": "once / loop",
+        "trade_live": "是否实盘",
+        "trade_enabled": "规则是否启用",
+        "trade_phase": "交易阶段",
+        "trade_last_error": "最近错误",
+    },
+    "持仓": {
+        "trade_held_qty": "当前持仓数量",
+        "trade_listed_qty": "已挂售数量",
+        "trade_available_qty": "可卖数量",
+        "trade_cost_basis": "持仓成本（GJN）",
+        "trade_proceeds": "累计税后到账（GJN）",
+        "trade_profit": "当前周期模拟盈亏（GJN）",
+        "trade_cycle_count": "已完成周期数",
+        "trade_buy_price": "买入限价（GJN）",
+        "trade_sell_net_price": "税后目标价（GJN）",
+        "trade_sell_gross_price": "税前挂单价（GJN）",
+        "trade_last_buy_price": "最近买入价（GJN）",
+        "trade_last_sell_price": "最近卖出价（GJN）",
+    },
+    "成交": {
+        "trade_side": "BUY / SELL",
+        "trade_price": "成交或挂单价格（GJN）",
+        "trade_quantity": "成交或挂单数量",
+        "trade_amount": "成交/挂单金额（GJN）",
+        "trade_fee": "手续费比例",
+        "trade_net_price": "税后单价（GJN）",
+        "trade_order_id": "订单 ID",
+    },
+}
+
+TRADE_FIELDS: dict[str, str] = {
+    name: description for group in TRADE_FIELD_GROUPS.values() for name, description in group.items()
+}
+TRADE_KNOWN_FIELDS = frozenset(TRADE_FIELDS)
+
 KNOWN_FIELDS = frozenset(ROUND_FIELDS) | frozenset(ITEM_FIELDS)
 
 _PLACEHOLDER = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -305,7 +358,12 @@ def _render_skeleton(skeleton: dict[str, Any], context: dict[str, Any]) -> Rende
     return result
 
 
-def validate_payload(template: str) -> tuple[bool, str]:
+def validate_payload(
+    template: str,
+    *,
+    known_fields: frozenset[str] | set[str] | None = None,
+    sample: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     """配置体检：返回 (是否可用, 说明)。"""
     if not template or not template.strip():
         return True, "未配置（使用默认可读文本）"
@@ -313,30 +371,34 @@ def validate_payload(template: str) -> tuple[bool, str]:
         skeleton, parse_error = load_skeleton(template)
         if skeleton is None:
             return False, f"JSON 解析失败：{parse_error}（常见原因：多了一个逗号、用了中文引号）"
-    sample: dict[str, Any] = {name: name for name in KNOWN_FIELDS}
-    sample.update(
-        {
-            "timestamp": 1790220000,
-            "count": 2,
-            "sell": 45.0,
-            "buy": 42.0,
-            "sell_text": "45.00",
-            "buy_text": "42.00",
-            "sell_depth": 570,
-            "buy_depth": 2168,
-            "sell_change_amount": "+1.00",
-            "sell_change_rate": "+2.3%",
-            "buy_change_amount": "0",
-            "buy_change_rate": "0%",
-            "sell_count_change_amount": "+10",
-            "sell_count_change_rate": "+1.8%",
-            "buy_count_change_amount": "-5",
-            "buy_count_change_rate": "-0.2%",
-        }
-    )
-    for alias, target in ALIASES.items():
-        sample[alias] = sample.get(target, "")
-    model = render_message(template, sample)
+    allowed = known_fields or KNOWN_FIELDS
+    values: dict[str, Any] = {name: name for name in allowed}
+    if sample:
+        values.update(sample)
+    if allowed == KNOWN_FIELDS:
+        values.update(
+            {
+                "timestamp": 1790220000,
+                "count": 2,
+                "sell": 45.0,
+                "buy": 42.0,
+                "sell_text": "45.00",
+                "buy_text": "42.00",
+                "sell_depth": 570,
+                "buy_depth": 2168,
+                "sell_change_amount": "+1.00",
+                "sell_change_rate": "+2.3%",
+                "buy_change_amount": "0",
+                "buy_change_rate": "0%",
+                "sell_count_change_amount": "+10",
+                "sell_count_change_rate": "+1.8%",
+                "buy_count_change_amount": "-5",
+                "buy_count_change_rate": "-0.2%",
+            }
+        )
+        for alias, target in ALIASES.items():
+            values[alias] = values.get(target, "")
+    model = render_message(template, values)
     notes = []
     if model.unknown_fields:
         notes.append("含未知字段：" + "、".join(model.unknown_fields))

@@ -77,6 +77,20 @@ class PluginStorage:
         name = Path(filename).name
         return self._load(self.dir / name, default)
 
+    def data_path(self, filename: str) -> Path:
+        """返回插件数据目录中固定文件的绝对路径。"""
+        return self.dir / Path(filename).name
+
+    def get_ui_schema_version(self) -> int:
+        raw = self.load_aux_json("ui_state.json", {})
+        try:
+            return int(raw.get("schema_version") or 0) if isinstance(raw, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def set_ui_schema_version(self, version: int) -> bool:
+        return self.save_aux_json("ui_state.json", {"schema_version": int(version)})
+
     def save_aux_json(self, filename: str, data: Any) -> bool:
         """原子写入插件数据目录下的辅助 JSON 文件。"""
         name = Path(filename).name

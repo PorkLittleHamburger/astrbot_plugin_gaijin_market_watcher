@@ -34,7 +34,7 @@ from urllib.parse import urljoin
 import httpx
 
 from . import constants as C
-from .api_client import AuthExpiredError, GaijinMarketClient, MarketApiError, RefreshTokenInvalidError
+from .api_client import AuthExpiredError, MarketApiError, RefreshTokenInvalidError
 
 # ---------------------------------------------------------------- 表单解析
 _FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.S | re.I)
@@ -228,16 +228,17 @@ class PendingLogin:
 class AuthManager:
     """持有并维护市场令牌，并提供两阶段登录。"""
 
-    def __init__(self, client: GaijinMarketClient, storage, config, logger) -> None:
+    def __init__(self, client, storage, config, logger, accounts=None) -> None:
         self.client = client
         self.storage = storage
         self.config = config
         self.logger = logger
+        self.accounts = accounts
         self._jwt: str = ""
         self._refresh_token: str = ""
-        self._last_refresh_error: str = ""
         self._config_jwt: str = ""
         self._config_refresh_token: str = ""
+        self._last_refresh_error: str = ""
 
     # ------------------------------------------------------------ 初始化
 
@@ -331,7 +332,7 @@ class AuthManager:
             "uid": info.get("uid"),
             "two_step": info.get("has_2step"),
             "last_error": self._last_refresh_error,
-            "has_account": bool(self.config.account_email and self.config.account_password),
+            "has_account": bool(self.accounts and self.accounts.email and self.accounts.password),
             "pending_login": pending is not None and not pending.expired(),
             "pending_code_field": pending.code_field if pending else "",
             "pending_age": (time.time() - pending.created_at) if pending else 0.0,

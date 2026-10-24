@@ -118,13 +118,15 @@ def _change_rate(old: float | None, new: float | None, *, decimals: int = 1) -> 
 
 
 class Notifier:
-    def __init__(self, context, storage, config, logger) -> None:
+    def __init__(self, context, storage, config, logger, *, subscriptions=None, output=None, accounts=None) -> None:
         self.context = context
         self.storage = storage
         self.config = config
         self.logger = logger
-        #: payload 模板的问题只提醒一次，避免刷屏
+        self.subscriptions = subscriptions
+        self.output = output
         self._payload_warned = False
+        self.accounts = accounts
         #: 出站失败通知限频（umo -> 上次通知时间）
         self._send_failure_at: dict[str, float] = {}
         #: 推送合并缓冲：(umo, uid) -> {uid, name, events, failures, deadline, on_delivered}
@@ -151,7 +153,11 @@ class Notifier:
 
     def owner_sessions(self, owner_uids: list[str] | None = None) -> list[str]:
         """拥有者 UID -> 会话列表（全局监控项的通知目标）。"""
-        uids = owner_uids if owner_uids is not None else self.config.owner_uids
+        uids = (
+            owner_uids
+            if owner_uids is not None
+            else (self.accounts.owner_uids if self.accounts else getattr(self.config, "owner_uids", []))
+        )
         umos: list[str] = []
         for uid in uids:
             resolved = self.session_of(uid)
@@ -333,6 +339,24 @@ class Notifier:
             context.update(self._item_context(primary))
         return context
 
+    def render_trade_event(self, event) -> str:
+        """使用独立的交易模板渲染 TradeEvent。"""
+        template = (getattr(self.output, "trade_payload", "") or "").strip()
+        fallback = f"【GJM 自动交易】{event.message}"
+        if not template:
+            return fallback
+        context = dict(event.details or {})
+        context.setdefault("trade_kind", event.kind)
+        context.setdefault("trade_level", event.level)
+        context.setdefault("trade_message", event.message)
+        model = render_message(template, context)
+        if model.ok:
+            return model.text
+        if not self._payload_warned:
+            self._payload_warned = True
+            self.logger.warning(f"[GJM] 交易输出模板渲染失败，已回退文本：{model.error}")
+        return fallback
+
     def _render_item(self, event: TriggerEvent) -> str:
         quote, previous = event.quote, event.previous
         old_sell = previous.sell_min if previous else None
@@ -417,7 +441,7 @@ class Notifier:
         mentions_by_event: dict[int, list[tuple[str, str]]] | None = None,
     ) -> list[DeliveryBlock]:
         mention_map = mentions_by_event or {}
-        template = (self.config.payload or "").strip()
+        template = (getattr(self.output, "quote_payload", "") or getattr(self.config, "payload", "") or "").strip()
         base = self.build_payload_context(
             events,
             failures,
@@ -727,7 +751,7 @@ class Notifier:
         if not items:
             return False
         platform_type = await self._platform_type(umo) if umo else ""
-        template = (self.config.payload or "").strip()
+        template = (getattr(self.output, "quote_payload", "") or getattr(self.config, "payload", "") or "").strip()
         events = [
             TriggerEvent(
                 spec=MonitorSpec(
@@ -978,7 +1002,7 @@ class Notifier:
                 continue
             user_markets = {
                 sub.market_name
-                for sub in getattr(self.config, "enabled_subscriptions", ())
+                for sub in getattr(self.subscriptions or self.config, "enabled_subscriptions", ())
                 if sub.uid == uid and sub.target_umo == target_umo
             }
             user_failures = [quote for quote in (failures or []) if quote.market_name in user_markets]

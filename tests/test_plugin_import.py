@@ -121,21 +121,35 @@ class PluginImportTests(unittest.TestCase):
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjma"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjm_trade_add"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "_trade_web_overview"))
+        for handler in (
+            "_account_web_overview",
+            "_account_web_save",
+            "_account_web_login_start",
+            "_account_web_login_code",
+            "_monitor_web_overview",
+            "_monitor_web_save",
+            "_monitor_web_delete",
+            "_output_web_overview",
+            "_output_web_save",
+            "_output_web_preview",
+        ):
+            self.assertTrue(hasattr(self.module.GaijinMarketWatcher, handler), handler)
         metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
+        self.assertEqual(metadata["version"], "2.19.0")
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher
         fake_self = SimpleNamespace(
-            cfg=SimpleNamespace(owner_uids=["owner"]),
+            accounts=SimpleNamespace(owner_uids=["owner"]),
             _is_owner=lambda _event: True,
         )
         group_event = SimpleNamespace(unified_msg_origin="p:GroupMessage:g")
         private_event = SimpleNamespace(unified_msg_origin="p:FriendMessage:owner")
         self.assertIn("私聊", watcher_class._trade_access_error(fake_self, group_event))
         self.assertEqual(watcher_class._trade_access_error(fake_self, private_event), "")
-        fake_self.cfg.owner_uids = []
-        self.assertIn("owner_uids", watcher_class._trade_access_error(fake_self, private_event))
-        fake_self.cfg.owner_uids = ["owner"]
+        fake_self.accounts.owner_uids = []
+        self.assertIn("拥有者 UID", watcher_class._trade_access_error(fake_self, private_event))
+        fake_self.accounts.owner_uids = ["owner"]
         fake_self._is_owner = lambda _event: False
         self.assertIn("仅插件拥有者", watcher_class._trade_access_error(fake_self, private_event))

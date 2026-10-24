@@ -108,6 +108,33 @@ class Subscription:
     def key(self) -> tuple[str, str, str]:
         return (self.target_umo, self.uid, self.market_name)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "uid": self.uid,
+            "market_name": self.market_name,
+            "display_name": self.display_name,
+            "sell_below": float(self.sell_below),
+            "buy_above": float(self.buy_above),
+            "enabled": bool(self.enabled),
+            "interval": int(self.interval),
+            "mode": self.mode,
+            "target_umo": self.target_umo,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Subscription:
+        return cls(
+            uid=str(data.get("uid") or ""),
+            market_name=str(data.get("market_name") or ""),
+            display_name=str(data.get("display_name") or ""),
+            sell_below=max(0.0, float(data.get("sell_below") or 0)),
+            buy_above=max(0.0, float(data.get("buy_above") or 0)),
+            enabled=bool(data.get("enabled", True)),
+            interval=max(1, int(data.get("interval") or DEFAULT_POLL_INTERVAL)),
+            mode=str(data.get("mode") or REFRESH_ONLY_CHANGE),
+            target_umo=str(data.get("target_umo") or ""),
+        )
+
     def to_spec(self) -> MonitorSpec:
         """复用全局监控的阈值判定逻辑（推送目标不同，判定规则一致）。"""
         return MonitorSpec(

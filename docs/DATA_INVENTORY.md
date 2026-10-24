@@ -1,6 +1,6 @@
 # Gaijin 市场自动交易插件（独立版）· 数据清单
 
-> 版本 `v2.18.0`　|　更新日期 2026-10-24　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
+> 版本 `v2.19.0`　|　更新日期 2026-10-24　|　接口字段来自真实探测结果，插件落盘结构已按当前实现更新
 
 ---
 
@@ -113,14 +113,17 @@ depth      = SELL 570 / BUY 2168
 | `sessions.json` | `UID → 会话 UMO` + 用户昵称（推送与 @ 的前提） |
 | `pending_login.json` | 待提交验证码的临时会话 Cookie 与表单字段（15 分钟过期） |
 | `items_meta.json` | 物品图标、标签、稀有度与颜色缓存 |
-| `auth.json` | `refresh_token` + `token` + 更新时间（**不含账号密码**） |
+| `auth.json` | `refresh_token` + `token` + 更新时间 |
+| `account.json` | 账号邮箱、登录密码和拥有者 UID；仅插件内部使用，API 不回显密码 |
+| `output.json` | 行情推送模板与交易事件模板 |
+| `ui_state.json` | 控制台数据迁移版本 |
 | `trade_rules.json` | 自动交易规则（规则 ID、物品、限价、数量、税后目标、模式、模拟/实盘） |
 | `trade_runtime.json` | 每规则状态、持仓、成本、累计收益、库存资产分配和自动订单 ID |
 | `trade_settings.json` | 总开关、预算、每日限额、单笔上限、最大数量、检查频率与隐私交易开关 |
 | `trade_ledger.json` | 上海时区每日累计买入额 |
 | `trade_events.json` | 最近 500 条自动交易事件与错误 |
 
-用户订阅、所属会话 `target`、刷新间隔与模式保存在 AstrBot 插件配置 `user_subscriptions` 中。
+用户订阅、所属会话 `target`、刷新间隔与模式保存在插件数据目录的 `subscriptions.json` 中。
 
 旧版独立 `history.json` 只作为兼容数据源读取；新行情点直接写入 `quotes.json`，不再产生额外历史文件写盘。
 

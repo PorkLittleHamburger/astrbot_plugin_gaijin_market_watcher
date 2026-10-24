@@ -15,6 +15,7 @@ from core.trade_models import (
     BookLevel,
     BookSnapshot,
     TradeAssetAllocation,
+    TradeEvent,
     TradeOrder,
     TradeSettings,
     fmt_gjn,
@@ -55,6 +56,9 @@ class _Notifier:
 
     async def push(self, text, targets, *_args, **_kwargs) -> None:
         self.sent.append((text, list(targets)))
+
+    def render_trade_event(self, event) -> str:
+        return event.message
 
 
 class _Config:
@@ -338,7 +342,8 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         notifier = _Notifier()
         notifier.owner_sessions = lambda: ["p:GroupMessage:g", "p:FriendMessage:owner"]
         self.trader.notifier = notifier
-        await self.trader._notify("test")
+        event = TradeEvent(timestamp=0, rule_id="", kind="test", message="test", details={"trade_message": "test"})
+        await self.trader._notify_event(event)
         self.assertEqual(notifier.sent, [("test", ["p:FriendMessage:owner"])])
 
     async def test_api_trade_calls_use_stable_transaction_and_no_internal_retry(self) -> None:

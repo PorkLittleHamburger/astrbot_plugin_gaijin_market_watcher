@@ -1,14 +1,8 @@
-"""配置层：把 AstrBot 注入的原始配置 dict 归一化为强类型对象。
+"""配置层：把 AstrBot 注入的技术配置归一化为强类型对象。
 
-AstrBot 会依据 _conf_schema.json 生成配置文件并注入 __init__，
-原始值可能因为 WebUI 编辑器而出现类型漂移（例如 int 存成 str），
-因此这里做一次统一的宽松解析 + 校验，业务代码只消费强类型结果。
-
-【重要】账号密码字段说明：
-  account_email / account_password 用于在 WebUI 里完成登录（含两步验证），
-  它们会被写入插件配置文件（data/config/<插件名>_config.json）。
-  登录成功后，JWT / refresh_token 仅由鉴权层写入 data/plugin_data，WebUI 不暴露
-  这两个字段；旧配置中残留的令牌键仍会被读取，以兼容已有安装。
+登录凭据、拥有者 UID、订阅和输出模板已经迁出插件配置，分别由
+AccountStore / SubscriptionStore / OutputStore 管理。本模块只保留连接、
+调度和推送相关的技术参数。
 """
 
 from __future__ import annotations
@@ -29,17 +23,13 @@ from .constants import (
     MIN_CHART_HISTORY_POINTS,
     MIN_GROUP_PUSH_INTERVAL,
     MIN_POLL_INTERVAL,
-    ONLY_CHANGE_INTERVAL,
     PUSH_BATCH_SECONDS,
     PUSH_MODES,
     PUSH_ON_CHANGE,
     REFRESH_ALWAYS,
-    REFRESH_MODES,
     REFRESH_ONLY_CHANGE,
 )
-from .models import Subscription
-from .payload import validate_payload
-from .resolver import clean_text, extract_reference, prettify_market_name
+from .resolver import clean_text
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -77,301 +67,67 @@ def _as_str(value: Any, default: str = "") -> str:
     return text or default
 
 
-def _as_str_list(value: Any) -> list[str]:
-    """把 list / 逗号分隔字符串 / 单个字符串统一成去重的字符串列表。"""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        parts = value.replace("\n", ",").split(",")
-    elif isinstance(value, list | tuple | set):
-        parts = list(value)
-    else:
-        return []
-    result: list[str] = []
-    for part in parts:
-        text = clean_text(str(part))
-        if text and text not in result:
-            result.append(text)
-    return result
-
-
-def _clamp_interval(value: Any, default: int = DEFAULT_POLL_INTERVAL) -> int:
-    """把单条订阅的刷新间隔夹到合法区间（秒）。"""
-    return max(MIN_POLL_INTERVAL, min(MAX_POLL_INTERVAL, _as_int(value, default)))
-
-
 class PluginConfig:
-    """强类型插件配置。"""
+    """强类型插件技术配置。"""
 
     def __init__(self, raw: dict | None) -> None:
         self.raw: dict = dict(raw or {})
 
-        # ---------- 账号与登录（全部在 WebUI 完成） ----------
-        self.account_email: str = _as_str(self.raw.get("account_email"))
-        self.account_password: str = str(self.raw.get("account_password") or "")
-        #: 用户在配置界面粘贴的验证码；插件检测到变化后会尝试提交（用完即清空）
-        self.twofa_code: str = clean_text(str(self.raw.get("twofa_code") or ""))
-
-        # ---------- 令牌 ----------
+        # 令牌字段仅用于兼容 2.18.x 以前遗留在配置里的旧安装。
         self.jwt_token: str = _as_str(self.raw.get("jwt_token"))
         self.refresh_token: str = _as_str(self.raw.get("refresh_token"))
 
-        # ---------- 接口 ----------
         self.appid: str = _as_str(self.raw.get("appid"), DEFAULT_APPID)
         self.language: str = _as_str(self.raw.get("language"), DEFAULT_LANGUAGE)
         self.request_timeout: float = max(3.0, _as_float(self.raw.get("request_timeout"), DEFAULT_TIMEOUT))
         self.request_retries: int = max(0, _as_int(self.raw.get("request_retries"), DEFAULT_RETRIES))
         self.item_interval: float = max(0.0, _as_float(self.raw.get("item_interval"), 0.4))
 
-        # ---------- 监控行为 ----------
-        # 刷新间隔不再全局配置，而是跟着每条订阅走（见 interval_of）。
         push_mode = _as_str(self.raw.get("push_mode"), PUSH_ON_CHANGE)
         self.push_mode: str = push_mode if push_mode in PUSH_MODES else PUSH_ON_CHANGE
         self.default_refresh_mode: str = REFRESH_ALWAYS if self.push_mode == REFRESH_ALWAYS else REFRESH_ONLY_CHANGE
-
-        # ---------- 身份与路由 ----------
-        # 拥有者（管理员）：按 **UID** 判定，/gjma login 与管理员指令都用它。
-        # 同一真人在不同平台 / 会话下 UID 稳定，所以只需要填 UID。
-        self.owner_uids: list[str] = _as_str_list(self.raw.get("owner_uids"))
-        #: 推送时是否 @ 订阅者（群聊场景必需；QQ 官方会自动走文本内嵌标记）
         self.mention_users: bool = _as_bool(self.raw.get("mention_users"), True)
 
-        # ---------- 输出模板（payload） ----------
-        #: 用 $字段 占位，渲染成 JSON 当作推送正文；留空 = 保持默认可读文本
-        self.payload: str = str(self.raw.get("payload") or "")
-
-        # ---------- 推送合并 ----------
-        #: 同一时间窗内多件物品的变化合并成一条消息（0 = 每件单独发）
         self.push_batch_seconds: int = max(0, min(120, _as_int(self.raw.get("push_batch_seconds"), PUSH_BATCH_SECONDS)))
         self.group_push_interval: int = max(
             MIN_GROUP_PUSH_INTERVAL,
-            min(
-                MAX_GROUP_PUSH_INTERVAL,
-                _as_int(self.raw.get("group_push_interval"), DEFAULT_GROUP_PUSH_INTERVAL),
-            ),
+            min(MAX_GROUP_PUSH_INTERVAL, _as_int(self.raw.get("group_push_interval"), DEFAULT_GROUP_PUSH_INTERVAL)),
         )
         self.chart_history_points: int = max(
             MIN_CHART_HISTORY_POINTS,
-            min(
-                MAX_CHART_HISTORY_POINTS,
-                _as_int(self.raw.get("chart_history_points"), DEFAULT_CHART_HISTORY_POINTS),
-            ),
+            min(MAX_CHART_HISTORY_POINTS, _as_int(self.raw.get("chart_history_points"), DEFAULT_CHART_HISTORY_POINTS)),
+        )
+        self.default_interval: int = max(
+            MIN_POLL_INTERVAL,
+            min(MAX_POLL_INTERVAL, _as_int(self.raw.get("poll_interval"), DEFAULT_POLL_INTERVAL)),
         )
 
-        # ---------- 用户订阅（每用户每物品一条） ----------
-        #: 解析订阅时若没写 interval，沿用旧的全局 poll_interval（兼容），再退回默认值
-        self._default_interval: int = _clamp_interval(self.raw.get("poll_interval"), DEFAULT_POLL_INTERVAL)
-        self.subscriptions: list[Subscription] = self._parse_subscriptions(self.raw.get("user_subscriptions"))
-
-    # ------------------------------------------------------------------ 解析
-
-    def _parse_subscriptions(self, value: Any) -> list[Subscription]:
-        """解析用户订阅。
-
-        支持两种结构：
-        ① **每用户一组**（当前结构）：`{uid, interval, enabled, items: [链接, ...]}`
-           —— 同一个用户只出现一次，物品是链接列表，刷新间隔挂在用户上；
-        ② 旧结构：一条一个物品（`{uid, item_url, interval, ...}`），仍然兼容。
-        """
-        subs: dict[tuple[str, str], Subscription] = {}
-        for entry in self._entries(value):
-            for sub in self._parse_entry(entry):
-                subs[sub.key] = sub
-        return list(subs.values())
-
-    @staticmethod
-    def _entries(value: Any) -> list[Any]:
-        if isinstance(value, dict):
-            value = list(value.values())
-        return list(value) if isinstance(value, list | tuple) else []
-
-    def _parse_entry(self, entry: Any) -> list[Subscription]:
-        """把一条配置（用户组，或旧的单物品条）解析成若干 Subscription。"""
-        if not isinstance(entry, dict):
-            return []
-        uid = _as_str(entry.get("uid"))
-        if not uid:
-            return []
-
-        # 门限配置项已移除：这里一律 0（不启用阈值），旧配置里的残留值不再生效。
-        # 注意：`note` 是用户备注，**不能**当作物品显示名（否则 /gjma my 会把物品名显示成备注）。
-        shared = {
-            "display_name": _as_str(entry.get("name")),
-            "sell_below": 0.0,
-            "buy_above": 0.0,
-            "enabled": _as_bool(entry.get("enabled"), True),
-            "interval": _clamp_interval(entry.get("interval"), self._default_interval),
-            "mode": self._refresh_mode(entry.get("mode"), self.default_refresh_mode),
-            "target_umo": _as_str(entry.get("target") or entry.get("target_umo")),
-        }
-
-        out: list[Subscription] = []
-        items = entry.get("items")
-        if isinstance(items, dict):
-            items = list(items.values())
-        for item in items if isinstance(items, list | tuple) else []:
-            if isinstance(item, dict):  # 也容忍 [{item_url, sell_below, buy_above}]
-                _, market_name = extract_reference(
-                    str(item.get("item_url") or item.get("url") or item.get("item") or "")
-                )
-                if not market_name:
-                    continue
-                out.append(
-                    Subscription(
-                        uid=uid,
-                        market_name=market_name,
-                        display_name=_as_str(item.get("name")) or shared["display_name"],
-                        enabled=_as_bool(item.get("enabled"), shared["enabled"]),
-                        interval=_clamp_interval(item.get("interval"), shared["interval"]),
-                        mode=self._refresh_mode(item.get("mode"), shared["mode"]),
-                        target_umo=shared["target_umo"],
-                    )
-                )
-                continue
-            _, market_name = extract_reference(str(item))
-            if market_name:
-                out.append(Subscription(uid=uid, market_name=market_name, **shared))
-
-        # 兼容旧结构：物品链接直接写在这一条上
-        raw_ref = entry.get("item_url") or entry.get("url") or entry.get("item") or ""
-        if not out and raw_ref:
-            _, market_name = extract_reference(str(raw_ref))
-            if market_name:
-                out.append(Subscription(uid=uid, market_name=market_name, **shared))
-        return out
-
-    @staticmethod
-    def _refresh_mode(value: Any, default: str) -> str:
-        mode = _as_str(value, default).lower()
-        return mode if mode in REFRESH_MODES else default
-
-    # ------------------------------------------------------------------ 校验
-
-    def validate(self) -> list[str]:
-        """返回面向用户的配置提示（不抛异常，尽力运行）。"""
+    def validate(self, *, subscriptions=None, owner_uids=None, output=None) -> list[str]:
+        """返回面向用户的启动提示（不抛异常）。"""
         hints: list[str] = []
-        short = sorted({s.interval for s in self.enabled_subscriptions if s.interval < 10})
-        if short:
-            hints.append(
-                "以下订阅的刷新间隔较短：" + "、".join(f"{v} 秒" for v in short) + "，可能触发站点风控，建议 ≥ 10 秒。"
-            )
-
-        has_token = bool(self.jwt_token or self.refresh_token)
-        has_account = bool(self.account_email and self.account_password)
-        if not has_token and not has_account:
-            hints.append("尚未配置登录凭据：请在 WebUI 填写账号密码，然后在聊天中发送 /gjma login。")
-        if self.account_email and not self.account_password:
-            hints.append("已填账号邮箱但未填密码，无法自动登录。")
-
-        watched = self.watched_market_names
-        if not watched:
-            hints.append(
-                "当前没有被监控/订阅的物品：可在聊天里发送 /gjma sub <物品链接>，或在配置里填写 user_subscriptions。"
-            )
-        if not self.owner_uids:
-            hints.append("未配置拥有者 UID：/gjma login 会回退管理员判定，但自动交易将持续禁用。")
-        if not self.subscriptions:
-            hints.append("当前没有任何用户订阅，推送将无处可去（可用 /gjma sub <物品链接> 添加）。")
-        if self.payload.strip():
-            ok, note = validate_payload(self.payload)
-            if not ok:
-                hints.append(f"payload 模板不可用（{note}），推送会退回可读文本。")
-            elif note.startswith("可用，但含未知字段"):
-                hints.append(f"payload 模板：{note}")
+        if subscriptions is not None:
+            short = sorted({sub.interval for sub in subscriptions.enabled_subscriptions if sub.interval < 10})
+            if short:
+                hints.append(
+                    "以下订阅的刷新间隔较短："
+                    + "、".join(f"{value} 秒" for value in short)
+                    + "，可能触发站点风控，建议 ≥ 10 秒。"
+                )
+            if not subscriptions.watched_market_names:
+                hints.append("当前没有行情订阅：可在插件控制台或聊天中订阅物品。")
+        if not (self.jwt_token or self.refresh_token):
+            hints.append("尚未配置登录令牌：请在插件控制台完成账号登录。")
+        if owner_uids is not None and not owner_uids:
+            hints.append("未配置拥有者 UID：聊天登录可回退管理员判定，但自动交易会持续禁用。")
+        if output is not None:
+            for label, template, kind in (
+                ("行情", output.quote_payload, "quote"),
+                ("交易", output.trade_payload, "trade"),
+            ):
+                ok, note = output.validate(template, kind)
+                if not ok:
+                    hints.append(f"{label}输出模板不可用（{note}），将退回可读文本。")
         return hints
 
-    # ------------------------------------------------------------------ 间隔
-
-    def interval_of(self, market_name: str) -> int:
-        """某件物品的实际抓取间隔。
-
-        ``always`` 使用用户配置的 interval；``only_change`` 固定 5 秒。
-        多人订阅时取所有策略中的最小值。
-        """
-        values = [
-            ONLY_CHANGE_INTERVAL if s.mode == REFRESH_ONLY_CHANGE else s.interval
-            for s in self.enabled_subscriptions
-            if s.market_name == market_name
-        ]
-        return min(values) if values else DEFAULT_POLL_INTERVAL
-
-    @property
-    def intervals(self) -> dict[str, int]:
-        """物品 -> 实际间隔。"""
-        return {name: self.interval_of(name) for name in self.watched_market_names}
-
-    @property
-    def min_interval(self) -> int:
-        values = list(self.intervals.values())
-        return min(values) if values else DEFAULT_POLL_INTERVAL
-
-    # ------------------------------------------------------------------ 便捷
-
-    @property
-    def enabled_subscriptions(self) -> list[Subscription]:
-        return [s for s in self.subscriptions if s.enabled]
-
-    @property
-    def watched_market_names(self) -> list[str]:
-        """全局监控清单与用户订阅的并集（去重）—— 轮询只按这份清单走。"""
-        names: list[str] = []
-        for sub in self.enabled_subscriptions:
-            if sub.market_name not in names:
-                names.append(sub.market_name)
-        return names
-
-    def subscriptions_of(self, uid: str, market_name: str = "", target_umo: str | None = None) -> list[Subscription]:
-        """查某个 UID 的订阅，可按会话和物品过滤。"""
-        result = [s for s in self.subscriptions if s.uid == uid and (target_umo is None or s.target_umo == target_umo)]
-        if market_name:
-            result = [s for s in result if s.market_name == market_name]
-        return result
-
-    def subscribers_of(self, market_name: str, target_umo: str | None = None) -> list[Subscription]:
-        """查订阅了某物品的所有用户。"""
-        return [
-            s
-            for s in self.enabled_subscriptions
-            if s.market_name == market_name and (target_umo is None or s.target_umo == target_umo)
-        ]
-
-    def hydrate_subscription_targets(self, resolver) -> int:
-        """给旧版没有 target_umo 的订阅补上最近已知会话。"""
-        hydrated: list[Subscription] = []
-        changed = 0
-        for sub in self.subscriptions:
-            target = sub.target_umo
-            if not target:
-                target = str(resolver(sub.uid) or "")
-            if target != sub.target_umo:
-                sub = Subscription(
-                    uid=sub.uid,
-                    market_name=sub.market_name,
-                    display_name=sub.display_name,
-                    sell_below=sub.sell_below,
-                    buy_above=sub.buy_above,
-                    enabled=sub.enabled,
-                    interval=sub.interval,
-                    mode=sub.mode,
-                    target_umo=target,
-                )
-                changed += 1
-            hydrated.append(sub)
-        self.subscriptions = hydrated
-        return changed
-
-    def display_name_of(self, market_name: str) -> str:
-        """物品显示名。
-
-        ① 先用订阅里的别名（旧配置的 `name`）；
-        ② 没有就用 slug 推导出的可读名（`id50381_f_16xl_usa` -> `F 16Xl Usa`）——
-           以前这个由配置里的 name 提供，改成"每用户一条"后就没有逐物品名字了。
-        """
-        for sub in self.subscriptions:
-            if sub.market_name == market_name and sub.display_name:
-                return sub.display_name
-        return prettify_market_name(market_name)
-
     def reload(self, raw: dict | None) -> None:
-        """热重载：用新配置覆盖当前实例的全部字段。"""
-        self.__init__(raw)  # type: ignore[misc]
+        self.__init__(raw)

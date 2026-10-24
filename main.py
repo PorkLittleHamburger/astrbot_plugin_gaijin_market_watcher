@@ -1,13 +1,12 @@
 """AstrBot 插件：Gaijin 市场自动交易（独立版）。
 
 核心能力：
-  * 按配置的间隔轮询 trade.gaijin.net 上一件或多件物品的
+  * 按订阅间隔轮询 trade.gaijin.net 上一件或多件物品的
     「实时最低售价 / 实时最高求购价 / 挂单量」；
-  * **登录通过聊天指令完成**：发送 /gjma login 发起登录，再用
-    /gjma login <验证码> 提交两步验证码；
-  * 订阅按 **UID**（人）区分：群聊里 UMO 相同但每个人 UID 不同，
-    推送时会 @ 到订阅者本人；
-  * 订阅物品只接受**物品页链接**。
+  * 插件视图统一管理账户登录、拥有者 UID、行情订阅和双输出模板；
+  * 聊天登录与 /gjma 订阅命令保留为备用入口；
+  * 订阅按 UID + 会话区分，群聊推送时会 @ 到订阅者本人；
+  * 订阅物品只接受物品页链接。
 
 本文件只负责「装配 + 指令层」，业务逻辑全部在 core/ 下按职责拆分：
     core/constants.py      接口契约（端点 / action / 价格刻度 / 错误码）
@@ -43,6 +42,7 @@ except ImportError:  # 兼容尚未提供插件 Web API 的旧版 AstrBot；聊�
 
 try:  # 常规：AstrBot 以包的形式加载插件
     from .core import platforms
+    from .core.account_store import AccountStore
     from .core.api_client import AuthExpiredError, GaijinMarketClient
     from .core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from .core.config import PluginConfig
@@ -50,9 +50,10 @@ try:  # 常规：AstrBot 以包的形式加载插件
     from .core.constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
     from .core.models import Subscription
     from .core.notifier import Notifier
+    from .core.output_store import DEFAULT_QUOTE_PAYLOAD, DEFAULT_TRADE_PAYLOAD, OutputStore
     from .core.resolver import extract_link_reference, prettify_market_name
     from .core.storage import PluginStorage
-    from .core.subscriptions import REJECT_HINT, SubscriptionStore
+    from .core.subscriptions import REJECT_HINT, SubscriptionStore, parse_legacy_subscriptions
     from .core.trader import AutoTrader, TradeError
     from .core.watcher import MarketWatcher
 except ImportError:  # 兜底：以文件路径方式加载时
@@ -62,6 +63,7 @@ except ImportError:  # 兜底：以文件路径方式加载时
         sys.path.append(str(Path(__file__).resolve().parent))
 
     from core import platforms
+    from core.account_store import AccountStore
     from core.api_client import AuthExpiredError, GaijinMarketClient
     from core.auth import AuthManager, LoginError, LoginRequiredError, describe_jwt
     from core.config import PluginConfig
@@ -69,9 +71,10 @@ except ImportError:  # 兜底：以文件路径方式加载时
     from core.constants import MIN_POLL_INTERVAL, ONLY_CHANGE_INTERVAL, REFRESH_ONLY_CHANGE
     from core.models import Subscription
     from core.notifier import Notifier
+    from core.output_store import DEFAULT_QUOTE_PAYLOAD, DEFAULT_TRADE_PAYLOAD, OutputStore
     from core.resolver import extract_link_reference, prettify_market_name
     from core.storage import PluginStorage
-    from core.subscriptions import REJECT_HINT, SubscriptionStore
+    from core.subscriptions import REJECT_HINT, SubscriptionStore, parse_legacy_subscriptions
     from core.trader import AutoTrader, TradeError
     from core.watcher import MarketWatcher
 
@@ -97,11 +100,10 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
     PLUGIN_NAME,
     "porklittlehamburger",
     (
-        "独立版 Gaijin Market 自动交易插件，使用 /gjma 指令命名空间；"
-        "发送 /gjma login 登录；按 UID 区分订阅者并在群聊里 @ 到本人；"
-        "拥有者可私聊或通过 WebUI 使用默认模拟的自动交易。"
+        "独立版 Gaijin Market 控制台插件，使用 /gjma 指令命名空间；"
+        "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.18.0",
+    "2.19.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -116,7 +118,54 @@ class GaijinMarketWatcher(Star):
         except Exception:  # 极端情况下回退
             self.data_dir = Path(__file__).resolve().parent / "data"
         self.storage = PluginStorage(self.data_dir, self.logger)
-        self._target_migration_pending = bool(self.cfg.hydrate_subscription_targets(self.storage.resolve_uid))
+
+        # ---------- 账户 / 输出 / 订阅：插件视图的权威数据源 ----------
+        migrating = self.storage.get_ui_schema_version() < 1
+        self.accounts = AccountStore(self.storage, self.logger)
+        self.output = OutputStore(self.storage, self.logger)
+        if migrating:
+            account_ok = self.accounts.migrate_legacy(dict(self.raw_config))
+            output_ok = self.output.migrate_legacy(dict(self.raw_config))
+        else:
+            account_ok = output_ok = True
+
+        subscription_raw = self.storage.load_aux_json("subscriptions.json", None)
+        subscription_migrated = isinstance(subscription_raw, list)
+        if subscription_migrated:
+            subscription_items = [Subscription.from_dict(item) for item in subscription_raw if isinstance(item, dict)]
+        else:
+            subscription_items = parse_legacy_subscriptions(
+                self.raw_config.get("user_subscriptions"),
+                default_interval=self.cfg.default_interval,
+                default_mode=self.cfg.default_refresh_mode,
+            )
+            subscription_migrated = self.storage.save_aux_json(
+                "subscriptions.json", [item.to_dict() for item in subscription_items]
+            )
+
+        legacy_data_present = bool(
+            self.raw_config.get("account_email")
+            or self.raw_config.get("account_password")
+            or self.raw_config.get("twofa_code")
+            or self.raw_config.get("owner_uids")
+            or self.raw_config.get("user_subscriptions")
+        )
+        self._legacy_config_pending = migrating or legacy_data_present
+        if migrating and account_ok and output_ok and subscription_migrated:
+            self.storage.set_ui_schema_version(1)
+
+        target_migration_pending = any(not sub.target_umo for sub in subscription_items)
+        self.subscriptions = SubscriptionStore(
+            self._persist_subscriptions_data,
+            self.logger,
+            resolve_target=self.storage.resolve_uid,
+            items=subscription_items,
+            default_interval=self.cfg.default_interval,
+            default_mode=self.cfg.default_refresh_mode,
+        )
+        self._target_migration_pending = target_migration_pending
+        if target_migration_pending:
+            self._persist_subscriptions_data(self.subscriptions.all())
 
         # ---------- 各层装配 ----------
         self.client = GaijinMarketClient(
@@ -126,21 +175,23 @@ class GaijinMarketWatcher(Star):
             min_interval=min(self.cfg.item_interval or 0.4, 1.0),
             logger=self.logger,
         )
-        self.auth = AuthManager(self.client, self.storage, self.cfg, self.logger)
+        self.auth = AuthManager(self.client, self.storage, self.cfg, self.logger, accounts=self.accounts)
         self.auth.bootstrap()
-
-        self.subscriptions = SubscriptionStore(
+        self.notifier = Notifier(
+            self.context,
+            self.storage,
             self.cfg,
-            self._persist_subscriptions,
             self.logger,
-            resolve_target=self.storage.resolve_uid,
+            subscriptions=self.subscriptions,
+            output=self.output,
+            accounts=self.accounts,
         )
-        self.notifier = Notifier(self.context, self.storage, self.cfg, self.logger)
         self.trader = AutoTrader(
             client=self.client,
             auth=self.auth,
             storage=self.storage,
             config=self.cfg,
+            accounts=self.accounts,
             notifier=self.notifier,
             logger=self.logger,
             on_watch_change=self._trade_watch_changed,
@@ -150,6 +201,7 @@ class GaijinMarketWatcher(Star):
             auth=self.auth,
             storage=self.storage,
             config=self.cfg,
+            subscriptions=self.subscriptions,
             notifier=self.notifier,
             logger=self.logger,
             on_auth_failure=self._notify_auth_failure,
@@ -157,13 +209,11 @@ class GaijinMarketWatcher(Star):
             extra_interval=self.trader.poll_interval,
             on_quotes=self.trader.on_quotes,
         )
-        self._register_trade_web_apis()
+        self._register_web_apis()
 
         # ---------- 配置热监听 ----------
         self._config_path = self._resolve_config_path()
         self._config_watcher = ConfigFileWatcher(self._config_path, self._on_config_changed, self.logger)
-        #: 已消费过的验证码，避免同一串被反复提交
-        self._consumed_code = self.cfg.twofa_code
 
         self._started = False
         self._auth_notice_at = 0.0
@@ -185,22 +235,20 @@ class GaijinMarketWatcher(Star):
             return
         self._started = True
 
-        for hint in self.cfg.validate():
+        for hint in self.cfg.validate(
+            subscriptions=self.subscriptions,
+            owner_uids=self.accounts.owner_uids,
+            output=self.output,
+        ):
             self.logger.info(f"[GJM] {hint}")
 
         if self._target_migration_pending:
-            try:
-                self._persist_subscriptions(self.subscriptions.all())
-                self._target_migration_pending = False
-                self.logger.info("[GJM] 已把旧订阅迁移到各自最近会话。")
-            except Exception as exc:
-                self.logger.warning(f"[GJM] 持久化旧订阅会话失败: {exc}")
+            self.logger.info("[GJM] 已把缺少会话目标的订阅补齐到各自最近会话。")
 
+        self._cleanup_legacy_config()
         self._config_watcher.start()
         self.trader.start()
         self.watcher.start()
-        # 启动时补一次：可能用户已经先填好账号/验证码再重载插件
-        await self._consume_config_code()
 
     async def terminate(self) -> None:
         """插件停用 / 卸载时调用：务必释放后台任务与连接。"""
@@ -248,33 +296,22 @@ class GaijinMarketWatcher(Star):
         return candidates[0]
 
     async def _on_config_changed(self, data: dict) -> None:
-        """配置文件发生变化：热更新到各层，并处理"配置里填的验证码"。"""
+        """配置文件发生变化：热更新技术参数。"""
         self._apply_config(data)
         self.logger.info("[GJM] 检测到配置变更，已热更新。")
-        await self._consume_config_code()
 
     def _apply_config(self, data: dict) -> None:
-        """把新配置应用到内存中的各层。"""
+        """把新配置应用到内存中的技术层。"""
         self.cfg.reload(data)
-        self._target_migration_pending = bool(
-            self.cfg.hydrate_subscription_targets(self.storage.resolve_uid)
-        ) or getattr(self, "_target_migration_pending", False)
-        # 订阅层持有自己的权威列表，配置变了要同步过去
-        self.subscriptions.reload(self.cfg.subscriptions)
-        # 让网络层跟随配置变化（语言 / 超时 / 重试）
         self.client.language = self.cfg.language
         self.client.timeout = self.cfg.request_timeout
         self.client.retries = self.cfg.request_retries
         if self.auth.sync_config_tokens():
             self.watcher.reset_auth_backoff()
-        # 各层持有的是同一个 cfg / storage 对象引用，无需重新注入
         self.watcher.reconfigure()
 
     def _save_config(self, mutate=None) -> bool:
-        """把改动写回 AstrBot 配置，成功后热重载本插件的强类型配置。
-
-        保存失败时必须让调用方知道，不能继续报告操作成功。
-        """
+        """把改动写回 AstrBot 配置，成功后热重载技术配置。"""
         save = getattr(self.raw_config, "save_config", None)
         if not callable(save):
             self.logger.error("[GJM] 当前配置对象不支持 save_config，改动未保存。")
@@ -286,7 +323,6 @@ class GaijinMarketWatcher(Star):
         try:
             save()
         except Exception as exc:
-            # 回滚内存中的原始配置，避免命令失败后留下“看似已保存”的脏状态。
             with contextlib.suppress(Exception):
                 self.raw_config.clear()
                 self.raw_config.update(snapshot)
@@ -295,76 +331,40 @@ class GaijinMarketWatcher(Star):
 
         data = dict(self.raw_config)
         self._apply_config(data)
-        # 告诉监听器"这份内容是我们自己写的"，避免下一轮自我触发
         self._config_watcher.mark_applied(data)
         return True
 
-    def _persist_subscriptions(self, subs: list[Subscription]) -> None:
-        """订阅列表落盘：写成 template_list 结构，WebUI 配置页里可直接查看/修改。"""
-        # 同一个 UID 折叠成一条；物品分别保存链接和刷新间隔。
-        grouped: dict[tuple[str, str], dict] = {}
-        for sub in subs:
-            entry = grouped.setdefault(
-                (sub.target_umo, sub.uid),
-                {
-                    "__template_key": "user_entry",
-                    "enabled": sub.enabled,
-                    "uid": sub.uid,
-                    "target": sub.target_umo,
-                    "note": self.storage.get_user_name(sub.uid) or sub.display_name,
-                    "interval": sub.interval,
-                    "mode": sub.mode,
-                    "items": [],
-                },
-            )
-            # 同组里以“任一启用即为启用”为准。
-            entry["enabled"] = entry["enabled"] or sub.enabled
-            url = f"https://trade.gaijin.net/market/{self.cfg.appid}/{sub.market_name}"
-            if not any(item.get("url") == url for item in entry["items"]):
-                entry["items"].append(
-                    {
-                        "__template_key": "item_entry",
-                        "url": url,
-                        "interval": int(sub.interval),
-                    }
-                )
-        self._save_config(lambda raw: raw.__setitem__("user_subscriptions", list(grouped.values())))
+    def _cleanup_legacy_config(self) -> None:
+        """迁移完成后从原生配置中移除敏感项和已迁出的界面字段。"""
+        if not getattr(self, "_legacy_config_pending", False):
+            return
+        legacy_keys = (
+            "account_email",
+            "account_password",
+            "twofa_code",
+            "owner_uids",
+            "user_subscriptions",
+            "payload",
+        )
+        if not any(key in self.raw_config for key in legacy_keys):
+            self._legacy_config_pending = False
+            return
+        try:
+            self._save_config(lambda raw: [raw.pop(key, None) for key in legacy_keys])
+        except Exception as exc:
+            self.logger.warning(f"[GJM] 清理旧配置字段失败，下次启动将继续尝试: {exc}")
+            return
+        self._legacy_config_pending = False
 
-    def save_twofa_code(self, code: str) -> None:
-        """写回验证码字段（提交后清空，避免验证码长期留痕）。"""
-        with contextlib.suppress(Exception):
-            self._save_config(lambda raw: raw.__setitem__("twofa_code", code))
+    def _persist_subscriptions_data(self, subs: list[Subscription]) -> bool:
+        """订阅数据原子写入插件数据目录。"""
+        return self.storage.save_aux_json("subscriptions.json", [sub.to_dict() for sub in subs])
 
     def on_login_success(self) -> None:
         """登录成功后的统一收尾。"""
         self.logger.info("[GJM] 登录成功，令牌已更新。")
         self.watcher.reset_auth_backoff()
         self.watcher.wake()
-
-    async def _consume_config_code(self) -> None:
-        """如果配置界面里填了验证码且确实有等待中的登录，就自动提交。
-
-        这是"在配置界面里填验证码"这条路径的落点：
-        用户在插件配置表单里填好验证码 -> 保存 -> 配置热监听发现变化 -> 自动提交。
-        """
-        code = str(self.cfg.twofa_code or "").strip()
-        if not code or code == self._consumed_code:
-            return
-        if not self.auth.has_pending_login:
-            self.logger.info("[GJM] 配置里填了验证码，但当前没有等待中的登录流程，已忽略。")
-            return
-
-        self._consumed_code = code
-        try:
-            step = await self.auth.submit_code(code)
-        except Exception as exc:
-            self.logger.warning(f"[GJM] 自动提交配置界面里的验证码失败: {exc}")
-        else:
-            self.logger.info(f"[GJM] 配置界面验证码提交成功：{step.message}")
-            self.on_login_success()
-        finally:
-            # 用完即清，避免验证码长期留在配置文件里
-            self.save_twofa_code("")
 
     # ================================================================= 身份
 
@@ -418,7 +418,7 @@ class GaijinMarketWatcher(Star):
             return owners
         # 未配置拥有者 UID 时，保留向已知订阅会话兜底通知的行为。
         fallback: list[str] = []
-        for sub in self.cfg.enabled_subscriptions:
+        for sub in self.subscriptions.all():
             umo = self.notifier.session_of(sub.uid)
             if umo and umo not in fallback:
                 fallback.append(umo)
@@ -446,12 +446,22 @@ class GaijinMarketWatcher(Star):
 
     # ================================================================= 交易 WebUI
 
-    def _register_trade_web_apis(self) -> None:
+    def _register_web_apis(self) -> None:
         register_api = getattr(self.context, "register_web_api", None)
         if not callable(register_api):
-            self.logger.warning("[GJM] 当前 AstrBot 不支持插件 Web API，交易页不可用。")
+            self.logger.warning("[GJM] 当前 AstrBot 不支持插件 Web API，控制台不可用。")
             return
         routes = [
+            ("account/overview", self._account_web_overview, ["GET"]),
+            ("account/save", self._account_web_save, ["POST"]),
+            ("account/login/start", self._account_web_login_start, ["POST"]),
+            ("account/login/code", self._account_web_login_code, ["POST"]),
+            ("monitor/overview", self._monitor_web_overview, ["GET"]),
+            ("monitor/subscriptions/save", self._monitor_web_save, ["POST"]),
+            ("monitor/subscriptions/delete", self._monitor_web_delete, ["POST"]),
+            ("output/overview", self._output_web_overview, ["GET"]),
+            ("output/save", self._output_web_save, ["POST"]),
+            ("output/preview", self._output_web_preview, ["POST"]),
             ("trade/overview", self._trade_web_overview, ["GET"]),
             ("trade/settings", self._trade_web_settings, ["POST"]),
             ("trade/rules/save", self._trade_web_save_rule, ["POST"]),
@@ -464,8 +474,227 @@ class GaijinMarketWatcher(Star):
                 f"/{PLUGIN_NAME}/{path}",
                 handler,
                 methods,
-                f"Gaijin market watcher: {path}",
+                f"Gaijin market console: {path}",
             )
+
+    def _account_overview_data(self) -> dict:
+        auth = self.auth.status()
+        return {
+            "account": self.accounts.sanitized(),
+            "auth": {
+                "has_jwt": bool(auth.get("has_jwt")),
+                "has_refresh_token": bool(auth.get("has_refresh_token")),
+                "has_account": bool(auth.get("has_account")),
+                "nick": auth.get("nick") or "",
+                "uid": auth.get("uid") or "",
+                "seconds_left": int(auth.get("seconds_left") or 0),
+                "last_error": auth.get("last_error") or "",
+                "pending_login": bool(auth.get("pending_login")),
+                "pending_age": int(auth.get("pending_age") or 0),
+            },
+        }
+
+    async def _account_web_overview(self):
+        return json_response(self._account_overview_data())
+
+    async def _account_web_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        email = payload.get("email", self.accounts.email)
+        password = payload.get("password")
+        owner_uids = payload.get("owner_uids", self.accounts.owner_uids)
+        if not isinstance(email, str):
+            return error_response("账号邮箱格式不正确", status_code=400)
+        if password is not None and not isinstance(password, str):
+            return error_response("账号密码格式不正确", status_code=400)
+        if not isinstance(owner_uids, list | tuple):
+            return error_response("owner_uids 必须是数组", status_code=400)
+        try:
+            saved = self.accounts.save(email=email, password=password, owner_uids=owner_uids)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if not saved:
+            return error_response("保存账号设置失败，请检查插件数据目录权限", status_code=500)
+        self.logger.info(
+            f"[GJM] WebUI 账号设置修改者: {self._trade_web_actor()}；拥有者 UID 数量: {len(self.accounts.owner_uids)}"
+        )
+        return json_response(self._account_overview_data())
+
+    async def _account_web_login_start(self):
+        try:
+            message = await self._begin_login()
+        except Exception as exc:
+            self.logger.warning(f"[GJM] WebUI 发起登录失败: {exc}")
+            return error_response(str(exc), status_code=400)
+        self.logger.info(f"[GJM] WebUI 发起登录: {self._trade_web_actor()}")
+        data = self._account_overview_data()
+        data.update({"message": message, "need_code": self.auth.has_pending_login})
+        return json_response(data)
+
+    async def _account_web_login_code(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        code = str(payload.get("code") or "").strip()
+        if not code:
+            return error_response("验证码不能为空", status_code=400)
+        try:
+            message = await self._submit_login_code(code)
+        except Exception as exc:
+            self.logger.warning("[GJM] WebUI 提交验证码失败")
+            return error_response(str(exc), status_code=400)
+        self.logger.info(f"[GJM] WebUI 提交登录验证码: {self._trade_web_actor()}")
+        data = self._account_overview_data()
+        data.update({"message": message, "need_code": self.auth.has_pending_login})
+        return json_response(data)
+
+    def _monitor_overview_data(self) -> dict:
+        grouped: dict[tuple[str, str], dict] = {}
+        for sub in self.subscriptions.all():
+            key = (sub.target_umo, sub.uid)
+            group = grouped.setdefault(
+                key,
+                {
+                    "uid": sub.uid,
+                    "target_umo": sub.target_umo,
+                    "note": self.storage.get_user_name(sub.uid) or "",
+                    "enabled": False,
+                    "interval": sub.interval,
+                    "mode": sub.mode,
+                    "items": [],
+                },
+            )
+            group["enabled"] = bool(group["enabled"] or sub.enabled)
+            group["interval"] = min(int(group["interval"]), int(sub.interval))
+            if sub.mode == "only_change":
+                group["mode"] = "only_change"
+            group["items"].append(
+                {
+                    "market_name": sub.market_name,
+                    "display_name": sub.display_name,
+                    "enabled": bool(sub.enabled),
+                    "interval": int(sub.interval),
+                    "mode": sub.mode,
+                    "url": f"https://trade.gaijin.net/market/{self.cfg.appid}/{sub.market_name}",
+                }
+            )
+        sessions_raw = self.storage.load_aux_json("sessions.json", {})
+        sessions: list[dict] = []
+        if isinstance(sessions_raw, dict):
+            for uid, item in sessions_raw.items():
+                if not isinstance(item, dict) or not item.get("umo"):
+                    continue
+                sessions.append(
+                    {
+                        "uid": str(uid),
+                        "umo": str(item.get("umo") or ""),
+                        "platform": str(item.get("platform") or ""),
+                        "name": str(item.get("name") or ""),
+                        "updated_at": float(item.get("updated_at") or 0),
+                    }
+                )
+        sessions.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
+        return {
+            "groups": list(grouped.values()),
+            "sessions": sessions,
+            "watched_market_names": self.subscriptions.watched_market_names,
+            "defaults": {
+                "interval": self.cfg.default_interval,
+                "mode": self.cfg.default_refresh_mode,
+                "url_example": "https://trade.gaijin.net/market/1067/id50381_f_16xl_usa",
+            },
+        }
+
+    async def _monitor_web_overview(self):
+        return json_response(self._monitor_overview_data())
+
+    async def _monitor_web_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            ok, message = self.subscriptions.replace_group(
+                original_uid=str(payload.get("original_uid") or ""),
+                original_target=str(payload.get("original_target") or ""),
+                uid=str(payload.get("uid") or ""),
+                target_umo=str(payload.get("target_umo") or ""),
+                enabled=bool(payload.get("enabled", True)),
+                interval=int(payload.get("interval") or self.cfg.default_interval),
+                mode=str(payload.get("mode") or self.cfg.default_refresh_mode),
+                items=list(payload.get("items") or []),
+            )
+        except (TypeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        if not ok:
+            return error_response(message, status_code=400)
+        self.watcher.reconfigure()
+        self.logger.info(f"[GJM] WebUI 保存订阅: {self._trade_web_actor()}")
+        data = self._monitor_overview_data()
+        data["message"] = message
+        return json_response(data)
+
+    async def _monitor_web_delete(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        ok, message = self.subscriptions.delete_group(
+            str(payload.get("uid") or ""),
+            str(payload.get("target_umo") or ""),
+            str(payload.get("market_name") or ""),
+        )
+        if not ok:
+            return error_response(message, status_code=400)
+        self.watcher.reconfigure()
+        self.logger.info(f"[GJM] WebUI 删除订阅: {self._trade_web_actor()}")
+        data = self._monitor_overview_data()
+        data["message"] = message
+        return json_response(data)
+
+    def _output_overview_data(self) -> dict:
+        return {
+            "quote_payload": self.output.quote_payload,
+            "trade_payload": self.output.trade_payload,
+            "defaults": {
+                "quote_payload": DEFAULT_QUOTE_PAYLOAD,
+                "trade_payload": DEFAULT_TRADE_PAYLOAD,
+            },
+            "fields": self.output.fields(),
+        }
+
+    async def _output_web_overview(self):
+        return json_response(self._output_overview_data())
+
+    async def _output_web_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        quote_template = payload.get("quote_payload", self.output.quote_payload)
+        trade_template = payload.get("trade_payload", self.output.trade_payload)
+        if not isinstance(quote_template, str) or not isinstance(trade_template, str):
+            return error_response("输出模板必须是字符串", status_code=400)
+        try:
+            if not self.output.save(quote_payload=quote_template, trade_payload=trade_template):
+                return error_response("保存输出模板失败，请检查插件数据目录权限", status_code=500)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        self.logger.info(f"[GJM] WebUI 保存输出模板: {self._trade_web_actor()}")
+        data = self._output_overview_data()
+        data["message"] = "输出模板已保存"
+        return json_response(data)
+
+    async def _output_web_preview(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        kind = str(payload.get("kind") or "quote")
+        template = payload.get("template")
+        if not isinstance(template, str):
+            return error_response("template 必须是字符串", status_code=400)
+        try:
+            return json_response(self.output.preview(template, kind))
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
 
     @staticmethod
     def _trade_web_actor() -> str:
@@ -574,14 +803,15 @@ class GaijinMarketWatcher(Star):
         按 **UID** 判定（配置项 owner_uids）：同一真人在不同平台 / 不同会话下
         UID 稳定，比 UMO 更适合做身份标识。未配置时回退 AstrBot 管理员判定。
         """
-        if self.cfg.owner_uids:
-            return bool(self._uid_candidates(event) & set(self.cfg.owner_uids))
+        owner_uids = self.accounts.owner_uids
+        if owner_uids:
+            return bool(self._uid_candidates(event) & set(owner_uids))
         return bool(event.is_admin())
 
     def _trade_access_error(self, event: AstrMessageEvent) -> str:
         """交易指令严格要求：显式拥有者 UID + 私聊会话。"""
-        if not self.cfg.owner_uids:
-            return "自动交易已禁用：请先在配置中填写 owner_uids，不能回退到 AstrBot 管理员判定。"
+        if not self.accounts.owner_uids:
+            return "自动交易已禁用：请先在插件控制台的账户页填写拥有者 UID，不能回退到 AstrBot 管理员判定。"
         if platforms.session_type_of(event.unified_msg_origin or "") != platforms.SESSION_TYPE_FRIEND:
             return "自动交易指令仅允许在拥有者私聊中使用。"
         if not self._is_owner(event):
@@ -599,7 +829,7 @@ class GaijinMarketWatcher(Star):
             return
         self._auth_notice_at = time.time()
         await self.notifier.push(
-            f"Gaijin 令牌失效，监控已暂停。\n原因：{reason}\n请发送 /gjma login 重新登录。",
+            f"Gaijin 令牌失效，监控已暂停。\n原因：{reason}\n请发送 /gjma login 或在插件控制台账户页重新登录。",
             self._owner_notify_umos(),
         )
 
@@ -652,7 +882,7 @@ class GaijinMarketWatcher(Star):
         ok, message = self.subscriptions.subscribe(uid, url, target_umo)
         if ok:
             market_name = self.subscriptions.parse_url(url)
-            display_name = self.cfg.display_name_of(market_name) or prettify_market_name(market_name)
+            display_name = self.subscriptions.display_name_of(market_name) or prettify_market_name(market_name)
             if self.storage.set_item_name(market_name, display_name) is False:
                 self.logger.warning(f"[GJM] 物品名称缓存写入失败：{market_name}")
             self.watcher.reconfigure()
@@ -688,7 +918,7 @@ class GaijinMarketWatcher(Star):
             yield event.plain_result("用法：/gjma mysub")
             return
 
-        if self.cfg.watched_market_names:
+        if self.subscriptions.watched_market_names:
             await event.send(event.plain_result("正在刷新行情，请稍候…"))
             try:
                 await self.watcher.poll_once()
@@ -723,7 +953,7 @@ class GaijinMarketWatcher(Star):
 
     def _global_list_text(self) -> str:
         """渲染全局被监控物品列表，供 ``/gjma mysub`` 使用。"""
-        names = self.cfg.watched_market_names
+        names = self.subscriptions.watched_market_names
         if not names:
             return "没有被订阅的物品。用 /gjma sub <物品链接> 订阅。"
 
@@ -732,10 +962,10 @@ class GaijinMarketWatcher(Star):
             quote = self.storage.get_last_quote(market_name)
             title = (
                 self.storage.get_item_name(market_name)
-                or self.cfg.display_name_of(market_name)
+                or self.subscriptions.display_name_of(market_name)
                 or prettify_market_name(market_name)
             )
-            subs = self.cfg.subscribers_of(market_name)
+            subs = self.subscriptions.subscribers_of(market_name)
             lines.append(f"{index}. {title}（{len(subs)} 人订阅）")
             lines.append(f"   {self.item_url(market_name)}")
             if quote and quote.ok:
@@ -775,7 +1005,7 @@ class GaijinMarketWatcher(Star):
                 market_name,
                 token,
                 appid=self.cfg.appid,
-                display_name=self.cfg.display_name_of(market_name) or self.storage.get_item_name(market_name),
+                display_name=self.subscriptions.display_name_of(market_name) or self.storage.get_item_name(market_name),
             )
         except Exception as exc:
             yield event.plain_result(f"抓取行情失败：{exc}")
@@ -820,7 +1050,7 @@ class GaijinMarketWatcher(Star):
             lines.append("登录：等待验证码（发 /gjma login <验证码>）")
         if auth["last_error"]:
             lines.append(f"续期错误：{auth['last_error']}")
-        subs = self.cfg.enabled_subscriptions
+        subs = self.subscriptions.enabled_subscriptions
         uids = list(dict.fromkeys(s.uid for s in subs))
         lines.append("")
         lines.append(
@@ -1195,7 +1425,8 @@ class GaijinMarketWatcher(Star):
 
         if not self._is_owner(event):
             yield event.plain_result(
-                "仅拥有者可登录。请把你的 UID 填入配置的「拥有者 UID」。\n可发送 AstrBot 内置命令 /sid 查看。"
+                "仅拥有者可登录。请把你的 UID 填入插件控制台账户页的「拥有者 UID」。"
+                "\n可发送 AstrBot 内置命令 /sid 查看。"
             )
             return
 
@@ -1214,11 +1445,11 @@ class GaijinMarketWatcher(Star):
             self.watcher.wake()
             return "refresh_token 仍有效，已换新 JWT，无需登录。"
 
-        if not (self.cfg.account_email and self.cfg.account_password):
-            return "未配置账号邮箱 / 密码。请先在插件配置里填写后重试。"
+        if not (self.accounts.email and self.accounts.password):
+            return "未配置账号邮箱 / 密码。请先在插件控制台的账户页填写后重试。"
 
         try:
-            step = await self.auth.begin_login(self.cfg.account_email, self.cfg.account_password)
+            step = await self.auth.begin_login(self.accounts.email, self.accounts.password)
         except LoginError as exc:
             return f"登录失败：{exc}"
         except Exception as exc:
@@ -1268,14 +1499,13 @@ class GaijinMarketWatcher(Star):
             f"配置热监听运行：{self._config_watcher.running}\n"
             f"等待验证码：{'是' if pending else '否'}"
             + (f"（字段 {pending.code_field}，已等待 {int((auth['pending_age'] or 0) / 60)} 分钟）" if pending else "")
-            + f"\n配置里的验证码：{'已填' if self.cfg.twofa_code else '空'}\n"
-            f"账号邮箱：{self.cfg.account_email or '未填'}\n"
-            f"账号密码：{'已填' if self.cfg.account_password else '未填'}\n"
+            + f"\n账号邮箱：{self.accounts.email or '未填'}\n"
+            f"账号密码：{'已填' if self.accounts.password else '未填'}\n"
             f"JWT 账号：{describe_jwt(self.auth.jwt).get('nick') or '无'}\n"
             "\n【@ 适配】\n"
             f"本会话平台类型：{platform_type or '（未匹配到）'}（会话类型 {session_type or '未知'}）\n"
             f"mention_users：{self.cfg.mention_users}\n"
             f"将采用：{mention_note}\n"
-            f"拥有者 UID / 已识别会话：{self.cfg.owner_uids or '（未配置）'} / "
+            f"拥有者 UID / 已识别会话：{self.accounts.owner_uids or '（未配置）'} / "
             f"{len(self.notifier.owner_sessions())}" + "\n\n" + "\n".join(await self._platform_report())
         )

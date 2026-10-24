@@ -1,10 +1,10 @@
 name: astrbot_plugin_gaijin_market_autotrader
-display_name: Gaijin 市场自动交易（独立版）
-help: 发送 /gjma login 登录；发送 /gjma help 查看行情与拥有者自动交易指令。
-short_desc: 独立部署的 Gaijin 普通商品自动交易插件，含模拟盘、限额和 WebUI 控制台
+display_name: Gaijin Market 控制台（独立版）
+help: 打开插件控制台管理账户、订阅、输出模板与自动交易；聊天可发送 /gjma help。
+short_desc: 独立部署的 Gaijin Market 控制台，含订阅、账户、双输出模板和模拟/实盘自动交易
 desc: |
   独立部署的 Gaijin Market 自动交易插件，使用 /gjma 指令命名空间，可与原行情监控插件同时安装。
-  监控普通商品的最低售价、最高求购价与挂单量，支持拥有者私聊或 WebUI 管理自动交易。
+  监控普通商品的最低售价、最高求购价与挂单量；插件控制台统一管理账户登录、订阅、输出模板和自动交易。
 
   特性：
   - 会话级多用户订阅：同一用户可在不同群聊或私聊独立订阅
@@ -13,7 +13,7 @@ desc: |
   - 多平台适配：适配微信/qq平台
   - 自动交易：拥有者私聊或 WebUI 管理，默认模拟，二次确认后实盘
   - 交易安全：固定 15% 手续费、全局预算、每日限额、急停与订单对账
-version: 2.18.0
+version: 2.19.0
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.29.0,<5"
