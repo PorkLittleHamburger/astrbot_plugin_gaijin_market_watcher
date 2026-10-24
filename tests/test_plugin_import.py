@@ -115,6 +115,8 @@ class PluginImportTests(unittest.TestCase):
 
     def test_main_module_imports_with_astrbot_api_surface(self) -> None:
         self.assertTrue(hasattr(self.module, "GaijinMarketWatcher"))
+        self.assertEqual(self.module.PLUGIN_NAME, "astrbot_plugin_gaijin_market_autotrader")
+        self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjma"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "gjm_trade_add"))
         self.assertTrue(hasattr(self.module.GaijinMarketWatcher, "_trade_web_overview"))
 

@@ -130,7 +130,7 @@ class PluginConfig:
         self.default_refresh_mode: str = REFRESH_ALWAYS if self.push_mode == REFRESH_ALWAYS else REFRESH_ONLY_CHANGE
 
         # ---------- 身份与路由 ----------
-        # 拥有者（管理员）：按 **UID** 判定，/login 与管理员指令都用它。
+        # 拥有者（管理员）：按 **UID** 判定，/gjma login 与管理员指令都用它。
         # 同一真人在不同平台 / 会话下 UID 稳定，所以只需要填 UID。
         self.owner_uids: list[str] = _as_str_list(self.raw.get("owner_uids"))
         #: 推送时是否 @ 订阅者（群聊场景必需；QQ 官方会自动走文本内嵌标记）
@@ -194,7 +194,7 @@ class PluginConfig:
             return []
 
         # 门限配置项已移除：这里一律 0（不启用阈值），旧配置里的残留值不再生效。
-        # 注意：`note` 是用户备注，**不能**当作物品显示名（否则 /gjm my 会把物品名显示成备注）。
+        # 注意：`note` 是用户备注，**不能**当作物品显示名（否则 /gjma my 会把物品名显示成备注）。
         shared = {
             "display_name": _as_str(entry.get("name")),
             "sell_below": 0.0,
@@ -259,19 +259,19 @@ class PluginConfig:
         has_token = bool(self.jwt_token or self.refresh_token)
         has_account = bool(self.account_email and self.account_password)
         if not has_token and not has_account:
-            hints.append("尚未配置登录凭据：请在 WebUI 填写账号密码，然后在聊天中发送 /login。")
+            hints.append("尚未配置登录凭据：请在 WebUI 填写账号密码，然后在聊天中发送 /gjma login。")
         if self.account_email and not self.account_password:
             hints.append("已填账号邮箱但未填密码，无法自动登录。")
 
         watched = self.watched_market_names
         if not watched:
             hints.append(
-                "当前没有被监控/订阅的物品：可在聊天里发送 /gjm sub <物品链接>，或在配置里填写 user_subscriptions。"
+                "当前没有被监控/订阅的物品：可在聊天里发送 /gjma sub <物品链接>，或在配置里填写 user_subscriptions。"
             )
         if not self.owner_uids:
-            hints.append("未配置拥有者 UID：/login 会回退管理员判定，但自动交易将持续禁用。")
+            hints.append("未配置拥有者 UID：/gjma login 会回退管理员判定，但自动交易将持续禁用。")
         if not self.subscriptions:
-            hints.append("当前没有任何用户订阅，推送将无处可去（可用 /gjm sub <物品链接> 添加）。")
+            hints.append("当前没有任何用户订阅，推送将无处可去（可用 /gjma sub <物品链接> 添加）。")
         if self.payload.strip():
             ok, note = validate_payload(self.payload)
             if not ok:

@@ -47,7 +47,7 @@
 
 ## 数据文件
 
-位于 `data/plugin_data/astrbot_plugin_gaijin_market_watcher/`：
+位于 `data/plugin_data/astrbot_plugin_gaijin_market_autotrader/`：
 
 | 文件 | 内容 |
 | --- | --- |

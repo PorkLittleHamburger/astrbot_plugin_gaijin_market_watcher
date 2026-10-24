@@ -17,7 +17,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "平时用 /login <验证码> 提交；填这里保存也会自动提交并清空。"
+    "hint": "平时用 /gjma login <验证码> 提交；填这里保存也会自动提交并清空。"
   },
   "appid": {
     "description": "游戏 appid",
@@ -44,7 +44,7 @@
       "on_change",
       "always"
     ],
-    "hint": "旧配置默认值；新订阅建议使用 /gjm refresh mode 设置。"
+    "hint": "旧配置默认值；新订阅建议使用 /gjma refresh mode 设置。"
   },
   "mention_users": {
     "description": "推送时 @ 订阅者",
@@ -125,7 +125,7 @@
     "description": "拥有者 UID",
     "type": "list",
     "default": [],
-    "hint": "/login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空时登录可回退 AstrBot 管理员判定，但自动交易会直接禁用。"
+    "hint": "/gjma login 与管理员指令的身份依据，可发送 AstrBot 内置命令 /sid 查看；留空时登录可回退 AstrBot 管理员判定，但自动交易会直接禁用。"
   },
   "user_subscriptions": {
     "description": "用户订阅",

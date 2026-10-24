@@ -1,6 +1,9 @@
-# Gaijin 市场行情监控与自动交易
+# Gaijin 市场自动交易（独立版）
 
-监控 [Gaijin Market](https://trade.gaijin.net/market/sell) 上物品的**最低售价**、**最高求购价**与**挂单量**，
+这是独立部署的自动交易插件，使用新的插件 ID、独立数据目录和 `/gjma` 指令前缀，
+可与原 `astrbot_plugin_gaijin_market_watcher` 同时安装而不会互相覆盖。
+
+插件监控 [Gaijin Market](https://trade.gaijin.net/market/sell) 上物品的**最低售价**、**最高求购价**与**挂单量**，
 变化时推送到群聊或私聊，可 @ 到订阅者本人。
 
 ## 功能
@@ -30,7 +33,7 @@
 
 需要 AstrBot ≥ 4.26.0、Python ≥ 3.10（自动交易 WebUI 页面依赖插件可视化视图 API）。
 
-在 AstrBot 插件市场搜索Gaijin 市场行情监控，或通过以下仓库地址安装：
+通过 AstrBot WebUI 上传本插件的 ZIP 包安装。源码仓库：
 ```text
 https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 ```
@@ -46,8 +49,8 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 然后在聊天里：
 
 ```
-/login              发起登录
-/login <验证码>     提交两步验证码
+/gjma login              发起登录
+/gjma login <验证码>     提交两步验证码
 ```
 
 ### 3. 自动交易（仅拥有者私聊）
@@ -56,18 +59,18 @@ https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 新规则始终从模拟盘开始，必须先在 WebUI 设置总开关、总预算、每日限额、单笔上限和最大数量。
 
 ```
-/gjm trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>
-/gjm trade list
-/gjm trade show <规则ID>
-/gjm trade arm <规则ID>                 查看实盘风险摘要
-/gjm trade arm <规则ID> confirm         60 秒内二次确认切换实盘
-/gjm trade pause|resume|disarm <规则ID>
-/gjm trade cancel <规则ID>              撤销本插件为该规则创建的订单并暂停
-/gjm trade delete <规则ID>
-/gjm trade orders
-/gjm trade log [1-50]
-/gjm trade budget
-/gjm trade stop-all confirm             撤销全部自动订单并暂停所有规则
+/gjma trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>
+/gjma trade list
+/gjma trade show <规则ID>
+/gjma trade arm <规则ID>                 查看实盘风险摘要
+/gjma trade arm <规则ID> confirm         60 秒内二次确认切换实盘
+/gjma trade pause|resume|disarm <规则ID>
+/gjma trade cancel <规则ID>              撤销本插件为该规则创建的订单并暂停
+/gjma trade delete <规则ID>
+/gjma trade orders
+/gjma trade log [1-50]
+/gjma trade budget
+/gjma trade stop-all confirm             撤销全部自动订单并暂停所有规则
 ```
 
 买入逻辑：最低售价达到买入限价后，按阈值内卖单深度买入；允许部分成交，并立即撤销未成交余量。
@@ -79,29 +82,29 @@ WebUI 的“插件可视化视图 → Gaijin 自动交易”页面可由所有�
 ### 4. 订阅物品
 
 ```
-/gjm sub <物品页链接>      订阅（只接受物品页链接）
-/gjm mysub                先刷新行情，再查看当前会话中我的订阅和全局列表
-/gjm unsub <编号|物品链接> 取消订阅
-/gjm refresh mode <模式>  always / only_change
-/gjm refresh interval <秒> [物品链接|编号]
+/gjma sub <物品页链接>      订阅（只接受物品页链接）
+/gjma mysub                先刷新行情，再查看当前会话中我的订阅和全局列表
+/gjma unsub <编号|物品链接> 取消订阅
+/gjma refresh mode <模式>  always / only_change
+/gjma refresh interval <秒> [物品链接|编号]
 ```
 
 ### 5. 查看与排障
 
 ```
-/gjm status               运行与令牌状态
-/gjm price <物品链接>     查询单个物品的实时行情
-/gjm help                 查看全部指令
+/gjma status               运行与令牌状态
+/gjma price <物品链接>     查询单个物品的实时行情
+/gjma help                 查看全部指令
 ```
 
 ### 主要配置项
 
 | 配置 | 说明 |
 | --- | --- |
-| `account_email` / `account_password` | Gaijin 账号，供 `/login` 使用 |
-| `owner_uids` | 拥有者 UID，`/login` 与管理员指令的身份依据 |
+| `account_email` / `account_password` | Gaijin 账号，供 `/gjma login` 使用 |
+| `owner_uids` | 拥有者 UID，`/gjma login` 与管理员指令的身份依据 |
 | `user_subscriptions` | 用户订阅：每用户一条（UID、刷新模式、逐物品链接和间隔） |
-| `push_mode` | 旧配置的默认刷新模式；新订阅可用 `/gjm refresh mode` 覆盖 |
+| `push_mode` | 旧配置的默认刷新模式；新订阅可用 `/gjma refresh mode` 覆盖 |
 | `push_batch_seconds` | 私聊推送合并窗口（秒），窗口内多件物品合成一条 |
 | `group_push_interval` | 群聊全量推送间隔，默认 30 秒 |
 | `chart_history_points` | 每张价格图展示的最近成功采样次数，默认 5 |
@@ -112,9 +115,9 @@ WebUI 的“插件可视化视图 → Gaijin 自动交易”页面可由所有�
 - `always`：按照该物品设置的刷新间隔抓取并推送，即使行情没有变化也会发送。
 - `only_change`：固定每 5 秒检查一次网站，只在价格发生变化时发送。
 - 群聊不使用个人 `always` / `only_change` 控制发送；插件每个 `group_push_interval` 主动刷新该群全部物品并发送完整快照。
-- `/gjm refresh mode always|only_change`：设置自己全部订阅的刷新模式。
-- `/gjm refresh interval <秒>`：设置自己全部订阅的默认刷新间隔。
-- `/gjm refresh interval <秒> <物品链接|编号>`：只修改指定物品；编号来自 `/gjm mysub`。
+- `/gjma refresh mode always|only_change`：设置自己全部订阅的刷新模式。
+- `/gjma refresh interval <秒>`：设置自己全部订阅的默认刷新间隔。
+- `/gjma refresh interval <秒> <物品链接|编号>`：只修改指定物品；编号来自 `/gjma mysub`。
 
 ### 价格折线图
 

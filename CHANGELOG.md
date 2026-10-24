@@ -2,6 +2,11 @@
 
 ## 2.18.0
 
+### 独立部署版
+
+- 使用独立插件 ID `astrbot_plugin_gaijin_market_autotrader`、独立数据目录和 `/gjma` 指令命名空间。
+- 可与原 `astrbot_plugin_gaijin_market_watcher` 同时安装，不会覆盖原插件或共用运行时配置。
+
 ### 新增
 
 - 增加普通商品自动交易：低价买入、部分成交后撤销余量、达到税后目标价后立即卖出或挂单。

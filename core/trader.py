@@ -1143,7 +1143,7 @@ class AutoTrader:
     async def _fail_rule(self, rule: TradeRule, exc: Exception) -> None:
         runtime = self.store.get_runtime(rule.rule_id)
         if isinstance(exc, AuthExpiredError):
-            message = "市场登录已失效，自动交易暂停，请发送 /login"
+            message = "市场登录已失效，自动交易暂停，请发送 /gjma login"
             runtime.phase = PHASE_ERROR
             rule.enabled = False
         elif isinstance(exc, TradeError):

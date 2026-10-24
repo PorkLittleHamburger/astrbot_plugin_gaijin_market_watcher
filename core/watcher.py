@@ -234,7 +234,7 @@ class MarketWatcher:
     # ------------------------------------------------------------ 单次轮询
 
     async def poll_once(self) -> list[TriggerEvent]:
-        """立即轮询全部物品（/gjm mysub、唤醒时使用）。"""
+        """立即轮询全部物品（/gjma mysub、唤醒时使用）。"""
         return await self.poll_items(self._private_market_names())
 
     async def poll_due(self) -> list[TriggerEvent]:

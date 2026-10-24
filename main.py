@@ -1,10 +1,10 @@
-"""AstrBot 插件：Gaijin 市场行情监控（astrbot_plugin_gaijin_market_watcher）。
+"""AstrBot 插件：Gaijin 市场自动交易（独立版）。
 
 核心能力：
   * 按配置的间隔轮询 trade.gaijin.net 上一件或多件物品的
     「实时最低售价 / 实时最高求购价 / 挂单量」；
-  * **登录通过聊天指令完成**：发送 /login 发起登录，再用
-    /login <验证码> 提交两步验证码；
+  * **登录通过聊天指令完成**：发送 /gjma login 发起登录，再用
+    /gjma login <验证码> 提交两步验证码；
   * 订阅按 **UID**（人）区分：群聊里 UMO 相同但每个人 UID 不同，
     推送时会 @ 到订阅者本人；
   * 订阅物品只接受**物品页链接**。
@@ -75,7 +75,7 @@ except ImportError:  # 兜底：以文件路径方式加载时
     from core.trader import AutoTrader, TradeError
     from core.watcher import MarketWatcher
 
-PLUGIN_NAME = "astrbot_plugin_gaijin_market_watcher"
+PLUGIN_NAME = "astrbot_plugin_gaijin_market_autotrader"
 
 
 def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
@@ -97,8 +97,8 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
     PLUGIN_NAME,
     "porklittlehamburger",
     (
-        "监控 Gaijin Market(trade.gaijin.net) 物品的实时最低售价与最高求购价；"
-        "发送 /login 登录；按 UID 区分订阅者并在群聊里 @ 到本人；"
+        "独立版 Gaijin Market 自动交易插件，使用 /gjma 指令命名空间；"
+        "发送 /gjma login 登录；按 UID 区分订阅者并在群聊里 @ 到本人；"
         "拥有者可私聊或通过 WebUI 使用默认模拟的自动交易。"
     ),
     "2.18.0",
@@ -425,7 +425,7 @@ class GaijinMarketWatcher(Star):
         return fallback
 
     async def _platform_report(self) -> list[str]:
-        """各平台的 @ 与主动推送能力（结论来自 core.platforms，供 /gjm debug 使用）。"""
+        """各平台的 @ 与主动推送能力（结论来自 core.platforms，供 /gjma debug 使用）。"""
         lines = ["【平台能力】"]
         cfg: dict = {}
         with contextlib.suppress(Exception):
@@ -599,7 +599,7 @@ class GaijinMarketWatcher(Star):
             return
         self._auth_notice_at = time.time()
         await self.notifier.push(
-            f"Gaijin 令牌失效，监控已暂停。\n原因：{reason}\n请发送 /login 重新登录。",
+            f"Gaijin 令牌失效，监控已暂停。\n原因：{reason}\n请发送 /gjma login 重新登录。",
             self._owner_notify_umos(),
         )
 
@@ -615,36 +615,36 @@ class GaijinMarketWatcher(Star):
 
     # ================================================================= 指令
 
-    @filter.command_group("gjm", alias={"/gjm"})
-    def gjm(self):
-        """Gaijin 市场行情监控指令组。"""
+    @filter.command_group("gjma", alias={"/gjma"})
+    def gjma(self):
+        """Gaijin 市场自动交易（独立版）指令组。"""
 
-    @gjm.command("help")
+    @gjma.command("help")
     async def gjm_help(self, event: AstrMessageEvent):
         """查看指令列表。"""
         self._remember(event)
         yield event.plain_result(
             "Gaijin 行情监控\n"
-            "/login [验证码]        登录 / 提交两步验证码\n"
-            "/gjm sub <链接>        订阅物品\n"
-            "/gjm unsub <链接|编号> 取消订阅\n"
-            "/gjm mysub             先刷新行情，再显示我的订阅 + 全局列表\n"
-            "/gjm price <链接>      查询单个物品行情\n"
-            "/gjm status            运行与令牌状态\n"
-            "/gjm refresh mode <模式>  always / only_change\n"
-            "/gjm refresh interval <秒> [链接|编号]\n"
+            "/gjma login [验证码]        登录 / 提交两步验证码\n"
+            "/gjma sub <链接>        订阅物品\n"
+            "/gjma unsub <链接|编号> 取消订阅\n"
+            "/gjma mysub             先刷新行情，再显示我的订阅 + 全局列表\n"
+            "/gjma price <链接>      查询单个物品行情\n"
+            "/gjma status            运行与令牌状态\n"
+            "/gjma refresh mode <模式>  always / only_change\n"
+            "/gjma refresh interval <秒> [链接|编号]\n"
             "群聊会自动按固定间隔发送全部订阅物品和价格图\n"
-            "/gjm trade             自动交易（仅拥有者私聊）\n"
-            "/gjm debug             排障信息"
+            "/gjma trade             自动交易（仅拥有者私聊）\n"
+            "/gjma debug             排障信息"
         )
 
-    @gjm.command("sub")
+    @gjma.command("sub")
     async def gjm_sub(self, event: AstrMessageEvent):
         """订阅物品（只接受物品页链接）。"""
         self._remember(event)
-        url = _args_after(event, "gjm", "sub")
+        url = _args_after(event, "gjma", "sub")
         if not url:
-            yield event.plain_result(f"用法：/gjm sub <物品链接>\n{REJECT_HINT}")
+            yield event.plain_result(f"用法：/gjma sub <物品链接>\n{REJECT_HINT}")
             return
 
         uid = str(event.get_sender_id() or "")
@@ -658,13 +658,15 @@ class GaijinMarketWatcher(Star):
             self.watcher.reconfigure()
         yield event.plain_result(message)
 
-    @gjm.command("unsub")
+    @gjma.command("unsub")
     async def gjm_unsub(self, event: AstrMessageEvent):
-        """按 /gjm mysub 的编号或物品页链接取消订阅。"""
+        """按 /gjma mysub 的编号或物品页链接取消订阅。"""
         self._remember(event)
-        arg = _args_after(event, "gjm", "unsub").strip()
+        arg = _args_after(event, "gjma", "unsub").strip()
         if not arg:
-            yield event.plain_result("用法：/gjm unsub <编号>\n或：/gjm unsub <物品链接>\n先发送 /gjm mysub 查看编号。")
+            yield event.plain_result(
+                "用法：/gjma unsub <编号>\n或：/gjma unsub <物品链接>\n先发送 /gjma mysub 查看编号。"
+            )
             return
         uid = str(event.get_sender_id() or "")
         target_umo = event.unified_msg_origin or ""
@@ -677,13 +679,13 @@ class GaijinMarketWatcher(Star):
         if ok:
             self.watcher.reconfigure()
 
-    @gjm.command("mysub")
+    @gjma.command("mysub")
     async def gjm_mysub(self, event: AstrMessageEvent):
         """先刷新行情，再查看我的订阅与全局列表。"""
         self._remember(event)
-        action = _args_after(event, "gjm", "mysub").strip().lower()
+        action = _args_after(event, "gjma", "mysub").strip().lower()
         if action:
-            yield event.plain_result("用法：/gjm mysub")
+            yield event.plain_result("用法：/gjma mysub")
             return
 
         if self.cfg.watched_market_names:
@@ -698,7 +700,7 @@ class GaijinMarketWatcher(Star):
         subs = self.subscriptions.subscriptions_of(uid, target_umo)
         sections: list[str] = []
         if not subs:
-            sections.append("【我的订阅】\n你还没有订阅。用 /gjm sub <物品链接> 订阅。")
+            sections.append("【我的订阅】\n你还没有订阅。用 /gjma sub <物品链接> 订阅。")
         else:
             lines = [f"【当前会话中我的订阅 · {len(subs)} 件】"]
             for index, sub in enumerate(subs, start=1):
@@ -714,16 +716,16 @@ class GaijinMarketWatcher(Star):
                 if quote and quote.ok:
                     lines.append(f"   售出 {quote.sell_min} / 求购 {quote.buy_max} GJN")
             lines.append("")
-            lines.append("删除订阅：/gjm unsub <编号>，例如 /gjm unsub 1")
+            lines.append("删除订阅：/gjma unsub <编号>，例如 /gjma unsub 1")
             sections.append("\n".join(lines))
         sections.append(self._global_list_text())
         yield event.plain_result("\n\n".join(sections))
 
     def _global_list_text(self) -> str:
-        """渲染全局被监控物品列表，供 ``/gjm mysub`` 使用。"""
+        """渲染全局被监控物品列表，供 ``/gjma mysub`` 使用。"""
         names = self.cfg.watched_market_names
         if not names:
-            return "没有被订阅的物品。用 /gjm sub <物品链接> 订阅。"
+            return "没有被订阅的物品。用 /gjma sub <物品链接> 订阅。"
 
         lines = ["【被监控的物品】"]
         for index, market_name in enumerate(names, start=1):
@@ -742,19 +744,19 @@ class GaijinMarketWatcher(Star):
                 lines.append("   暂无行情数据")
 
         lines.append("")
-        lines.append("提示：物品由用户订阅产生，用 /gjm sub <物品链接> 添加。")
+        lines.append("提示：物品由用户订阅产生，用 /gjma sub <物品链接> 添加。")
         return "\n".join(lines)
 
     def item_url(self, market_name: str) -> str:
         return f"https://trade.gaijin.net/market/{self.cfg.appid}/{market_name}"
 
-    @gjm.command("price")
+    @gjma.command("price")
     async def gjm_price(self, event: AstrMessageEvent):
         """查询单个物品的实时行情（只接受物品页链接）。"""
         self._remember(event)
-        url = _args_after(event, "gjm", "price")
+        url = _args_after(event, "gjma", "price")
         if not url:
-            yield event.plain_result(f"用法：/gjm price <物品链接>\n{REJECT_HINT}")
+            yield event.plain_result(f"用法：/gjma price <物品链接>\n{REJECT_HINT}")
             return
         _, market_name = extract_link_reference(url)
         if not market_name:
@@ -764,7 +766,7 @@ class GaijinMarketWatcher(Star):
         try:
             token = await self.auth.get_token()
         except LoginRequiredError as exc:
-            yield event.plain_result(f"令牌不可用：{exc}\n请发送 /login 登录。")
+            yield event.plain_result(f"令牌不可用：{exc}\n请发送 /gjma login 登录。")
             return
 
         await event.send(event.plain_result("正在查询…"))
@@ -787,7 +789,7 @@ class GaijinMarketWatcher(Star):
             f"{self.item_url(market_name)}"
         )
 
-    @gjm.command("status")
+    @gjma.command("status")
     async def gjm_status(self, event: AstrMessageEvent):
         """查看运行与令牌状态。"""
         self._remember(event)
@@ -815,7 +817,7 @@ class GaijinMarketWatcher(Star):
         lines.append(f"refresh_token：{'有' if auth['has_refresh_token'] else '无'}")
         lines.append(f"账号密码：{'有' if auth['has_account'] else '无'}")
         if auth["pending_login"]:
-            lines.append("登录：等待验证码（发 /login <验证码>）")
+            lines.append("登录：等待验证码（发 /gjma login <验证码>）")
         if auth["last_error"]:
             lines.append(f"续期错误：{auth['last_error']}")
         subs = self.cfg.enabled_subscriptions
@@ -830,7 +832,7 @@ class GaijinMarketWatcher(Star):
                 lines.append(f"  ! {uid} 未解析到会话")
         yield event.plain_result("\n".join(lines))
 
-    @gjm.group("refresh")
+    @gjma.group("refresh")
     def gjm_refresh(self):
         """刷新策略指令组。"""
 
@@ -843,11 +845,11 @@ class GaijinMarketWatcher(Star):
                 f"群聊统一每 {self.cfg.group_push_interval} 秒刷新全部物品并推送，不使用个人刷新模式。"
             )
             return
-        mode = _args_after(event, "gjm", "refresh", "mode").strip().lower()
+        mode = _args_after(event, "gjma", "refresh", "mode").strip().lower()
         if mode == "on_change":
             mode = "only_change"
         if mode not in {"always", "only_change"}:
-            yield event.plain_result("用法：/gjm refresh mode <always|only_change>")
+            yield event.plain_result("用法：/gjma refresh mode <always|only_change>")
             return
         ok, message = self.subscriptions.set_refresh_mode(
             str(event.get_sender_id() or ""),
@@ -867,17 +869,17 @@ class GaijinMarketWatcher(Star):
                 f"群聊统一每 {self.cfg.group_push_interval} 秒刷新全部物品并推送，不支持个人刷新间隔。"
             )
             return
-        parts = _args_after(event, "gjm", "refresh", "interval").split()
+        parts = _args_after(event, "gjma", "refresh", "interval").split()
         if not parts:
             yield event.plain_result(
-                f"用法：/gjm refresh interval <秒> [物品链接|编号]\n"
+                f"用法：/gjma refresh interval <秒> [物品链接|编号]\n"
                 f"（最小 {MIN_POLL_INTERVAL} 秒；不填目标则作用于你的全部订阅）"
             )
             return
         try:
             value = int(float(parts[0]))
         except (ValueError, OverflowError):
-            yield event.plain_result("秒数没看懂，请给整数，例如 /gjm refresh interval 30")
+            yield event.plain_result("秒数没看懂，请给整数，例如 /gjma refresh interval 30")
             return
         uid = str(event.get_sender_id() or "")
         target = " ".join(parts[1:]).strip()
@@ -897,7 +899,7 @@ class GaijinMarketWatcher(Star):
         if ok:
             self.watcher.reconfigure()
 
-    @gjm.group("trade")
+    @gjma.group("trade")
     def gjm_trade(self):
         """自动交易指令组（仅拥有者私聊）。"""
 
@@ -909,11 +911,11 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        raw = _args_after(event, "gjm", "trade", "add")
+        raw = _args_after(event, "gjma", "trade", "add")
         parts = raw.split()
         if len(parts) != 5:
             yield event.plain_result(
-                "用法：/gjm trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>\n新规则默认模拟运行。"
+                "用法：/gjma trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>\n新规则默认模拟运行。"
             )
             return
         try:
@@ -933,7 +935,7 @@ class GaijinMarketWatcher(Star):
             f"买入：{rule.buy_price_raw / 10000:.2f} GJN × {rule.quantity}\n"
             f"税后卖出：{rule.sell_net_price_raw / 10000:.2f} GJN\n"
             f"模式：{rule.mode}\n"
-            f"实盘切换：/gjm trade arm {rule.rule_id}"
+            f"实盘切换：/gjma trade arm {rule.rule_id}"
         )
 
     @gjm_trade.command("list")
@@ -969,9 +971,9 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "show").strip()
+        rule_id = _args_after(event, "gjma", "trade", "show").strip()
         if not rule_id:
-            yield event.plain_result("用法：/gjm trade show <规则ID>")
+            yield event.plain_result("用法：/gjma trade show <规则ID>")
             return
         try:
             rule = self.trader._require_rule(rule_id)
@@ -1023,9 +1025,9 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        parts = _args_after(event, "gjm", "trade", "arm").split()
+        parts = _args_after(event, "gjma", "trade", "arm").split()
         if not parts:
-            yield event.plain_result("用法：/gjm trade arm <规则ID>，然后发送 /gjm trade arm <规则ID> confirm")
+            yield event.plain_result("用法：/gjma trade arm <规则ID>，然后发送 /gjma trade arm <规则ID> confirm")
             return
         rule_id = parts[0]
         try:
@@ -1045,7 +1047,7 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "disarm").strip()
+        rule_id = _args_after(event, "gjma", "trade", "disarm").strip()
         try:
             await self.trader.action(rule_id, "disarm")
         except Exception as exc:
@@ -1061,7 +1063,7 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "pause").strip()
+        rule_id = _args_after(event, "gjma", "trade", "pause").strip()
         try:
             await self.trader.action(rule_id, "pause")
         except Exception as exc:
@@ -1077,7 +1079,7 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "resume").strip()
+        rule_id = _args_after(event, "gjma", "trade", "resume").strip()
         try:
             await self.trader.action(rule_id, "resume")
         except Exception as exc:
@@ -1093,7 +1095,7 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "cancel").strip()
+        rule_id = _args_after(event, "gjma", "trade", "cancel").strip()
         try:
             await self.trader.action(rule_id, "cancel_orders")
         except Exception as exc:
@@ -1109,7 +1111,7 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        rule_id = _args_after(event, "gjm", "trade", "delete").strip()
+        rule_id = _args_after(event, "gjma", "trade", "delete").strip()
         try:
             await self.trader.action(rule_id, "delete")
         except Exception as exc:
@@ -1143,11 +1145,11 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        raw = _args_after(event, "gjm", "trade", "log").strip()
+        raw = _args_after(event, "gjma", "trade", "log").strip()
         try:
             limit = max(1, min(50, int(raw or 10)))
         except ValueError:
-            yield event.plain_result("用法：/gjm trade log [1-50]")
+            yield event.plain_result("用法：/gjma trade log [1-50]")
             return
         events = self.trader.store.events[-limit:]
         if not events:
@@ -1167,9 +1169,9 @@ class GaijinMarketWatcher(Star):
         if error:
             yield event.plain_result(error)
             return
-        if _args_after(event, "gjm", "trade", "stop-all").strip().lower() != "confirm":
+        if _args_after(event, "gjma", "trade", "stop-all").strip().lower() != "confirm":
             yield event.plain_result(
-                "急停会撤销本插件跟踪的全部订单并暂停规则。\n确认请发送：/gjm trade stop-all confirm"
+                "急停会撤销本插件跟踪的全部订单并暂停规则。\n确认请发送：/gjma trade stop-all confirm"
             )
             return
         try:
@@ -1184,9 +1186,9 @@ class GaijinMarketWatcher(Star):
             text += "\n撤单异常：\n" + "\n".join(result["errors"])
         yield event.plain_result(text)
 
-    @filter.command("login", alias={"/login", "登录"})
+    @gjma.command("login")
     async def cmd_login(self, event: AstrMessageEvent):
-        """登录 Gaijin 账号：/login 发起，/login <验证码> 提交验证码。"""
+        """登录 Gaijin 账号：/gjma login 发起，/gjma login <验证码> 提交验证码。"""
         self._remember(event)
         # 验证码属敏感内容：终止事件传播，避免其进入 LLM 上下文或其它插件
         event.stop_event()
@@ -1197,7 +1199,7 @@ class GaijinMarketWatcher(Star):
             )
             return
 
-        code = _args_after(event, "login")
+        code = _args_after(event, "gjma", "login")
         if code:
             yield event.plain_result(await self._submit_login_code(code))
             return
@@ -1206,7 +1208,7 @@ class GaijinMarketWatcher(Star):
     async def _begin_login(self) -> str:
         """第一步：发起登录。优先用 refresh_token（免密码），其次账号密码。"""
         if self.auth.has_pending_login:
-            return "已有登录在等待验证码。请发送 /login <验证码>"
+            return "已有登录在等待验证码。请发送 /gjma login <验证码>"
 
         if self.auth.refresh_token and await self.auth.try_refresh():
             self.watcher.wake()
@@ -1227,12 +1229,12 @@ class GaijinMarketWatcher(Star):
             self.on_login_success()
             return "登录成功。"
 
-        return "站点要求验证码。请发送 /login <验证码>（15 分钟内有效）"
+        return "站点要求验证码。请发送 /gjma login <验证码>（15 分钟内有效）"
 
     async def _submit_login_code(self, code: str) -> str:
         """第二步：提交验证码。"""
         if not self.auth.has_pending_login:
-            return "没有等待验证码的登录流程（可能已超时）。请先发送 /login。"
+            return "没有等待验证码的登录流程（可能已超时）。请先发送 /gjma login。"
         try:
             step = await self.auth.submit_code(code)
         except LoginError as exc:
@@ -1243,7 +1245,7 @@ class GaijinMarketWatcher(Star):
         self.on_login_success()
         return f"验证码校验通过，{step.message}"
 
-    @gjm.command("debug")
+    @gjma.command("debug")
     async def gjm_debug(self, event: AstrMessageEvent):
         """排障：显示登录流程、配置监听与 @ 适配状态。"""
         self._remember(event)

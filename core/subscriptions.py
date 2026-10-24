@@ -204,10 +204,10 @@ class SubscriptionStore:
         return True, f"已取消订阅：{market_name}"
 
     def remove_by_index(self, uid: str, index: int, target_umo: str | None = None) -> tuple[bool, str]:
-        """按 ``/gjm my`` 显示的编号删除当前用户的一条订阅。"""
+        """按 ``/gjma my`` 显示的编号删除当前用户的一条订阅。"""
         own = self.subscriptions_of(uid, target_umo)
         if not own:
-            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
         if index < 1 or index > len(own):
             return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
 
@@ -272,7 +272,7 @@ class SubscriptionStore:
         if not targets:
             if market_name:
                 return False, "你没有订阅这件物品。"
-            return False, "你还没有订阅任何物品，先用 /gjm sub <物品链接> 订阅。"
+            return False, "你还没有订阅任何物品，先用 /gjma sub <物品链接> 订阅。"
 
         target_keys = {s.key for s in targets}
         updated: list[Subscription] = []
@@ -308,7 +308,7 @@ class SubscriptionStore:
     ) -> tuple[bool, str]:
         own = self.subscriptions_of(uid, target_umo)
         if not own:
-            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
         if index < 1 or index > len(own):
             return False, f"编号无效，请输入 1~{len(own)} 之间的编号。"
         return self.set_interval(uid, seconds, own[index - 1].market_name, target_umo)
@@ -319,7 +319,7 @@ class SubscriptionStore:
             return False, "刷新模式只能是 always 或 only_change。"
         targets = [s for s in self._items if s.uid == uid and (target_umo is None or s.target_umo == target_umo)]
         if not targets:
-            return False, "你还没有订阅。用 /gjm sub <物品链接> 订阅。"
+            return False, "你还没有订阅。用 /gjma sub <物品链接> 订阅。"
 
         updated = [
             Subscription(
