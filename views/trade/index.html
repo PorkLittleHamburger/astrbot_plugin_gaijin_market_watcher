@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Gaijin Market 控制台</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
@@ -33,6 +34,73 @@
       </div>
 
       <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+      <div id="workbenchBackdrop" class="workbench-backdrop" hidden>
+        <section class="workbench-dialog" role="dialog" aria-modal="true" aria-labelledby="workbenchTitle" tabindex="-1">
+          <header class="workbench-header">
+            <div>
+              <p class="eyebrow">PAPER TRADING</p>
+              <h2 id="workbenchTitle">模拟交易工作台</h2>
+              <p id="workbenchSubtitle" class="muted">正在读取规则与盘口…</p>
+            </div>
+            <button id="workbenchClose" class="button secondary" type="button">关闭工作台</button>
+          </header>
+          <div class="workbench-layout">
+            <aside class="workbench-status" aria-label="交易状态">
+              <div class="section-heading"><div><h3>交易状态</h3><p class="muted">状态机与纸面成交摘要</p></div><span id="workbenchPhase" class="pill">读取中</span></div>
+              <div id="workbenchStatusGrid" class="status-grid"></div>
+              <div id="workbenchMessage" class="inline-message" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+              <div class="workbench-actions">
+                <button id="workbenchPause" class="button secondary" type="button">暂停规则</button>
+                <button id="workbenchResume" class="button secondary" type="button">恢复规则</button>
+                <button id="workbenchRefresh" class="button ghost" type="button">刷新状态</button>
+              </div>
+              <div class="workbench-note"><strong>工作台边界</strong><span>这里的盘口只驱动当前模拟规则，不会调用真实买卖接口。</span></div>
+            </aside>
+            <section class="workbench-market" aria-label="盘口状态">
+              <div class="section-heading">
+                <div><h3>盘口状态</h3><p id="bookSource" class="muted">读取中…</p></div>
+                <div class="book-summary">
+                  <span>最低卖 <b id="bestSell">--</b></span>
+                  <span>最高求 <b id="bestBuy">--</b></span>
+                  <span>价差 <b id="bookSpread">--</b></span>
+                </div>
+              </div>
+              <div class="book-toolbar">
+                <button id="bookLoadLive" class="button secondary" type="button">载入当前真实盘口</button>
+                <button id="bookGenerate" class="button primary" type="button">按规则生成可成交盘口</button>
+                <button id="bookFollowLive" class="button ghost" type="button">恢复跟随真实行情</button>
+              </div>
+              <div class="book-columns">
+                <section class="book-side" aria-labelledby="sellBookTitle">
+                  <div class="book-heading"><h4 id="sellBookTitle">卖单 SELL</h4><span id="sellDepth" class="muted">深度 0</span></div>
+                  <div class="book-table-wrap">
+                    <table class="book-table">
+                      <thead><tr><th>价格 GJN</th><th>数量</th><th>累计</th><th><span class="sr-only">操作</span></th></tr></thead>
+                      <tbody id="sellBookBody"></tbody>
+                    </table>
+                  </div>
+                  <button id="addSellLevel" class="button small ghost" type="button">新增卖单档位</button>
+                </section>
+                <section class="book-side" aria-labelledby="buyBookTitle">
+                  <div class="book-heading"><h4 id="buyBookTitle">买单 BUY</h4><span id="buyDepth" class="muted">深度 0</span></div>
+                  <div class="book-table-wrap">
+                    <table class="book-table">
+                      <thead><tr><th>价格 GJN</th><th>数量</th><th>累计</th><th><span class="sr-only">操作</span></th></tr></thead>
+                      <tbody id="buyBookBody"></tbody>
+                    </table>
+                  </div>
+                  <button id="addBuyLevel" class="button small ghost" type="button">新增买单档位</button>
+                </section>
+              </div>
+              <div class="book-footer">
+                <p class="muted">允许买卖价格交叉，以便一次测试完整买卖流程。保存后会立即执行一次纸面检查。</p>
+                <button id="bookSaveApply" class="button primary" type="button">保存盘口并执行</button>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
 
       <div id="modalBackdrop" class="modal-backdrop" hidden>
         <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMessage">
@@ -77,7 +145,7 @@
               <label class="span-2"><span>会话 UMO</span><input id="subTarget" type="text" placeholder="qq_official:FriendMessage:123456" required /></label>
               <label><span>刷新间隔（秒）</span><input id="subInterval" type="number" min="1" max="3600" step="1" value="30" required /></label>
               <label><span>刷新模式</span><select id="subMode"><option value="only_change">only_change · 变化时</option><option value="always">always · 每次</option></select></label>
-              <label class="switch-row span-2"><span>启用该订阅组</span><input id="subEnabled" type="checkbox" checked /></label>
+              <label class="switch-row span-2"><span>启用该订阅组</span><input id="subEnabled" class="toggle-input" type="checkbox" role="switch" checked /></label>
               <label class="span-2"><span>物品页链接（每行一个）</span><textarea id="subItems" rows="5" placeholder="https://trade.gaijin.net/market/1067/id50381_f_16xl_usa" required></textarea></label>
               <div class="form-actions span-2"><button type="submit" class="button primary">保存订阅组</button></div>
             </form>
@@ -106,13 +174,21 @@
               <div><h2>安全设置</h2><p class="muted">实盘额度全部为 0 时，任何规则都不能切换实盘。</p></div>
             </div>
             <form id="settingsForm" class="form-grid">
-              <label class="switch-row span-2"><span>自动交易总开关</span><input id="settingEnabled" type="checkbox" /></label>
+              <div class="switch-row span-2">
+                <div><span>全局交易环境</span><small id="globalModeLabel" class="switch-help">模拟盘，不会下真实订单</small></div>
+                <button id="globalModeSwitch" class="toggle-button" type="button" role="switch" aria-checked="false" aria-label="切换全局交易环境">
+                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                  <b id="globalModeText">模拟盘</b>
+                </button>
+              </div>
+              <div id="globalModeResult" class="inline-message span-2" role="status" aria-live="polite" hidden></div>
+              <label class="switch-row span-2"><span>自动交易总开关</span><input id="settingEnabled" class="toggle-input" type="checkbox" role="switch" /></label>
               <label><span>总投入预算 (GJN)</span><input id="settingTotal" type="number" min="0" step="0.01" /></label>
               <label><span>每日限额 (GJN)</span><input id="settingDaily" type="number" min="0" step="0.01" /></label>
               <label><span>单笔上限 (GJN)</span><input id="settingMaxOrder" type="number" min="0" step="0.01" /></label>
               <label><span>最大数量</span><input id="settingMaxQty" type="number" min="0" step="1" /></label>
               <label><span>检查间隔 (秒)</span><input id="settingInterval" type="number" min="1" max="3600" step="1" /></label>
-              <label class="switch-row"><span>隐藏交易动态</span><input id="settingPrivate" type="checkbox" /></label>
+              <label class="switch-row"><span>隐藏交易动态</span><input id="settingPrivate" class="toggle-input" type="checkbox" role="switch" /></label>
               <div class="form-actions span-2"><button type="submit" class="button primary">保存设置</button></div>
             </form>
           </article>

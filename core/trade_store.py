@@ -10,12 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 from .trade_log_store import TradeLogStorageError, TradeLogStore
-from .trade_models import TradeEvent, TradeLedger, TradeRule, TradeRuntime, TradeSettings
+from .trade_models import TradeEvent, TradeLedger, TradePaperBook, TradeRule, TradeRuntime, TradeSettings
 
 RULES_FILE = "trade_rules.json"
 RUNTIME_FILE = "trade_runtime.json"
 SETTINGS_FILE = "trade_settings.json"
 LEDGER_FILE = "trade_ledger.json"
+PAPER_BOOKS_FILE = "trade_paper_books.json"
 MAX_EVENTS = 500
 
 
@@ -31,6 +32,7 @@ class TradeStore:
         self.runtimes: dict[str, TradeRuntime] = {}
         self.settings = TradeSettings()
         self.ledger = TradeLedger()
+        self.paper_books: dict[str, TradePaperBook] = {}
         self.events: list[TradeEvent] = []
         self.log_store = TradeLogStore(storage, logger, memory_limit=MAX_EVENTS)
         self.reload()
@@ -72,6 +74,20 @@ class TradeStore:
         except Exception:
             self.ledger = TradeLedger()
 
+        raw_books = self.storage.load_aux_json(PAPER_BOOKS_FILE, {})
+        self.paper_books = {}
+        for rule in self.rules:
+            item = raw_books.get(rule.rule_id) if isinstance(raw_books, dict) else None
+            if not isinstance(item, dict):
+                continue
+            try:
+                book = TradePaperBook.from_dict(item)
+                if book.rule_id != rule.rule_id or not (book.sell_levels or book.buy_levels):
+                    continue
+                self.paper_books[rule.rule_id] = book
+            except Exception as exc:
+                self.logger.warning(f"忽略损坏的模拟盘口 {rule.rule_id}: {exc}")
+
         self.events = self.log_store.recent(MAX_EVENTS)
 
     # ------------------------------------------------------------------ 规则
@@ -104,6 +120,37 @@ class TradeStore:
         if not self.storage.save_aux_json(LEDGER_FILE, self.ledger.to_dict()):
             raise TradeStorageError("交易账本写入失败")
 
+    def save_paper_books(self) -> None:
+        data = {rule_id: book.to_dict() for rule_id, book in self.paper_books.items()}
+        if not self.storage.save_aux_json(PAPER_BOOKS_FILE, data):
+            raise TradeStorageError("模拟盘口写入失败")
+
+    def get_paper_book(self, rule_id: str) -> TradePaperBook | None:
+        return self.paper_books.get(rule_id)
+
+    def set_paper_book(self, book: TradePaperBook) -> None:
+        previous = self.paper_books.get(book.rule_id)
+        self.paper_books[book.rule_id] = book
+        try:
+            self.save_paper_books()
+        except TradeStorageError:
+            if previous is None:
+                self.paper_books.pop(book.rule_id, None)
+            else:
+                self.paper_books[book.rule_id] = previous
+            raise
+
+    def remove_paper_book(self, rule_id: str) -> bool:
+        previous = self.paper_books.pop(rule_id, None)
+        if previous is None:
+            return False
+        try:
+            self.save_paper_books()
+        except TradeStorageError:
+            self.paper_books[rule_id] = previous
+            raise
+        return True
+
     def append_event(self, event: TradeEvent) -> TradeEvent:
         try:
             self.log_store.append(event)
@@ -126,4 +173,5 @@ class TradeStore:
             "runtimes": {rule_id: runtime.to_dict() for rule_id, runtime in self.runtimes.items()},
             "settings": self.settings.to_dict(),
             "ledger": self.ledger.to_dict(),
+            "paper_books": {rule_id: book.to_dict() for rule_id, book in self.paper_books.items()},
         }

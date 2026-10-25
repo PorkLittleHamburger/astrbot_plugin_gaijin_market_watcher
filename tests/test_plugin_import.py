@@ -136,16 +136,44 @@ class PluginImportTests(unittest.TestCase):
             "_output_web_save",
             "_output_web_preview",
             "_trade_web_drill",
+            "_trade_web_workbench",
+            "_trade_web_mode",
         ):
             self.assertTrue(hasattr(self.module.GaijinMarketWatcher, handler), handler)
         metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
         self.assertEqual(metadata["name"], "astrbot_plugin_gaijin_market_watcher")
         self.assertEqual(metadata["display_name"], "Gaijin 市场行情监控")
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
-        self.assertEqual(metadata["version"], "2.20.3")
+        self.assertEqual(metadata["version"], "2.21.0")
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
         self.assertIn('@filter.command_group("gjm"', source)
         self.assertIn('"/gjma"', source)
+
+    def test_trade_help_has_explicit_usage_examples_and_risk_notes(self) -> None:
+        required = {
+            "add",
+            "list",
+            "show",
+            "arm",
+            "disarm",
+            "pause",
+            "resume",
+            "cancel",
+            "delete",
+            "orders",
+            "log",
+            "budget",
+            "stop-all",
+            "help",
+        }
+        self.assertEqual(set(self.module.TRADE_COMMAND_HELP), required)
+        for name, item in self.module.TRADE_COMMAND_HELP.items():
+            self.assertIn("/gjm trade", item["usage"], name)
+            self.assertTrue(item["detail"], name)
+            self.assertTrue(item["example"], name)
+            self.assertTrue(item["risk"], name)
+        self.assertIn("新建模拟规则", self.module.GaijinMarketWatcher.gjm_trade_add.__doc__ or "")
+        self.assertIn("切换实盘", self.module.GaijinMarketWatcher.gjm_trade_arm.__doc__ or "")
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher

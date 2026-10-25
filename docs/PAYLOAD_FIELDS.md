@@ -1,6 +1,6 @@
 # 行情 / 交易输出模板 · 字段清单
 
-> 插件版本 `v2.20.3`
+> 插件版本 `v2.21.0`
 
 插件控制台的“输出模板”标签页提供两套独立模板：
 
@@ -151,7 +151,7 @@ F-16XL（美国）行情报告
 
 | 字段 | 说明 |
 | --- | --- |
-| `$trade_kind` | 事件类型标识，如 `buy`、`sell`、`cycle_complete` |
+| `$trade_kind` | 事件类型标识，如 `buy`、`sell`、`cycle_complete`、`paper_book`、`mode_changed` |
 | `$trade_kind_text` | 事件中文名称 |
 | `$trade_level` | `info` / `warning` / `error` |
 | `$trade_message` | 事件正文 |

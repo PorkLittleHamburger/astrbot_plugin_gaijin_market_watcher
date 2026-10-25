@@ -237,11 +237,17 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
             "output/save",
             "output/preview",
             "trade/rules/drill",
+            "trade/rules/workbench",
+            "trade/mode",
             "trade/logs",
         ):
             self.assertIn(endpoint, app)
         self.assertIn("完整模拟演练", app)
-        self.assertIn("切换到模拟盘", app)
+        self.assertIn("进入模拟盘", app)
+        self.assertIn('role="switch"', html)
+        self.assertIn("workbenchBackdrop", html)
+        self.assertIn("bookSaveApply", html)
+        self.assertIn("按规则生成可成交盘口", html)
         self.assertIn("function authIsValid", app)
         self.assertNotIn('auth.has_jwt ? "有效"', app)
         self.assertIn("function runWithBusy", app)
@@ -254,7 +260,9 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(":focus-visible", css)
         self.assertIn(":active", css)
         self.assertIn("prefers-reduced-motion", css)
-        self.assertIn(".switch-row input { width: 24px; height: 24px; min-width: 24px; }", css)
+        self.assertIn(".toggle-input", css)
+        self.assertIn("width: 44px; height: 24px", css)
+        self.assertIn(".workbench-layout", css)
         self.assertIn("min-width: 0; width: 100%;", css)
         self.assertIn("insertAdjacentHTML", app)
         self.assertNotIn("renderEvents(data.events", app)

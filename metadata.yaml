@@ -1,7 +1,7 @@
 name: astrbot_plugin_gaijin_market_watcher
 display_name: Gaijin 市场行情监控
 help: 打开插件控制台管理账户、订阅、输出模板与自动交易；聊天可发送 /gjm help。
-short_desc: Gaijin 市场行情监控升级版，含订阅、账户、双输出模板和模拟/实盘自动交易
+short_desc: Gaijin 市场行情监控升级版，含订阅、账户、双输出模板、模拟交易工作台和受控实盘
 desc: |
   老插件 Gaijin 市场行情监控的升级版本，沿用原有插件 ID、数据目录和 /gjm 指令命名空间。
   监控普通商品的最低售价、最高求购价与挂单量；插件控制台统一管理账户登录、订阅、输出模板和自动交易。
@@ -11,11 +11,12 @@ desc: |
   - 群聊全量快照：按固定间隔合并群内全部物品并分别 @ 订阅者
   - 价格折线图：自动推送最近 N 次最低售价与最高求购
   - 多平台适配：适配微信/qq平台
-  - 自动交易：拥有者私聊或 WebUI 管理，默认模拟，二次确认后实盘
+  - 自动交易：拥有者私聊或 WebUI 管理，默认模拟，全局门禁与二次确认后实盘
+  - 模拟工作台：双栏查看交易状态和完整盘口，可编辑、生成并持久化纸面盘口
   - 模拟演练：读取一次真实盘口后，在隔离状态中完整执行模拟买卖
   - 交易安全：固定 15% 手续费、全局预算、每日限额、急停与订单对账
   - 增量日志：按上海日期追加 JSONL，控制台按游标只更新新增事件
-version: 2.20.3
+version: 2.21.0
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.29.0,<5"

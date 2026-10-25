@@ -12,6 +12,12 @@ let outputDirty = false;
 let accountDirty = false;
 let tradeLogCursor = 0;
 const tradeLogIds = new Set();
+let workbenchRuleId = "";
+let workbenchData = null;
+let workbenchDirty = false;
+let workbenchReturnFocus = null;
+let workbenchPollBusy = false;
+const workbenchBook = { sell: [], buy: [] };
 
 async function runWithBusy(button, label, task) {
   if (!button || button.dataset.busy === "1") return undefined;
@@ -19,6 +25,7 @@ async function runWithBusy(button, label, task) {
   const returnSelector = focusSelector(button);
   const original = {
     text: button.textContent,
+    html: button.innerHTML,
     disabled: button.disabled,
     ariaLabel: button.getAttribute("aria-label"),
   };
@@ -35,7 +42,7 @@ async function runWithBusy(button, label, task) {
     button.removeAttribute("aria-busy");
     if (original.ariaLabel === null) button.removeAttribute("aria-label");
     else button.setAttribute("aria-label", original.ariaLabel);
-    button.textContent = original.text;
+    button.innerHTML = original.html;
     if (hadFocus) {
       setTimeout(() => {
         const target = returnSelector ? document.querySelector(returnSelector) : button;
@@ -602,7 +609,250 @@ $("resetTradeBtn").addEventListener("click", () => {
   outputDirty = true;
 });
 
+// ---------------------------------------------------------------- 模拟工作台
+function numberText(value) {
+  return Number(value || 0).toLocaleString("zh-CN");
+}
+
+function renderWorkbenchStatus(data) {
+  workbenchData = data;
+  const rule = data.rule || {};
+  const runtime = data.runtime || rule.runtime || {};
+  $("workbenchSubtitle").textContent = `${rule.title || rule.market_name || "--"} · ${rule.rule_id || "--"} · ${rule.mode || "--"}`;
+  $("workbenchPhase").textContent = phaseLabels[runtime.phase] || runtime.phase || "未知";
+  const items = [
+    ["模拟/实盘", rule.live ? "实盘" : "模拟盘"],
+    ["规则状态", rule.enabled ? "启用" : "暂停"],
+    ["持仓", `${numberText(runtime.held_quantity)} / ${numberText(rule.quantity)}`],
+    ["已挂售", numberText(runtime.listed_quantity)],
+    ["当前成本", `${(Number(runtime.cost_basis_raw || 0) / 10000).toFixed(2)} GJN`],
+    ["累计到账", `${(Number(runtime.proceeds_raw || 0) / 10000).toFixed(2)} GJN`],
+    ["完成轮次", numberText(runtime.cycle_count)],
+    ["最后错误", runtime.last_error || "无"],
+  ];
+  $("workbenchStatusGrid").innerHTML = items
+    .map(([label, value]) => `<div class="status-item"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`)
+    .join("");
+  $("workbenchPause").disabled = !rule.enabled;
+  $("workbenchResume").disabled = Boolean(rule.enabled);
+}
+
+function bookSourceText(source) {
+  return {
+    live: "当前真实盘口预览；点击保存后才会成为模拟覆盖。",
+    manual: "已保存的模拟盘口；该规则只使用这份盘口。",
+    generated: "按规则参数生成的未保存盘口；点击保存并执行后生效。",
+  }[source] || "盘口状态";
+}
+
+function renderBookSide(side) {
+  const body = $(side === "sell" ? "sellBookBody" : "buyBookBody");
+  const levels = workbenchBook[side];
+  if (!levels.length) {
+    body.innerHTML = '<tr><td colspan="4" class="book-empty">暂无档位</td></tr>';
+    return;
+  }
+  let cumulative = 0;
+  body.innerHTML = levels.map((level, index) => {
+    const quantity = Number(level.quantity || 0);
+    cumulative += Number.isFinite(quantity) ? Math.max(0, quantity) : 0;
+    return `<tr data-index="${index}">
+      <td><input type="text" inputmode="decimal" value="${escapeHtml(level.price || "")}" aria-label="${side === "sell" ? "卖单" : "买单"}第 ${index + 1} 档价格" data-book-field="price" /></td>
+      <td><input type="number" min="1" step="1" value="${escapeHtml(level.quantity || "")}" aria-label="${side === "sell" ? "卖单" : "买单"}第 ${index + 1} 档数量" data-book-field="quantity" /></td>
+      <td>${numberText(cumulative)}</td>
+      <td><button class="button small ghost" type="button" data-book-delete="${side}" data-index="${index}" aria-label="删除第 ${index + 1} 档">删除</button></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderBook(book) {
+  workbenchBook.sell = (book?.sell_levels || []).map((level) => ({ price: level.price, quantity: String(level.quantity) }));
+  workbenchBook.buy = (book?.buy_levels || []).map((level) => ({ price: level.price, quantity: String(level.quantity) }));
+  renderBookSide("sell");
+  renderBookSide("buy");
+  $("bestSell").textContent = book?.best_sell ? `${book.best_sell} GJN` : "无";
+  $("bestBuy").textContent = book?.best_buy ? `${book.best_buy} GJN` : "无";
+  $("bookSpread").textContent = book?.spread ? `${book.spread} GJN` : "无";
+  $("sellDepth").textContent = `深度 ${numberText(book?.sell_depth)}`;
+  $("buyDepth").textContent = `深度 ${numberText(book?.buy_depth)}`;
+  $("bookSource").textContent = bookSourceText(workbenchData?.book_source);
+}
+
+function renderWorkbench(data, { keepBook = false } = {}) {
+  workbenchData = data;
+  renderWorkbenchStatus(data);
+  if (!keepBook || !workbenchDirty) {
+    renderBook(data.book || {});
+    workbenchDirty = false;
+  }
+  if (data.message) showInlineMessage("workbenchMessage", data.message, data.runtime?.last_error ? "error" : "ok");
+}
+
+async function refreshWorkbench({ resetBook = false } = {}) {
+  if (!workbenchRuleId || $("workbenchBackdrop").hidden || workbenchPollBusy) return;
+  workbenchPollBusy = true;
+  try {
+    const data = await apiGet("trade/rules/workbench", { rule_id: workbenchRuleId });
+    renderWorkbench(data, { keepBook: !resetBook });
+  } catch (error) {
+    showInlineMessage("workbenchMessage", apiError(error), "error");
+  } finally {
+    workbenchPollBusy = false;
+  }
+}
+
+async function openWorkbench(ruleId, trigger = null) {
+  const rule = lastOverview?.rules?.find((item) => item.rule_id === ruleId);
+  if (!rule) {
+    showToast("找不到该规则", "error");
+    return;
+  }
+  if (rule.live) {
+    showToast("请先把规则切换到模拟盘", "error");
+    return;
+  }
+  workbenchRuleId = ruleId;
+  workbenchReturnFocus = trigger || document.activeElement;
+  workbenchDirty = false;
+  $("workbenchBackdrop").hidden = false;
+  $("workbenchTitle").textContent = `${rule.title} · 模拟交易工作台`;
+  $("workbenchSubtitle").textContent = `${rule.rule_id} · 正在读取盘口…`;
+  $("workbenchStatusGrid").innerHTML = '<p class="muted">读取中…</p>';
+  showInlineMessage("workbenchMessage", "", "");
+  document.body.classList.add("workbench-open");
+  setTimeout(() => $("workbenchClose").focus(), 0);
+  await refreshWorkbench({ resetBook: true });
+}
+
+function closeWorkbench() {
+  if ($("workbenchBackdrop").hidden) return;
+  $("workbenchBackdrop").hidden = true;
+  document.body.classList.remove("workbench-open");
+  const returning = workbenchReturnFocus;
+  workbenchReturnFocus = null;
+  workbenchRuleId = "";
+  workbenchDirty = false;
+  if (returning?.isConnected) setTimeout(() => returning.focus(), 0);
+}
+
+async function runWorkbenchRuleAction(action, button) {
+  const run = async () => {
+    try {
+      await apiPost("trade/rules/action", { rule_id: workbenchRuleId, action });
+      showToast(action === "pause" ? "规则已暂停" : "规则已恢复", "success");
+      await refreshWorkbench({ resetBook: false });
+      await refreshTrade();
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, "处理中…", run) : run());
+}
+
+function collectBookSide(side) {
+  return workbenchBook[side]
+    .map((level) => ({ price: String(level.price || "").trim(), quantity: String(level.quantity || "").trim() }))
+    .filter((level) => level.price || level.quantity);
+}
+
+async function workbenchBookAction(action, button, { requireConfirm = false } = {}) {
+  let confirmed = "";
+  if (requireConfirm) {
+    confirmed = await openModal({
+      title: "恢复跟随真实行情",
+      message: "这会删除当前规则保存的模拟盘口，之后自动检查将重新使用真实行情。",
+    });
+    if (confirmed === null) return;
+  }
+  const run = async () => {
+    try {
+      const payload = { rule_id: workbenchRuleId, action };
+      if (action === "save_apply") {
+        payload.sell_levels = collectBookSide("sell");
+        payload.buy_levels = collectBookSide("buy");
+      }
+      const data = await apiPost("trade/rules/workbench", payload);
+      workbenchDirty = false;
+      renderWorkbench(data);
+      if (action === "load_live" || action === "generate") workbenchDirty = true;
+      const failed = Boolean(data.runtime?.last_error);
+      showToast(data.message || (failed ? "盘口已保存，但执行检查失败" : "操作完成"), failed ? "error" : "success");
+      if (action === "save_apply" || action === "follow_live") await refreshTrade();
+    } catch (error) {
+      showInlineMessage("workbenchMessage", apiError(error), "error");
+      showToast(apiError(error), "error");
+    }
+  };
+  await (button ? runWithBusy(button, action === "save_apply" ? "保存并执行中…" : "处理中…", run) : run());
+}
+
+function updateBookLevel(side, index, field, value) {
+  const level = workbenchBook[side][index];
+  if (!level) return;
+  level[field] = value;
+  workbenchDirty = true;
+  $("bookSource").textContent = "有未保存修改；保存并执行后生效。";
+}
+
+$("workbenchClose").addEventListener("click", closeWorkbench);
+$("workbenchPause").addEventListener("click", () => void runWorkbenchRuleAction("pause", $("workbenchPause")));
+$("workbenchResume").addEventListener("click", () => void runWorkbenchRuleAction("resume", $("workbenchResume")));
+$("workbenchRefresh").addEventListener("click", () => void runWithBusy($("workbenchRefresh"), "刷新中…", () => refreshWorkbench({ resetBook: false })));
+$("bookLoadLive").addEventListener("click", () => void workbenchBookAction("load_live", $("bookLoadLive")));
+$("bookGenerate").addEventListener("click", () => void workbenchBookAction("generate", $("bookGenerate")));
+$("bookFollowLive").addEventListener("click", () => void workbenchBookAction("follow_live", $("bookFollowLive"), { requireConfirm: true }));
+$("bookSaveApply").addEventListener("click", () => void workbenchBookAction("save_apply", $("bookSaveApply")));
+$("addSellLevel").addEventListener("click", () => {
+  workbenchBook.sell.push({ price: workbenchData?.rule?.buy_price || "", quantity: workbenchData?.rule?.quantity || 1 });
+  workbenchDirty = true;
+  $("bookSource").textContent = "有未保存修改；保存并执行后生效。";
+  renderBookSide("sell");
+});
+$("addBuyLevel").addEventListener("click", () => {
+  workbenchBook.buy.push({ price: workbenchData?.rule?.sell_gross_price || "", quantity: workbenchData?.rule?.quantity || 1 });
+  workbenchDirty = true;
+  $("bookSource").textContent = "有未保存修改；保存并执行后生效。";
+  renderBookSide("buy");
+});
+for (const side of ["sell", "buy"]) {
+  $(side === "sell" ? "sellBookBody" : "buyBookBody").addEventListener("input", (event) => {
+    const input = event.target.closest("input[data-book-field]");
+    const row = input?.closest("tr[data-index]");
+    if (!input || !row) return;
+    updateBookLevel(side, Number(row.dataset.index), input.dataset.bookField, input.value);
+  });
+  $(side === "sell" ? "sellBookBody" : "buyBookBody").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-book-delete]");
+    if (!button) return;
+    workbenchBook[side].splice(Number(button.dataset.index), 1);
+    workbenchDirty = true;
+    $("bookSource").textContent = "有未保存修改；保存并执行后生效。";
+    renderBookSide(side);
+  });
+}
+
 // ---------------------------------------------------------------- 自动交易
+function renderGlobalMode(data) {
+  const live = data.mode === "live";
+  const button = $("globalModeSwitch");
+  button.setAttribute("aria-checked", live ? "true" : "false");
+  $("globalModeText").textContent = live ? "实盘" : "模拟盘";
+  $("globalModeLabel").textContent = live
+    ? "实盘许可已开启；仍只会执行已切换为实盘的规则"
+    : "模拟盘，不会下真实订单";
+  const result = data.last_mode_result || {};
+  const skipped = Array.isArray(result.skipped) ? result.skipped : [];
+  if (skipped.length) {
+    showInlineMessage(
+      "globalModeResult",
+      `最近一次批量切换跳过 ${skipped.length} 条规则：${skipped.map((item) => `${item.rule_id}（${item.reason}）`).join("；")}`,
+      "error",
+    );
+  } else {
+    showInlineMessage("globalModeResult", "", "");
+  }
+}
+
 function fillSettings(settings) {
   const form = $("settingsForm");
   if (form.contains(document.activeElement)) return;
@@ -637,9 +887,10 @@ function renderRules(rules) {
     const actions = [
       actionButton("编辑", "edit", rule.rule_id),
       actionButton(rule.enabled ? "暂停" : "恢复", rule.enabled ? "pause" : "resume", rule.rule_id),
-      rule.live
-        ? actionButton("切换到模拟盘", "disarm", rule.rule_id, "secondary")
-        : actionButton("切换到实盘", "arm", rule.rule_id, "danger"),
+      `<button class="rule-mode-toggle toggle-button" type="button" role="switch" aria-checked="${rule.live ? "true" : "false"}" data-action="${rule.live ? "disarm" : "arm"}" data-rule="${escapeHtml(rule.rule_id)}" aria-label="切换 ${escapeHtml(rule.rule_id)} 的模拟盘或实盘环境">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span><b>${rule.live ? "实盘" : "模拟盘"}</b>
+      </button>`,
+      !rule.live ? actionButton("进入模拟盘", "workbench", rule.rule_id, "primary") : "",
       !rule.live ? actionButton("完整模拟演练", "drill", rule.rule_id, "secondary") : "",
       hasOrders ? actionButton("撤销自动订单", "cancel_orders", rule.rule_id, "danger") : "",
       actionButton("删除", "delete", rule.rule_id, "ghost"),
@@ -732,6 +983,7 @@ function renderTrade(data) {
   $("budgetRemaining").textContent = `${data.budget_remaining} GJN`;
   $("dailySpent").textContent = `${data.ledger.daily_spent} GJN`;
   fillSettings(data.settings);
+  renderGlobalMode(data);
   renderRules(data.rules || []);
   renderOrders(data.orders || []);
 }
@@ -815,6 +1067,7 @@ async function drillRule(ruleId, button = null) {
 
 async function runRuleAction(action, ruleId, button = null) {
   if (action === "edit") return editRule(ruleId);
+  if (action === "workbench") return openWorkbench(ruleId, button);
   if (action === "arm") return armRule(ruleId, button);
   if (action === "drill") return drillRule(ruleId, button);
   if (action === "disarm") {
@@ -848,6 +1101,38 @@ $("rulesList").addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   void runRuleAction(button.dataset.action, button.dataset.rule, button);
+});
+
+$("globalModeSwitch").addEventListener("click", async () => {
+  const live = lastOverview?.mode === "live";
+  const target = live ? "paper" : "live";
+  const rules = lastOverview?.rules || [];
+  const summary = rules.length
+    ? rules.map((rule) => `${rule.rule_id}（${rule.live ? "当前实盘" : "当前模拟"}）`).join("\n")
+    : "当前没有交易规则。";
+  const confirmation = await openModal({
+    title: live ? "关闭实盘总开关" : "开启实盘总开关",
+    message: live
+      ? `将尝试把所有实盘规则切回模拟盘；有持仓或挂单的规则会被跳过。\n\n${summary}`
+      : `将尝试把所有安全可切换的规则批量切换为实盘。真实资金风险随后仍然存在。\n\n${summary}`,
+    requireText: !live,
+    placeholder: "LIVE",
+    confirmText: live ? "确认关闭实盘" : "确认批量切换实盘",
+  });
+  if (confirmation === null) return;
+  await runWithBusy($("globalModeSwitch"), live ? "切换中…" : "确认实盘…", async () => {
+    try {
+      const data = await apiPost("trade/mode", { mode: target, confirmation });
+      renderTrade(data.overview);
+      const skipped = data.result?.skipped || [];
+      showToast(
+        skipped.length ? `环境已切换，跳过 ${skipped.length} 条规则` : `全局交易环境已切换为${target === "live" ? "实盘" : "模拟盘"}`,
+        skipped.length ? "error" : "success",
+      );
+    } catch (error) {
+      showToast(apiError(error), "error");
+    }
+  });
 });
 
 $("settingsForm").addEventListener("submit", async (event) => {
@@ -885,11 +1170,12 @@ $("ruleForm").addEventListener("submit", async (event) => {
   if (editId) payload.rule_id = editId;
   await runWithBusy(formSubmitter(event), "保存中…", async () => {
     try {
-      await apiPost("trade/rules/save", payload);
-      showToast(editId ? "规则已更新" : "规则已创建", "success");
+      const saved = await apiPost("trade/rules/save", payload);
+      showToast(editId ? "规则已更新" : "规则已创建，正在打开模拟工作台", "success");
       $("ruleUrl").disabled = false;
       resetRuleForm();
       await refreshTrade();
+      if (!editId && saved?.rule?.rule_id) await openWorkbench(saved.rule.rule_id);
     } catch (error) {
       showToast(apiError(error), "error");
     }
@@ -930,6 +1216,25 @@ $("refreshBtn").addEventListener("click", async () => {
   });
 });
 
+$("workbenchBackdrop").addEventListener("click", (event) => {
+  if (event.target === $("workbenchBackdrop")) closeWorkbench();
+});
+$("workbenchBackdrop").addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const focusables = [...$("workbenchBackdrop").querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled)")]
+    .filter((element) => element.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+
 $("modalCancel").addEventListener("click", () => closeModal(null));
 $("modalConfirm").addEventListener("click", () => closeModal($("modalInput").value));
 $("modalInput").addEventListener("keydown", (event) => {
@@ -954,7 +1259,9 @@ $("modalBackdrop").addEventListener("keydown", (event) => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !$("modalBackdrop").hidden) closeModal(null);
+  if (event.key !== "Escape") return;
+  if (!$("modalBackdrop").hidden) closeModal(null);
+  else if (!$("workbenchBackdrop").hidden) closeWorkbench();
 });
 
 await bridge.ready();
@@ -965,6 +1272,7 @@ if (activeTab === "trade") await refreshTrade({ resetLogs: true });
 setInterval(() => {
   void loadAccount();
   if (activeTab === "trade") void refreshTrade();
+  if (!$("workbenchBackdrop").hidden) void refreshWorkbench({ resetBook: false });
 }, 3000);
 bridge.onContext(() => {
   document.title = bridge.t("views.trade.title", "Gaijin Market 控制台");

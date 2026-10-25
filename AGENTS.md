@@ -91,6 +91,27 @@ Test-only work must not change plugin code.
 - Capture the server-side cause when a generic UI error appears; record it in
   the report and AstrBot logs.
 
+### Trade workbench and paper-book matrix
+
+- Verify `/gjm trade` without a subcommand returns an annotated parameter-insufficient command tree, and that
+  `/gjm trade help` plus `/gjm trade help <subcommand>` show usage, examples, and live-risk notes.
+- Create a paper rule from the WebUI and confirm the full-screen workbench opens automatically. Verify the
+  two-pane status/order-book layout, focus trap, Escape close, focus return, 390x844 stacking, and both themes.
+- Exercise sell and buy level add/edit/delete, duplicate-price and two-decimal validation, 100-level limit,
+  crossed books, load-live preview, rule-generated book, save-and-run, reload persistence, and follow-live reset.
+- Confirm every paper-book action reports loading, success, or a concrete error; async controls must show busy
+  state and reject duplicate clicks. Verify the page never calls real buy/sell/cancel APIs from paper mode.
+- Verify a live rule cannot open or use the workbench. Switch a test paper rule to live only in MockTransport or
+  unit tests; never enable live funds during user acceptance.
+- Verify all checkbox-like controls use keyboard-operable `role=switch` semantics, visible focus, at least
+  24x24px effective targets, and immediate pressed feedback.
+- Verify the global environment switch displays an accurate risk summary. Acceptance testing may cancel the
+  confirmation and test zero-limit rejection; it must not confirm global live mode or raise any live limit.
+- Check incremental logs for paper-book edits, state transitions, batch mode results, and errors; confirm no
+  duplicated nodes and that only the owner's private session receives trade-template notifications.
+- Before cleanup, reload the plugin and verify the saved paper book, rule state, and global mode are recovered.
+  Then delete test rules and books, restore rules/limits/templates/global mode, and confirm no auto orders remain.
+
 ### QQ private and group matrix
 
 - Private chat commands do not use an @ mention; send `/gjm ...` directly.
@@ -126,3 +147,6 @@ Test-only work must not change plugin code.
 - Any unmitigated P2 keeps the result at FAIL for release purposes.
 - Restore and verify all mutable test data. Append-only logs and chat history
   must be documented as expected residue.
+- Record workbench layout, switch semantics, paper-book persistence, global-mode
+  cancellation, and private-notification evidence with redacted screenshots or
+  API/response excerpts.

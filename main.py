@@ -87,6 +87,7 @@ FORMER_TRADE_FILES = (
     "trade_runtime.json",
     "trade_settings.json",
     "trade_ledger.json",
+    "trade_paper_books.json",
     "trade_events.json",
     "trade_logs_meta.json",
 )
@@ -98,6 +99,92 @@ LEGACY_UI_KEYS = (
     "user_subscriptions",
     "payload",
 )
+TRADE_COMMAND_HELP = {
+    "add": {
+        "usage": "/gjm trade add <物品链接> <买入价> <数量> <税后卖出价> <once|loop>",
+        "detail": "新建模拟交易规则；新规则默认模拟盘，不会下真实订单。",
+        "example": "/gjm trade add https://trade.gaijin.net/market/1067/item 8.00 1 9.00 once",
+        "risk": "仅创建规则，不触发实盘。",
+    },
+    "list": {
+        "usage": "/gjm trade list",
+        "detail": "列出全部规则的环境、启停状态、阶段、价格和数量。",
+        "example": "/gjm trade list",
+        "risk": "只读，不会交易。",
+    },
+    "show": {
+        "usage": "/gjm trade show <规则ID>",
+        "detail": "查看单条规则的持仓、成本、到账、挂单和错误详情。",
+        "example": "/gjm trade show T1234ABCD",
+        "risk": "只读，不会交易。",
+    },
+    "arm": {
+        "usage": "/gjm trade arm <规则ID> [confirm]",
+        "detail": "把规则切换为实盘；第一次查看风险摘要，60 秒内再次发送并输入规则 ID 确认。",
+        "example": "/gjm trade arm T1234ABCD confirm",
+        "risk": "确认后可能产生真实资金订单；必须先开启全局实盘总开关。",
+    },
+    "disarm": {
+        "usage": "/gjm trade disarm <规则ID>",
+        "detail": "退出实盘并恢复模拟盘；有持仓或自动挂单时会拒绝。",
+        "example": "/gjm trade disarm T1234ABCD",
+        "risk": "不会自动清仓。",
+    },
+    "pause": {
+        "usage": "/gjm trade pause <规则ID>",
+        "detail": "暂停规则检查，不撤销已有订单。",
+        "example": "/gjm trade pause T1234ABCD",
+        "risk": "已有实盘订单仍可能存在，需要时使用 cancel。",
+    },
+    "resume": {
+        "usage": "/gjm trade resume <规则ID>",
+        "detail": "恢复规则自动检查。",
+        "example": "/gjm trade resume T1234ABCD",
+        "risk": "恢复实盘规则可能继续尝试下单。",
+    },
+    "cancel": {
+        "usage": "/gjm trade cancel <规则ID>",
+        "detail": "撤销本插件跟踪的自动订单，并暂停该规则。",
+        "example": "/gjm trade cancel T1234ABCD",
+        "risk": "会调用官方撤单接口，但不会卖出持仓。",
+    },
+    "delete": {
+        "usage": "/gjm trade delete <规则ID>",
+        "detail": "删除规则及其模拟盘口；有持仓或自动挂单时拒绝。",
+        "example": "/gjm trade delete T1234ABCD",
+        "risk": "删除后不能恢复该规则。",
+    },
+    "orders": {
+        "usage": "/gjm trade orders",
+        "detail": "列出本插件跟踪的当前自动订单。",
+        "example": "/gjm trade orders",
+        "risk": "只读，不会撤单。",
+    },
+    "log": {
+        "usage": "/gjm trade log [1-50]",
+        "detail": "查看最近 N 条交易事件，默认 10 条。",
+        "example": "/gjm trade log 20",
+        "risk": "只读，不会交易。",
+    },
+    "budget": {
+        "usage": "/gjm trade budget",
+        "detail": "查看总开关、全局交易环境、预算、每日限额和单笔上限。",
+        "example": "/gjm trade budget",
+        "risk": "只读，不会交易。",
+    },
+    "stop-all": {
+        "usage": "/gjm trade stop-all confirm",
+        "detail": "急停：撤销本插件跟踪的全部订单并暂停所有规则。",
+        "example": "/gjm trade stop-all confirm",
+        "risk": "会调用官方撤单接口；持仓不会被卖出。",
+    },
+    "help": {
+        "usage": "/gjm trade help [子命令]",
+        "detail": "查看交易命令用途、参数、示例和风险说明。",
+        "example": "/gjm trade help arm",
+        "risk": "只读，不会交易。",
+    },
+}
 
 
 def _can_cleanup_legacy_config(
@@ -132,7 +219,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "Gaijin 市场行情监控插件升级版，使用 /gjm 指令命名空间；"
         "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.20.3",
+    "2.21.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -544,6 +631,8 @@ class GaijinMarketWatcher(Star):
             ("trade/rules/save", self._trade_web_save_rule, ["POST"]),
             ("trade/rules/action", self._trade_web_action, ["POST"]),
             ("trade/rules/drill", self._trade_web_drill, ["POST"]),
+            ("trade/rules/workbench", self._trade_web_workbench, ["GET", "POST"]),
+            ("trade/mode", self._trade_web_mode, ["POST"]),
             ("trade/stop-all", self._trade_web_stop_all, ["POST"]),
             ("trade/logs", self._trade_web_logs, ["GET"]),
         ]
@@ -887,6 +976,51 @@ class GaijinMarketWatcher(Star):
         self.logger.info(f"[GJM Trade] WebUI 模拟演练 {rule_id} / {self._trade_web_actor()}")
         return json_response(result)
 
+    async def _trade_web_workbench(self):
+        method = str(getattr(request, "method", "GET") or "GET").upper()
+        try:
+            if method == "GET":
+                rule_id = str(request.query.get("rule_id") or "").strip()
+                if not rule_id:
+                    return error_response("缺少 rule_id", status_code=400)
+                return json_response(await self.trader.workbench_view(rule_id))
+
+            payload = await request.json(default={})
+            if not isinstance(payload, dict):
+                return error_response("请求体必须是 JSON 对象", status_code=400)
+            rule_id = str(payload.get("rule_id") or "").strip()
+            action = str(payload.get("action") or "").strip()
+            result = await self.trader.workbench_action(
+                rule_id,
+                action,
+                sell_levels=payload.get("sell_levels"),
+                buy_levels=payload.get("buy_levels"),
+            )
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 模拟工作台失败: {exc}")
+            return error_response("模拟工作台操作失败", status_code=500)
+        self.logger.info(f"[GJM Trade] WebUI 模拟工作台 {action} / {rule_id} / {self._trade_web_actor()}")
+        return json_response(result)
+
+    async def _trade_web_mode(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        mode = str(payload.get("mode") or "").strip().lower()
+        try:
+            result = await self.trader.set_global_mode(mode, str(payload.get("confirmation") or ""))
+        except (TradeError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Trade] WebUI 切换全局交易环境失败: {exc}")
+            return error_response("切换全局交易环境失败", status_code=500)
+        self.logger.warning(f"[GJM Trade] WebUI 切换全局交易环境 {mode} / {self._trade_web_actor()}")
+        return json_response({"result": result, "overview": self.trader.overview()})
+
     async def _trade_web_stop_all(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict) or str(payload.get("confirmation") or "").strip().lower() != "stop-all":
@@ -966,7 +1100,8 @@ class GaijinMarketWatcher(Star):
             "/gjm refresh mode <模式>  always / only_change\n"
             "/gjm refresh interval <秒> [链接|编号]\n"
             "群聊会自动按固定间隔发送全部订阅物品和价格图\n"
-            "/gjm trade             自动交易（仅拥有者私聊）\n"
+            "/gjm trade help        自动交易命令说明（拥有者私聊）\n"
+            "/gjm trade ...         规则、模拟工作台、预算、日志与急停\n"
             "/gjm debug             排障信息"
         )
 
@@ -1233,8 +1368,38 @@ class GaijinMarketWatcher(Star):
     def gjm_trade(self):
         """自动交易指令组（仅拥有者私聊）。"""
 
+    @gjm_trade.command("help")
+    async def gjm_trade_help(self, event: AstrMessageEvent):
+        """help：查看交易命令说明；/gjm trade help [子命令]。"""
+        self._remember(event)
+        event.stop_event()
+        error = self._trade_access_error(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        topic = _args_after(event, "gjm", "trade", "help").strip().lower()
+        if topic:
+            item = TRADE_COMMAND_HELP.get(topic)
+            if item is None:
+                yield event.plain_result(f"未知交易子命令：{topic}\n发送 /gjm trade help 查看全部命令。")
+                return
+            yield event.plain_result(
+                f"【/gjm trade {topic}】\n"
+                f"用法：{item['usage']}\n"
+                f"说明：{item['detail']}\n"
+                f"示例：{item['example']}\n"
+                f"风险：{item['risk']}"
+            )
+            return
+        lines = ["【自动交易命令说明】"]
+        for item in TRADE_COMMAND_HELP.values():
+            lines.append(f"{item['usage']}\n  {item['detail']}")
+        lines.append("查看单个命令详情：/gjm trade help <子命令>")
+        yield event.plain_result("\n".join(lines))
+
     @gjm_trade.command("add")
     async def gjm_trade_add(self, event: AstrMessageEvent):
+        """add：新建模拟规则；参数 <链接> <买入价> <数量> <税后卖出价> <once|loop>；默认不下真单。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1265,11 +1430,13 @@ class GaijinMarketWatcher(Star):
             f"买入：{rule.buy_price_raw / 10000:.2f} GJN × {rule.quantity}\n"
             f"税后卖出：{rule.sell_net_price_raw / 10000:.2f} GJN\n"
             f"模式：{rule.mode}\n"
-            f"实盘切换：/gjm trade arm {rule.rule_id}"
+            f"模拟工作台：请在插件控制台“自动交易”中点击“进入模拟盘”\n"
+            f"实盘切换：/gjm trade arm {rule.rule_id}（需先开启全局实盘总开关）"
         )
 
     @gjm_trade.command("list")
     async def gjm_trade_list(self, event: AstrMessageEvent):
+        """list：列出规则环境、启停、阶段、价格和数量；只读。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1288,6 +1455,7 @@ class GaijinMarketWatcher(Star):
                 f"{'启用' if rule.enabled else '停用'}  {runtime.phase}\n"
                 f"  {rule.title}｜买 {rule.buy_price_raw / 10000:.2f}｜数量 {rule.quantity}｜"
                 f"税后卖 {rule.sell_net_price_raw / 10000:.2f}｜{rule.mode}"
+                f"{'｜独立模拟盘口' if self.trader.store.get_paper_book(rule.rule_id) else ''}"
             )
             if runtime.last_error:
                 lines.append(f"  错误：{runtime.last_error}")
@@ -1295,6 +1463,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("show")
     async def gjm_trade_show(self, event: AstrMessageEvent):
+        """show：查看单条规则详情；格式 /gjm trade show <规则ID>；只读。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1328,6 +1497,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("budget")
     async def gjm_trade_budget(self, event: AstrMessageEvent):
+        """budget：查看总开关、交易环境、预算和风险额度；只读。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1340,6 +1510,7 @@ class GaijinMarketWatcher(Star):
         yield event.plain_result(
             "【自动交易预算】\n"
             f"总开关：{'开' if settings['enabled'] else '关'}\n"
+            f"全局交易环境：{'实盘' if data.get('mode') == 'live' else '模拟盘'}\n"
             f"总投入预算：{settings['total_budget']} GJN｜当前占用 {data['exposure']}｜"
             f"剩余 {data['budget_remaining']}\n"
             f"每日限额：{settings['daily_limit']} GJN｜今日已用 {ledger['daily_spent']}｜"
@@ -1349,6 +1520,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("arm")
     async def gjm_trade_arm(self, event: AstrMessageEvent):
+        """arm：切换实盘；先查看风险，再发送 /gjm trade arm <规则ID> confirm；可能产生真实订单。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1371,6 +1543,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("disarm")
     async def gjm_trade_disarm(self, event: AstrMessageEvent):
+        """disarm：退出实盘并恢复模拟盘；有持仓或自动挂单时拒绝。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1387,6 +1560,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("pause")
     async def gjm_trade_pause(self, event: AstrMessageEvent):
+        """pause：暂停规则检查；不撤销已有订单。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1403,6 +1577,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("resume")
     async def gjm_trade_resume(self, event: AstrMessageEvent):
+        """resume：恢复规则检查；实盘规则可能继续下单。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1419,6 +1594,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("cancel")
     async def gjm_trade_cancel(self, event: AstrMessageEvent):
+        """cancel：撤销本插件自动订单并暂停规则；不会卖出持仓。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1435,6 +1611,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("delete")
     async def gjm_trade_delete(self, event: AstrMessageEvent):
+        """delete：删除规则和模拟盘口；有持仓或自动挂单时拒绝。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1451,6 +1628,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("orders")
     async def gjm_trade_orders(self, event: AstrMessageEvent):
+        """orders：列出本插件跟踪的自动订单；只读。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1469,6 +1647,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("log")
     async def gjm_trade_log(self, event: AstrMessageEvent):
+        """log：查看最近交易事件；格式 /gjm trade log [1-50]；只读。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
@@ -1493,6 +1672,7 @@ class GaijinMarketWatcher(Star):
 
     @gjm_trade.command("stop-all")
     async def gjm_trade_stop_all(self, event: AstrMessageEvent):
+        """stop-all：撤销全部自动订单并暂停规则；必须发送 /gjm trade stop-all confirm。"""
         self._remember(event)
         event.stop_event()
         error = self._trade_access_error(event)
