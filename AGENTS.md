@@ -96,11 +96,18 @@ Test-only work must not change plugin code.
 - Verify `/gjm trade` without a subcommand returns an annotated parameter-insufficient command tree, and that
   `/gjm trade help` plus `/gjm trade help <subcommand>` show usage, examples, and live-risk notes.
 - Create a paper rule from the WebUI and confirm the full-screen workbench opens automatically. Verify the
-  two-pane status/order-book layout, focus trap, Escape close, focus return, 390x844 stacking, and both themes.
-- Exercise sell and buy level add/edit/delete, duplicate-price and two-decimal validation, 100-level limit,
-  crossed books, load-live preview, rule-generated book, save-and-run, reload persistence, and follow-live reset.
-- Confirm every paper-book action reports loading, success, or a concrete error; async controls must show busy
-  state and reject duplicate clicks. Verify the page never calls real buy/sell/cancel APIs from paper mode.
+  two-pane status/market layout, focus trap, Escape close, focus return, 390x844 stacking, and both themes.
+- Verify the SVG depth chart draws green cumulative buy depth on the left and red cumulative sell depth on the
+  right, with quantity and price axes, best-bid/best-ask markers, rule thresholds, cross-book handling, hover
+  details, empty state, accessible summary, and no horizontal overflow.
+- Exercise the stock-style order console: buy/sell switching, price and quantity validation, decimal limits,
+  quantity shortcuts, buy cost preview, fixed-15% sell proceeds preview, inline errors, and keyboard operation.
+- Exercise immediate add/edit/delete behavior. Each mutation must call `save_apply` exactly once, show a Toast
+  and the latest-action status line, highlight the changed level, and reject duplicate clicks while busy.
+- Verify duplicate-price rejection, 100-level limit, delete confirmation/cancel, load-live and rule-generated
+  book application, reload persistence, and follow-live reset. A failed mutation must leave chart and levels unchanged.
+- Confirm every paper-book action reports loading, success, or a concrete error and never calls real
+  buy/sell/cancel APIs from paper mode.
 - Verify a live rule cannot open or use the workbench. Switch a test paper rule to live only in MockTransport or
   unit tests; never enable live funds during user acceptance.
 - Verify all checkbox-like controls use keyboard-operable `role=switch` semantics, visible focus, at least

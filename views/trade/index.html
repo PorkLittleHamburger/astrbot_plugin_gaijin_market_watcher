@@ -71,31 +71,68 @@
                 <button id="bookGenerate" class="button primary" type="button">按规则生成可成交盘口</button>
                 <button id="bookFollowLive" class="button ghost" type="button">恢复跟随真实行情</button>
               </div>
-              <div class="book-columns">
-                <section class="book-side" aria-labelledby="sellBookTitle">
-                  <div class="book-heading"><h4 id="sellBookTitle">卖单 SELL</h4><span id="sellDepth" class="muted">深度 0</span></div>
-                  <div class="book-table-wrap">
-                    <table class="book-table">
-                      <thead><tr><th>价格 GJN</th><th>数量</th><th>累计</th><th><span class="sr-only">操作</span></th></tr></thead>
-                      <tbody id="sellBookBody"></tbody>
-                    </table>
-                  </div>
-                  <button id="addSellLevel" class="button small ghost" type="button">新增卖单档位</button>
-                </section>
-                <section class="book-side" aria-labelledby="buyBookTitle">
-                  <div class="book-heading"><h4 id="buyBookTitle">买单 BUY</h4><span id="buyDepth" class="muted">深度 0</span></div>
-                  <div class="book-table-wrap">
-                    <table class="book-table">
-                      <thead><tr><th>价格 GJN</th><th>数量</th><th>累计</th><th><span class="sr-only">操作</span></th></tr></thead>
-                      <tbody id="buyBookBody"></tbody>
-                    </table>
-                  </div>
-                  <button id="addBuyLevel" class="button small ghost" type="button">新增买单档位</button>
-                </section>
+              <div class="book-action-strip" role="status" aria-live="polite" aria-atomic="true">
+                <span class="book-action-dot"></span>
+                <div><strong id="bookActionStatus">正在等待新操作…</strong><small id="bookActionDetail">通过下方控制台调整模拟盘口，每次修改都会立即执行纸面检查。</small></div>
               </div>
-              <div class="book-footer">
-                <p class="muted">允许买卖价格交叉，以便一次测试完整买卖流程。保存后会立即执行一次纸面检查。</p>
-                <button id="bookSaveApply" class="button primary" type="button">保存盘口并执行</button>
+
+              <div class="depth-chart-wrap">
+                <svg id="depthChart" class="depth-chart" role="img" aria-label="模拟盘口累计深度图"></svg>
+                <div id="depthChartEmpty" class="depth-chart-empty" hidden>暂无盘口档位</div>
+                <div id="depthChartTooltip" class="depth-tooltip" hidden></div>
+              </div>
+              <div class="depth-legend" aria-hidden="true">
+                <span class="buy">买单累计</span><span class="sell">卖单累计</span><span class="threshold">虚线：规则阈值</span>
+              </div>
+              <p id="depthChartSummary" class="sr-only" aria-live="polite"></p>
+
+              <div class="market-workspace">
+                <section class="order-console" aria-labelledby="orderConsoleTitle">
+                  <div class="console-heading"><div><h4 id="orderConsoleTitle">盘口控制台</h4><p class="muted">新增或修改模拟市场挂单，不会提交真实委托。</p></div><span id="orderConsoleMode" class="pill">新增</span></div>
+                  <div class="side-selector" role="group" aria-label="选择买卖方向">
+                    <button id="orderSideBuy" class="side-button buy active" type="button" aria-pressed="true">买入</button>
+                    <button id="orderSideSell" class="side-button sell" type="button" aria-pressed="false">卖出</button>
+                  </div>
+                  <form id="bookOrderForm" class="order-ticket" novalidate>
+                    <label class="span-2"><span>价格 (GJN)</span>
+                      <div class="price-stepper">
+                        <button id="orderPriceDown" type="button" class="button small ghost" aria-label="价格减少 0.01">−</button>
+                        <input id="orderPrice" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00" />
+                        <button id="orderPriceUp" type="button" class="button small ghost" aria-label="价格增加 0.01">+</button>
+                      </div>
+                    </label>
+                    <label class="span-2"><span>数量</span><input id="orderQuantity" type="number" min="1" step="1" value="1" /></label>
+                    <div class="quantity-shortcuts span-2" aria-label="快捷数量">
+                      <button type="button" class="chip-button" data-quantity="1">1</button>
+                      <button type="button" class="chip-button" data-quantity="5">5</button>
+                      <button type="button" class="chip-button" data-quantity="10">10</button>
+                      <button type="button" class="chip-button" data-quantity="rule">规则数量</button>
+                    </div>
+                    <div class="order-preview span-2">
+                      <span id="orderPreviewLabel">预计支出</span><strong id="orderPreviewValue">0.00 GJN</strong>
+                      <small id="orderPreviewHint">买入档位会增加模拟市场的求购深度。</small>
+                    </div>
+                    <div id="bookOrderMessage" class="inline-message span-2" role="alert" aria-live="assertive" hidden></div>
+                    <div class="form-actions span-2">
+                      <button id="bookOrderCancelEdit" class="button ghost" type="button" hidden>取消编辑</button>
+                      <button id="bookOrderSubmit" class="button primary" type="submit">添加买单</button>
+                    </div>
+                  </form>
+                </section>
+
+                <section class="level-board" aria-labelledby="levelBoardTitle">
+                  <div class="section-heading"><div><h4 id="levelBoardTitle">当前档位</h4><p class="muted">点击档位可载入控制台修改；删除后立即执行检查。</p></div></div>
+                  <div class="level-columns">
+                    <section class="level-side buy" aria-labelledby="buyLevelTitle">
+                      <div class="level-heading"><h4 id="buyLevelTitle">买单 BUY <span id="buyDepth" class="muted">0 档 / 深度 0</span></h4><button class="button small ghost" type="button" data-open-order="buy">新增买单</button></div>
+                      <div id="buyLevelList" class="level-list" role="list"></div>
+                    </section>
+                    <section class="level-side sell" aria-labelledby="sellLevelTitle">
+                      <div class="level-heading"><h4 id="sellLevelTitle">卖单 SELL <span id="sellDepth" class="muted">0 档 / 深度 0</span></h4><button class="button small ghost" type="button" data-open-order="sell">新增卖单</button></div>
+                      <div id="sellLevelList" class="level-list" role="list"></div>
+                    </section>
+                  </div>
+                </section>
               </div>
             </section>
           </div>
