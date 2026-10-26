@@ -1,4 +1,11 @@
 import { createDepthChart } from "./depth-chart.mjs";
+import {
+  MAX_BOOK_LEVELS,
+  MAX_BOOK_QUANTITY,
+  findBookLevelIndex,
+  priceToRaw,
+  sellerNet,
+} from "./book-model.mjs";
 
 const bridge = window.AstrBotPluginView;
 const $ = (id) => document.getElementById(id);
@@ -31,7 +38,6 @@ async function runWithBusy(button, label, task) {
   const hadFocus = document.activeElement === button;
   const returnSelector = focusSelector(button);
   const original = {
-    text: button.textContent,
     html: button.innerHTML,
     disabled: button.disabled,
     ariaLabel: button.getAttribute("aria-label"),
@@ -56,6 +62,36 @@ async function runWithBusy(button, label, task) {
         if (target instanceof HTMLElement && !target.disabled) target.focus();
       }, 0);
     }
+  }
+}
+
+async function runModeToggleBusy(button, label, task) {
+  if (!button || button.dataset.busy === "1") return undefined;
+  const labelNode = button.querySelector("[data-busy-label]");
+  const hadFocus = document.activeElement === button;
+  const original = {
+    label: labelNode?.textContent || "",
+    disabled: button.disabled,
+    ariaLabel: button.getAttribute("aria-label"),
+  };
+  button.dataset.busy = "1";
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.setAttribute("aria-label", label);
+  if (labelNode) labelNode.textContent = label;
+  try {
+    return await task();
+  } finally {
+    button.dataset.busy = "";
+    button.disabled = original.disabled;
+    button.removeAttribute("aria-busy");
+    if (original.ariaLabel === null) button.removeAttribute("aria-label");
+    else button.setAttribute("aria-label", original.ariaLabel);
+    if (labelNode?.isConnected) {
+      if (lastOverview) renderGlobalMode(lastOverview);
+      else labelNode.textContent = original.label;
+    }
+    if (hadFocus) setTimeout(() => button.focus(), 0);
   }
 }
 
@@ -661,9 +697,10 @@ function setBookActionStatus(message, detail = "", kind = "") {
 }
 
 function normalizeBookLevel(level) {
+  const raw = Number(level?.price_raw);
   return {
     price: String(level?.price ?? ""),
-    price_raw: Number(level?.price_raw || Math.round(Number(level?.price || 0) * 10000)),
+    price_raw: Number.isFinite(raw) && raw > 0 ? raw : priceToRaw(level?.price) ?? 0,
     quantity: String(level?.quantity ?? ""),
   };
 }
@@ -704,17 +741,14 @@ function renderBook(book) {
   if (workbenchChart) workbenchChart.render(book || {}, workbenchData?.rule || {}, { highlight: highlightedBookLevel });
 }
 
-function sellerNet(price) {
-  return Math.floor(Number(price || 0) * 0.85 * 100) / 100;
-}
-
 function updateOrderPreview() {
-  const price = Number($("orderPrice").value || 0);
+  const priceText = $("orderPrice").value.trim();
+  const price = Number(priceText || 0);
   const quantity = Math.max(0, Number($("orderQuantity").value || 0));
   const total = price * quantity;
   if (bookConsoleSide === "sell") {
     $("orderPreviewLabel").textContent = "预计到手（税后）";
-    $("orderPreviewValue").textContent = `${sellerNet(total).toFixed(2)} GJN`;
+    $("orderPreviewValue").textContent = `${sellerNet(priceText, quantity).toFixed(2)} GJN`;
     $("orderPreviewHint").textContent = `挂单总额 ${total.toFixed(2)} GJN，固定扣除 15% 手续费。`;
   } else {
     $("orderPreviewLabel").textContent = "预计支出";
@@ -766,7 +800,7 @@ function setConsoleSide(side, { reset = true } = {}) {
 function beginEditLevel(side, index) {
   const level = workbenchBook[side]?.[Number(index)];
   if (!level) return;
-  editingBookLevel = { side, index: Number(index) };
+  editingBookLevel = { side, priceRaw: Number(level.price_raw) };
   bookConsoleSide = side;
   $("orderPrice").value = level.price;
   $("orderQuantity").value = level.quantity;
@@ -959,21 +993,33 @@ async function submitBookOrder(event) {
     $("orderPrice").focus();
     return;
   }
-  if (!/^\d+$/.test(rawQuantity) || Number(rawQuantity) < 1 || Number(rawQuantity) > 1_000_000) {
-    showBookOrderError("数量必须是 1 到 1000000 之间的整数");
+  if (!/^\d+$/.test(rawQuantity) || Number(rawQuantity) < 1 || Number(rawQuantity) > MAX_BOOK_QUANTITY) {
+    showBookOrderError(`数量必须是 1 到 ${MAX_BOOK_QUANTITY} 之间的整数`);
     $("orderQuantity").focus();
     return;
   }
   const price = Number(rawPrice);
   const quantity = Number(rawQuantity);
-  const priceRaw = Math.round(price * 10000);
+  const priceRaw = priceToRaw(rawPrice);
+  if (priceRaw === null) {
+    showBookOrderError("价格必须大于 0，且最多保留两位小数");
+    $("orderPrice").focus();
+    return;
+  }
   const nextBuy = workbenchBook.buy.map((level) => ({ ...level }));
   const nextSell = workbenchBook.sell.map((level) => ({ ...level }));
-  let target = side === "buy" ? nextBuy : nextSell;
-  let verb = editingBookLevel ? "更新" : "添加";
-  if (editingBookLevel) target.splice(editingBookLevel.index, 1);
-  if (target.length >= 100) {
-    showBookOrderError("单侧最多允许 100 个档位");
+  const target = side === "buy" ? nextBuy : nextSell;
+  const verb = editingBookLevel ? "更新" : "添加";
+  if (editingBookLevel) {
+    const editIndex = findBookLevelIndex(target, editingBookLevel.priceRaw);
+    if (editIndex < 0) {
+      showBookOrderError("当前档位已刷新，请重新选择要修改的档位");
+      return;
+    }
+    target.splice(editIndex, 1);
+  }
+  if (target.length >= MAX_BOOK_LEVELS) {
+    showBookOrderError(`单侧最多允许 ${MAX_BOOK_LEVELS} 个档位`);
     return;
   }
   if (target.some((level) => Number(level.price_raw) === priceRaw)) {
@@ -1002,7 +1048,12 @@ async function deleteBookLevel(side, index) {
   const nextBuy = workbenchBook.buy.map((item) => ({ ...item }));
   const nextSell = workbenchBook.sell.map((item) => ({ ...item }));
   const target = side === "buy" ? nextBuy : nextSell;
-  target.splice(Number(index), 1);
+  const currentIndex = findBookLevelIndex(target, level.price_raw);
+  if (currentIndex < 0) {
+    showBookOrderError("当前档位已刷新，请重新选择要删除的档位");
+    return;
+  }
+  target.splice(currentIndex, 1);
   await saveBookPayload(
     nextBuy,
     nextSell,
@@ -1366,7 +1417,13 @@ $("globalModeSwitch").addEventListener("click", async () => {
   const target = live ? "paper" : "live";
   const rules = lastOverview?.rules || [];
   const summary = rules.length
-    ? rules.map((rule) => `${rule.rule_id}（${rule.live ? "当前实盘" : "当前模拟"}）`).join("\n")
+    ? rules
+        .map((rule) => {
+          const phase = rule.runtime?.phase || "";
+          const state = phase === "completed" ? "已完成" : !rule.enabled ? "当前暂停" : rule.live ? "当前实盘" : "当前模拟";
+          return `${rule.rule_id}（${state}）`;
+        })
+        .join("\n")
     : "当前没有交易规则。";
   const confirmation = await openModal({
     title: live ? "关闭实盘总开关" : "开启实盘总开关",
@@ -1378,7 +1435,7 @@ $("globalModeSwitch").addEventListener("click", async () => {
     confirmText: live ? "确认关闭实盘" : "确认批量切换实盘",
   });
   if (confirmation === null) return;
-  await runWithBusy($("globalModeSwitch"), live ? "切换中…" : "确认实盘…", async () => {
+  await runModeToggleBusy($("globalModeSwitch"), live ? "切换中…" : "确认实盘…", async () => {
     try {
       const data = await apiPost("trade/mode", { mode: target, confirmation });
       renderTrade(data.overview);

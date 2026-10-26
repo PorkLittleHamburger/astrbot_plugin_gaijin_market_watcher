@@ -921,6 +921,53 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["rule_id"] for item in back["skipped"]], [first.rule_id])
         self.assertTrue(next(rule for rule in self.trader.store.rules if rule.rule_id == first.rule_id).live)
 
+    async def test_global_mode_preserves_paused_and_completed_rules(self) -> None:
+        eligible = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item-a",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        paused = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item-b",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        completed = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item-c",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        await self.trader.action(paused.rule_id, "pause")
+        completed_runtime = self.trader.store.get_runtime(completed.rule_id)
+        completed_runtime.phase = PHASE_COMPLETED
+        completed.enabled = False
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+
+        result = await self.trader.set_global_mode("live", "LIVE")
+
+        self.assertTrue(self.trader.store.settings.live_mode_enabled)
+        self.assertEqual([item["rule_id"] for item in result["switched"]], [eligible.rule_id])
+        reasons = {item["rule_id"]: item["reason"] for item in result["skipped"]}
+        self.assertIn(paused.rule_id, reasons)
+        self.assertIn(completed.rule_id, reasons)
+        self.assertFalse(paused.enabled)
+        self.assertFalse(paused.live)
+        self.assertFalse(completed.enabled)
+        self.assertFalse(completed.live)
+        self.assertEqual(completed_runtime.phase, PHASE_COMPLETED)
+
     async def test_global_mode_network_failure_skips_without_aborting_batch(self) -> None:
         rule = await self.trader.create_rule(
             url="https://trade.gaijin.net/market/1067/item",
@@ -999,6 +1046,38 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["book"]["best_sell"], "7.00")
         self.assertIsNone(self.trader.store.get_paper_book(rule.rule_id))
 
+    async def test_workbench_view_releases_action_lock_during_live_fetch(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_fetch(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return self._book(sells=[(90_000, 1)], buys=[(100_000, 1)])
+
+        self.client.fetch_book = slow_fetch
+        view_task = asyncio.create_task(self.trader.workbench_view(rule.rule_id))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        lock_free = False
+        try:
+            await asyncio.wait_for(self.trader._action_lock.acquire(), timeout=0.5)
+            lock_free = True
+        finally:
+            if lock_free:
+                self.trader._action_lock.release()
+            release.set()
+
+        view = await asyncio.wait_for(view_task, timeout=1)
+        self.assertTrue(lock_free)
+        self.assertEqual(view["book_source"], "live")
+
     def test_corrupt_paper_book_file_is_ignored(self) -> None:
         rule = TradeRule(
             rule_id="T1",
@@ -1059,6 +1138,25 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
                 "卖单",
                 reverse=False,
             )
+        with self.assertRaisesRegex(TradeError, "数量必须是整数"):
+            AutoTrader._parse_paper_levels(
+                [{"price": "8.00", "quantity": 1.9}],
+                "卖单",
+                reverse=False,
+            )
+        with self.assertRaisesRegex(TradeError, "原始价格必须是整数"):
+            AutoTrader._parse_paper_levels(
+                [{"price_raw": 80_000.9, "quantity": 1}],
+                "卖单",
+                reverse=False,
+            )
+        parsed = AutoTrader._parse_paper_levels(
+            [{"price_raw": "80000", "quantity": 1.0}],
+            "卖单",
+            reverse=False,
+        )
+        self.assertEqual(parsed[0].price_raw, 80_000)
+        self.assertEqual(parsed[0].amount, 1)
 
     async def test_global_mode_persists_after_store_reload(self) -> None:
         await self.trader.set_global_mode("live", "LIVE")

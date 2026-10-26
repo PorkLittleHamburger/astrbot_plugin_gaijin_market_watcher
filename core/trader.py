@@ -61,6 +61,23 @@ class TradeError(RuntimeError):
     """可由用户修正的交易业务错误。"""
 
 
+def _paper_integer(value: Any, message: str) -> int:
+    """严格解析盘口接口中的整数字段，拒绝会丢失精度的小数值。"""
+    if isinstance(value, bool):
+        raise TradeError(message)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise TradeError(message)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.isdigit() or (text[0] in "+-" and text[1:].isdigit())):
+            return int(text)
+    raise TradeError(message)
+
+
 class AutoTrader:
     def __init__(self, *, client, auth, storage, config, accounts=None, notifier, logger, on_watch_change=None) -> None:
         self.client = client
@@ -392,8 +409,12 @@ class AutoTrader:
                     continue
                 try:
                     if target == "live":
-                        if self.store.get_runtime(rule.rule_id).phase == PHASE_ERROR:
+                        runtime = self.store.get_runtime(rule.rule_id)
+                        if runtime.phase == PHASE_ERROR:
                             raise TradeError("错误规则不能切换实盘")
+                        if runtime.phase in (PHASE_COMPLETED, PHASE_PAUSED) or not rule.enabled:
+                            skipped.append({**item, "reason": "规则已暂停或已完成，保留原状态"})
+                            continue
                         await self._prepare_arm_unlocked(rule.rule_id)
                         try:
                             await self._confirm_arm_unlocked(rule.rule_id, rule.rule_id)
@@ -843,12 +864,22 @@ class AutoTrader:
                 raise TradeError("实盘规则不能打开模拟工作台")
             saved = self.store.get_paper_book(rule.rule_id)
             if saved is not None:
-                book = saved.snapshot(rule.market_name)
-                source = saved.source
-            else:
-                book = await self._fetch_live_paper_book(rule)
-                source = "live"
-            return self._workbench_payload(rule, book, source)
+                return self._workbench_payload(rule, saved.snapshot(rule.market_name), saved.source)
+            market_name = rule.market_name
+
+        # 外部盘口请求可能较慢，不能占用自动交易依赖的 action lock。
+        book = await self._fetch_live_paper_book(market_name)
+
+        async with self._action_lock:
+            rule = self._require_rule(rule_id)
+            if rule.live:
+                raise TradeError("实盘规则不能打开模拟工作台")
+            if rule.market_name != market_name:
+                raise TradeError("规则已变更，请刷新工作台")
+            saved = self.store.get_paper_book(rule.rule_id)
+            if saved is not None:
+                return self._workbench_payload(rule, saved.snapshot(rule.market_name), saved.source)
+            return self._workbench_payload(rule, book, "live")
 
     async def workbench_action(
         self,
@@ -864,7 +895,7 @@ class AutoTrader:
                 raise TradeError("实盘规则不能使用模拟盘口")
             normalized = str(action or "").strip().lower()
             if normalized == "load_live":
-                book = await self._fetch_live_paper_book(rule)
+                book = await self._fetch_live_paper_book(rule.market_name)
                 payload = self._workbench_payload(rule, book, "live")
                 payload["message"] = "已载入当前真实盘口；保存后才会作为模拟覆盖"
                 return payload
@@ -874,7 +905,7 @@ class AutoTrader:
                 payload["message"] = "已按规则生成可成交盘口；保存并执行后生效"
                 return payload
             if normalized == "follow_live":
-                book = await self._fetch_live_paper_book(rule)
+                book = await self._fetch_live_paper_book(rule.market_name)
                 removed = self.store.remove_paper_book(rule.rule_id)
                 if removed:
                     await self._record(rule, "paper_book_follow_live", f"{rule.title} 已恢复跟随真实行情")
@@ -918,9 +949,9 @@ class AutoTrader:
             payload["message"] = message
             return payload
 
-    async def _fetch_live_paper_book(self, rule: TradeRule) -> BookSnapshot:
+    async def _fetch_live_paper_book(self, market_name: str) -> BookSnapshot:
         token = await self.auth.get_token()
-        book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
+        book = await self.client.fetch_book(market_name, token, appid=self.config.appid)
         if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
             raise TradeError("该物品不是可模拟的普通商品")
         return book
@@ -951,7 +982,7 @@ class AutoTrader:
             price_value = item.get("price")
             try:
                 if raw_value not in (None, ""):
-                    price_raw = int(raw_value)
+                    price_raw = _paper_integer(raw_value, f"{label}第 {index} 档原始价格必须是整数")
                     if price_raw <= 0:
                         raise ValueError
                 else:
@@ -966,10 +997,7 @@ class AutoTrader:
             except Exception as exc:
                 raise TradeError(f"{label}第 {index} 档价格格式不正确") from exc
             quantity_value = item.get("quantity", item.get("amount"))
-            try:
-                quantity = int(quantity_value)
-            except (TypeError, ValueError) as exc:
-                raise TradeError(f"{label}第 {index} 档数量必须是整数") from exc
+            quantity = _paper_integer(quantity_value, f"{label}第 {index} 档数量必须是整数")
             if not 1 <= quantity <= MAX_PAPER_BOOK_QUANTITY:
                 raise TradeError(f"{label}第 {index} 档数量必须在 1 到 {MAX_PAPER_BOOK_QUANTITY} 之间")
             if price_raw in prices:

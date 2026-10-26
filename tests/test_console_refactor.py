@@ -222,6 +222,7 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         app = (root / "views/trade/app.js").read_text(encoding="utf-8")
         css = (root / "views/trade/style.css").read_text(encoding="utf-8")
         depth_chart = (root / "views/trade/depth-chart.mjs").read_text(encoding="utf-8")
+        book_model = (root / "views/trade/book-model.mjs").read_text(encoding="utf-8")
         for tab in ("monitor", "trade", "account", "output"):
             self.assertIn(f'data-tab="{tab}"', html)
         tab_positions = [html.index(f'data-tab="{tab}"') for tab in ("monitor", "trade", "output", "account")]
@@ -263,6 +264,14 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("function authIsValid", app)
         self.assertNotIn('auth.has_jwt ? "有效"', app)
         self.assertIn("function runWithBusy", app)
+        self.assertIn("function runModeToggleBusy", app)
+        self.assertIn("data-busy-label", html)
+        self.assertIn('from "./book-model.mjs"', app)
+        self.assertIn("export function sellerNet", book_model)
+        self.assertIn("export function priceToRaw", book_model)
+        self.assertIn("findBookLevelIndex(target, editingBookLevel.priceRaw)", app)
+        self.assertIn("findBookLevelIndex(target, level.price_raw)", app)
+        self.assertIn('runModeToggleBusy($("globalModeSwitch")', app)
         self.assertIn("function focusSelector", app)
         self.assertIn("const focusReturn = focusSelector", app)
         self.assertIn('data-field="$${escapeHtml(prefix + field)}"', app)
