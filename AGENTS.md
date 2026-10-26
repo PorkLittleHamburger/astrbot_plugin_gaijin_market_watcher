@@ -9,6 +9,21 @@
   it into tracked files.
 - Keep `.env.example` free of real credentials.
 
+## Sub-agent usage
+
+- When the execution environment provides sub-agents and work can be split into
+  independent research, read-only review, local investigation, or disjoint
+  implementation tasks, use sub-agents and prefer parallel execution instead of
+  doing everything serially.
+- Keep blockers, tightly coupled edits, authoritative test suites, final
+  integration, commits, and deployment in the main agent. Sub-agents may run
+  bounded checks within their assigned scope, but the main agent owns final
+  verification.
+- Give each sub-agent a bounded, self-contained scope and a disjoint write
+  scope; review and verify its output before accepting it.
+- Sub-agents must never merge, deploy, alter AstrBot runtime state, or send
+  user-facing messages. These actions remain reserved for the main agent.
+
 ## AstrBot management
 
 - Manage AstrBot through its official WebUI or HTTP API. Do not directly modify
@@ -29,6 +44,13 @@
 
 ## Deployment workflow
 
+The user has pre-authorized the main agent to deploy to the configured local
+AstrBot instance after each completed code change. "Completed" means checks
+pass, the working tree is clean, and the change is committed to the current
+`fix/*` branch. Do not ask for a separate deployment confirmation for local
+deployments; still obtain explicit approval before merging to `main`, creating
+a release or tag, or deploying anywhere else.
+
 1. Run tests, Ruff, schema validation, and an AstrBot-environment import check.
 2. Package only committed files:
    `git archive --format=zip --prefix=astrbot_plugin_gaijin_market_watcher/ --output=<temp.zip> HEAD`
@@ -46,8 +68,9 @@
 - Do not create pull requests unless the user explicitly asks for one.
 - Wait for explicit user confirmation before merging a `fix/*` branch into
   `main`.
-- Do not create a release, tag, or deploy unless the user explicitly requests
-  it.
+- The main agent may perform pre-authorized local deployments by following the
+  deployment workflow above. Do not create a release, tag, remote deployment,
+  or `main` merge unless the user explicitly requests it.
 
 ## User-facing acceptance testing
 
