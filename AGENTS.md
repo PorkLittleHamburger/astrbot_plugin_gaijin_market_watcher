@@ -109,38 +109,41 @@ Test-only work must not change plugin code.
   expose a disabled/busy state and prevent duplicate submission.
 - Cover account status and password masking, monitor-group CRUD, output
   preview/validation/save/reset, zero-limit settings, paper-rule CRUD,
-  pause/resume, paper drill, live-mode rejection, stop-all, deletion, and
-  incremental logs.
+  pause/resume, paper orders, market scenarios, live-mode rejection, stop-all,
+  deletion, and incremental logs.
 - Capture the server-side cause when a generic UI error appears; record it in
   the report and AstrBot logs.
 
-### Trade workbench and paper-book matrix
+### Trade workbench and paper-trading matrix
 
 - Verify `/gjm trade` without a subcommand returns an annotated parameter-insufficient command tree, and that
   `/gjm trade help` plus `/gjm trade help <subcommand>` show usage, examples, and live-risk notes.
 - Create a paper rule from the WebUI and confirm the full-screen workbench opens automatically. Verify the
   two-pane status/market layout, focus trap, Escape close, focus return, 390x844 stacking, and both themes.
 - Verify the SVG depth chart draws green cumulative buy depth on the left and red cumulative sell depth on the
-  right, with quantity and price axes, best-bid/best-ask markers, rule thresholds, cross-book handling, hover
-  details, empty state, accessible summary, and no horizontal overflow.
-- Exercise the stock-style order console: buy/sell switching, price and quantity validation, decimal limits,
-  quantity shortcuts, buy cost preview, fixed-15% sell proceeds preview, inline errors, and keyboard operation.
-- Exercise immediate add/edit/delete behavior. Each mutation must call `save_apply` exactly once, show a Toast
-  and the latest-action status line, highlight the changed level, and reject duplicate clicks while busy.
-- Verify duplicate-price rejection, 100-level limit, delete confirmation/cancel, load-live and rule-generated
-  book application, reload persistence, and follow-live reset. A failed mutation must leave chart and levels unchanged.
-- Confirm every paper-book action reports loading, success, or a concrete error and never calls real
-  buy/sell/cancel APIs from paper mode.
-- Verify a live rule cannot open or use the workbench. Switch a test paper rule to live only in MockTransport or
-  unit tests; never enable live funds during user acceptance.
+  right, with quantity and price axes, best-bid/best-ask markers, rule thresholds, hover details, empty state,
+  accessible summary, and no horizontal overflow.
+- Exercise the paper ticket: buy/sell switching, price and quantity validation, buy cost preview, fixed-15%
+  sell proceeds preview, idempotent submission, and keyboard operation.
+- Verify shared-account accounting: available/reserved GJN, FIFO inventory, realized/unrealized P&L, partial
+  fills, remaining open quantity, order cancellation, and released cash or inventory.
+- Confirm automatic rules may hold buy and sell orders at the same time, sell only acquired quantity, reject
+  requests outside budget/daily/order/quantity limits, and complete `once` / reset `loop` correctly.
+- Create a market scenario and verify the configured delay, progressive synthetic liquidity, countdown,
+  early close, current-rule-only visibility, automatic/manual participation, and rollback without changing
+  other rules or the real market.
+- Confirm the removed level editor is absent: no `save_apply`, level add/edit/delete, load-live, generated-book,
+  follow-live, or `trade/rules/workbench` / `trade/rules/drill` calls remain.
+- Verify paper commands never call real buy/sell/cancel APIs and a live rule cannot open or use the workbench.
+  Switch a test paper rule to live only in MockTransport or unit tests; never enable live funds during acceptance.
 - Verify all checkbox-like controls use keyboard-operable `role=switch` semantics, visible focus, at least
   24x24px effective targets, and immediate pressed feedback.
 - Verify the global environment switch displays an accurate risk summary. Acceptance testing may cancel the
   confirmation and test zero-limit rejection; it must not confirm global live mode or raise any live limit.
-- Check incremental logs for paper-book edits, state transitions, batch mode results, and errors; confirm no
-  duplicated nodes and that only the owner's private session receives trade-template notifications.
-- Before cleanup, reload the plugin and verify the saved paper book, rule state, and global mode are recovered.
-  Then delete test rules and books, restore rules/limits/templates/global mode, and confirm no auto orders remain.
+- Check incremental logs for fills, cancellation, scenario lifecycle, state transitions, batch mode results and
+  errors; confirm no duplicated nodes and that only the owner's private session receives trade notifications.
+- Before cleanup, reload the plugin and verify paper account, orders, fills, open scenarios and global mode are
+  recovered. Then cancel/delete test data, restore rules/limits/templates/global mode, and confirm no auto orders remain.
 
 ### QQ private and group matrix
 
@@ -177,6 +180,6 @@ Test-only work must not change plugin code.
 - Any unmitigated P2 keeps the result at FAIL for release purposes.
 - Restore and verify all mutable test data. Append-only logs and chat history
   must be documented as expected residue.
-- Record workbench layout, switch semantics, paper-book persistence, global-mode
-  cancellation, and private-notification evidence with redacted screenshots or
+- Record workbench layout, order lifecycle, shared-account persistence, scenario rollback,
+  global-mode cancellation, and private-notification evidence with redacted screenshots or
   API/response excerpts.

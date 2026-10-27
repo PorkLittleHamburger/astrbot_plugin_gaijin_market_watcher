@@ -19,23 +19,31 @@ from zoneinfo import ZoneInfo
 from . import platforms
 from .api_client import AuthExpiredError, MarketApiError, TransportError
 from .models import Quote
+from .paper_engine import PaperError, PaperTradingEngine
+from .paper_models import (
+    PAPER_SIDE_BUY,
+    PAPER_SIDE_SELL,
+    PAPER_SOURCE_RULE,
+    PAPER_SOURCE_SCENARIO,
+)
 from .trade_models import (
     CENT_RAW,
+    PHASE_BUYING,
     PHASE_COMPLETED,
     PHASE_ERROR,
     PHASE_HOLDING,
     PHASE_LISTING,
     PHASE_PAUSED,
+    PHASE_SELLING,
     PHASE_WAITING_BUY,
+    PHASE_WORKING,
     TRADE_ITEM_COMMODITY,
     TRADE_MODE_ONCE,
     TRADE_MODES,
-    BookLevel,
     BookSnapshot,
     TradeAssetAllocation,
     TradeEvent,
     TradeOrder,
-    TradePaperBook,
     TradeRule,
     TradeRuntime,
     TradeSettings,
@@ -53,8 +61,6 @@ MAX_LISTING_RECONCILE_SECONDS = 30
 SELL_RECONCILE_ATTEMPTS = 5
 SELL_RECONCILE_DELAY = 0.8
 BUY_CANCEL_VERIFY_ATTEMPTS = 3
-MAX_PAPER_BOOK_LEVELS = 100
-MAX_PAPER_BOOK_QUANTITY = 1_000_000
 
 
 class TradeError(RuntimeError):
@@ -87,6 +93,9 @@ class AutoTrader:
         self.notifier = notifier
         self.logger = logger
         self.store = TradeStore(storage, logger)
+        self.paper = PaperTradingEngine(storage, logger)
+        self._paper_limits_loaded_at = 0.0
+        self._paper_fetch_locks: dict[str, asyncio.Lock] = {}
         self.on_watch_change = on_watch_change
         self._task: asyncio.Task | None = None
         self._running = False
@@ -160,7 +169,6 @@ class AutoTrader:
 
     def rule_view(self, rule: TradeRule) -> dict[str, Any]:
         runtime = self.store.get_runtime(rule.rule_id)
-        paper_book = self.store.get_paper_book(rule.rule_id)
         return {
             **rule.to_dict(),
             "title": rule.title,
@@ -171,8 +179,9 @@ class AutoTrader:
             "runtime": runtime.to_dict(),
             "available_quantity": runtime.available_quantity,
             "profit_per_unit": fmt_gjn(rule.sell_net_price_raw - rule.buy_price_raw),
-            "paper_book": paper_book is not None,
-            "paper_book_source": paper_book.source if paper_book is not None else "",
+            "paper_orders": [
+                self.paper._order_view(order) for order in self.paper.rule_orders(rule.rule_id) if order.is_open
+            ],
         }
 
     def overview(self) -> dict[str, Any]:
@@ -202,6 +211,7 @@ class AutoTrader:
             "live_rules": sum(1 for rule in self.store.rules if rule.live),
             "paper_rules": sum(1 for rule in self.store.rules if not rule.live),
             "last_mode_result": dict(self._last_mode_result),
+            "paper": self.paper.overview(order_limit=20, fill_limit=20),
         }
 
     async def create_rule(
@@ -307,8 +317,14 @@ class AutoTrader:
         if rule.live:
             raise TradeError("实盘规则不能直接修改，请先退出实盘")
         runtime = self.store.get_runtime(rule.rule_id)
-        if runtime.held_quantity or runtime.orders or runtime.phase in (PHASE_HOLDING, PHASE_LISTING):
-            raise TradeError("持仓或挂单期间不能修改规则，请先撤单并清仓")
+        if (
+            runtime.held_quantity
+            or runtime.orders
+            or runtime.phase in (PHASE_HOLDING, PHASE_LISTING)
+            or self._paper_open_orders(rule.rule_id)
+            or self.paper.active_scenario_for_rule(rule.rule_id) is not None
+        ):
+            raise TradeError("持仓、挂单或行情场景期间不能修改规则，请先撤单并清仓")
         buy_raw = (
             parse_gjn_raw(changes.get("buy_price", rule.buy_price)) if "buy_price" in changes else rule.buy_price_raw
         )
@@ -461,8 +477,14 @@ class AutoTrader:
         runtime = self.store.get_runtime(rule.rule_id)
         if rule.live:
             raise TradeError("规则已经在实盘模式")
-        if runtime.held_quantity or runtime.orders or runtime.phase in (PHASE_HOLDING, PHASE_LISTING):
-            raise TradeError("模拟持仓或订单尚未清空，不能切换实盘")
+        if (
+            runtime.held_quantity
+            or runtime.orders
+            or runtime.phase in (PHASE_HOLDING, PHASE_LISTING)
+            or self._paper_open_orders(rule.rule_id)
+            or self.paper.active_scenario_for_rule(rule.rule_id) is not None
+        ):
+            raise TradeError("模拟持仓、订单或行情场景尚未清空，不能切换实盘")
         settings = self.store.settings
         if not settings.live_mode_enabled:
             raise TradeError("实盘总开关未开启，请先在交易设置中切换为实盘模式")
@@ -570,14 +592,18 @@ class AutoTrader:
         elif action == "cancel_orders":
             await self._cancel_rule_orders(rule, pause=True)
         elif action == "delete":
-            if runtime.held_quantity or runtime.orders or runtime.phase in (PHASE_HOLDING, PHASE_LISTING):
-                raise TradeError("仍有持仓或自动挂单，不能删除规则")
+            if (
+                runtime.held_quantity
+                or runtime.orders
+                or runtime.phase in (PHASE_HOLDING, PHASE_LISTING)
+                or self._paper_open_orders(rule.rule_id)
+                or self.paper.active_scenario_for_rule(rule.rule_id) is not None
+            ):
+                raise TradeError("仍有持仓、自动挂单或行情场景，不能删除规则")
             self.store.rules = [item for item in self.store.rules if item.rule_id != rule.rule_id]
             self.store.runtimes.pop(rule.rule_id, None)
-            self.store.paper_books.pop(rule.rule_id, None)
             self.store.save_rules()
             self.store.save_runtime()
-            self.store.save_paper_books()
             self._changed()
             await self._record(rule, "deleted", f"规则 {rule.rule_id} 已删除")
             return rule
@@ -598,7 +624,13 @@ class AutoTrader:
         errors: list[str] = []
         for rule in list(self.store.rules):
             runtime = self.store.get_runtime(rule.rule_id)
-            if runtime.orders:
+            scenario = self.paper.active_scenario_for_rule(rule.rule_id)
+            paper_open = any(order.is_open for order in self.paper.rule_orders(rule.rule_id))
+            if scenario is not None:
+                paper_open = paper_open or any(
+                    order.is_open for order in self.paper.rule_orders(rule.rule_id, scenario_id=scenario.scenario_id)
+                )
+            if runtime.orders or paper_open:
                 try:
                     await self._cancel_rule_orders(rule, pause=False)
                     cancelled.append(rule.rule_id)
@@ -617,523 +649,391 @@ class AutoTrader:
         await self._record_system("stop_all", text)
         return {"cancelled": cancelled, "errors": errors}
 
+    def _paper_open_orders(self, rule_id: str) -> list:
+        orders = [order for order in self.paper.rule_orders(rule_id) if order.is_open]
+        scenario = self.paper.active_scenario_for_rule(rule_id)
+        if scenario is not None:
+            orders.extend(
+                order for order in self.paper.rule_orders(rule_id, scenario_id=scenario.scenario_id) if order.is_open
+            )
+        return orders
+
     def _is_rule_tradable(self, rule: TradeRule) -> bool:
         runtime = self.store.get_runtime(rule.rule_id)
         if not rule.enabled or runtime.phase in (PHASE_COMPLETED, PHASE_ERROR, PHASE_PAUSED):
             return False
-        if rule.live and not self.store.settings.enabled:
+        if not self.store.settings.enabled:
             return False
         if rule.live and runtime.phase == PHASE_WAITING_BUY and not self.store.settings.live_mode_enabled:
             return False
-        return runtime.phase in (PHASE_WAITING_BUY, PHASE_HOLDING, PHASE_LISTING)
+        return runtime.phase in (
+            PHASE_WAITING_BUY,
+            PHASE_BUYING,
+            PHASE_HOLDING,
+            PHASE_SELLING,
+            PHASE_WORKING,
+            PHASE_LISTING,
+        )
 
     async def _evaluate_rule(self, rule: TradeRule, quote: Quote) -> None:
-        runtime = self.store.get_runtime(rule.rule_id)
         if not rule.live:
-            paper_book = self.store.get_paper_book(rule.rule_id)
-            if paper_book is not None:
-                await self._evaluate_paper_with_book(rule, paper_book.snapshot(rule.market_name))
-                return
+            await self._evaluate_paper_rule(rule)
+            return
+        runtime = self.store.get_runtime(rule.rule_id)
         if runtime.phase == PHASE_WAITING_BUY:
             sell_raw = self._quote_raw(quote.sell_min)
             if sell_raw and sell_raw <= rule.buy_price_raw:
-                if rule.live:
-                    await self._live_buy(rule, quote)
-                else:
-                    await self._paper_buy(rule, quote)
+                await self._live_buy(rule, quote)
             return
         if runtime.phase == PHASE_HOLDING:
-            if rule.live:
-                await self._live_sell(rule, quote)
-            else:
-                await self._paper_sell(rule, quote)
+            await self._live_sell(rule, quote)
             return
         if runtime.phase == PHASE_LISTING:
-            if rule.live:
-                await self._reconcile_live_listing(rule)
-            else:
-                await self._paper_reconcile_listing(rule, quote)
+            await self._reconcile_live_listing(rule)
 
-    async def _evaluate_paper_with_book(self, rule: TradeRule, book: BookSnapshot) -> None:
-        runtime = self.store.get_runtime(rule.rule_id)
-        if rule.live:
-            raise TradeError("实盘规则不能使用模拟盘口")
-        if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
-            raise TradeError("该物品不是可模拟的普通商品")
-        if runtime.phase == PHASE_WAITING_BUY:
-            await self._paper_buy(rule, None, book=book)
-        elif runtime.phase == PHASE_HOLDING:
-            await self._paper_sell(rule, None, book=book)
-        elif runtime.phase == PHASE_LISTING:
-            await self._paper_reconcile_listing(rule, None, book=book)
+    async def _ensure_paper_limits(self, token: str) -> None:
+        if time.time() - self._paper_limits_loaded_at < 3600:
+            return
+        try:
+            info = await self.client.get_market_info(token)
+            min_price = int(info.get("minPrice") or info.get("min_price") or self.paper.price_min_raw)
+            max_price = int(info.get("maxPrice") or info.get("max_price") or self.paper.price_max_raw)
+            self.paper.set_price_limits(min_price, max_price)
+        except Exception as exc:
+            self.logger.warning(f"[GJM Paper] 读取市场限价失败，保留默认值: {exc}")
+        self._paper_limits_loaded_at = time.time()
 
-    async def drill_paper_cycle(self, rule_id: str) -> dict[str, Any]:
-        async with self._action_lock:
-            return await self._drill_paper_cycle_unlocked(rule_id)
-
-    async def _drill_paper_cycle_unlocked(self, rule_id: str) -> dict[str, Any]:
-        """用一次真实盘口快照做隔离的完整模拟，不修改规则运行状态。"""
-        rule = self._require_rule(rule_id)
-        if rule.live:
-            raise TradeError("实盘规则不能执行模拟演练，请先切换到模拟盘")
-
-        token = await self.auth.get_token()
-        book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
-        if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
-            raise TradeError("该物品不是可模拟的普通商品")
-
-        initial_best_sell = book.best_sell
-        initial_best_buy = book.best_buy
-        initial_sell_depth = sum(level.amount for level in book.sell_levels)
-        initial_buy_depth = sum(level.amount for level in book.buy_levels)
-
-        live_buy_quantity, live_buy_cost = self._fillable_buy(book, rule.buy_price_raw, rule.quantity)
-        synthetic_buy_quantity = max(0, rule.quantity - live_buy_quantity)
-        total_buy_cost = live_buy_cost + synthetic_buy_quantity * rule.buy_price_raw
-        average_buy_price = self._weighted_price(total_buy_cost, rule.quantity)
-
-        sim_runtime = TradeRuntime.from_dict(self.store.get_runtime(rule.rule_id).to_dict())
-        sim_runtime.reset_for_cycle()
-        sim_runtime.held_quantity = rule.quantity
-        sim_runtime.cost_basis_raw = total_buy_cost
-        sim_runtime.last_buy_price_raw = average_buy_price
-        sim_runtime.phase = PHASE_HOLDING
-
-        live_sell_quantity, live_sell_proceeds, _ = self._fillable_sell(
-            book,
-            rule.sell_net_price_raw,
-            rule.quantity,
-        )
-        synthetic_sell_quantity = max(0, rule.quantity - live_sell_quantity)
-        total_sell_proceeds = live_sell_proceeds + synthetic_sell_quantity * rule.sell_net_price_raw
-        average_net_price = (
-            int(Decimal(total_sell_proceeds) / Decimal(rule.quantity))
-            if total_sell_proceeds > 0 and rule.quantity > 0
-            else 0
-        )
-
-        sim_runtime.held_quantity = 0
-        sim_runtime.listed_quantity = 0
-        sim_runtime.proceeds_raw = total_sell_proceeds
-        sim_runtime.cost_basis_raw = 0
-        sim_runtime.last_sell_price_raw = rule.sell_gross_price_raw
-        sim_runtime.phase = PHASE_COMPLETED
-        sim_runtime.cycle_count = 1
-
-        profit_raw = total_sell_proceeds - total_buy_cost
-        drill_id = "D" + secrets.token_hex(4).upper()
-        steps = [
-            {
-                "kind": "market",
-                "title": "读取初始盘口",
-                "detail": (
-                    f"最低卖价 {fmt_gjn(initial_best_sell) if initial_best_sell else '无'} GJN，"
-                    f"最高求购 {fmt_gjn(initial_best_buy) if initial_best_buy else '无'} GJN；"
-                    f"卖单深度 {initial_sell_depth}，求购深度 {initial_buy_depth}"
-                ),
-            },
-            {
-                "kind": "buy",
-                "title": "模拟买入",
-                "detail": (
-                    f"盘口成交 {live_buy_quantity} 个，虚拟补足 {synthetic_buy_quantity} 个；"
-                    f"均价 {fmt_gjn(average_buy_price)} GJN，成本 {fmt_gjn(total_buy_cost)} GJN"
-                ),
-            },
-            {
-                "kind": "sell",
-                "title": "模拟卖出",
-                "detail": (
-                    f"盘口求购成交 {live_sell_quantity} 个，虚拟补足 {synthetic_sell_quantity} 个；"
-                    f"税后均价 {fmt_gjn(average_net_price)} GJN，到账 {fmt_gjn(total_sell_proceeds)} GJN"
-                ),
-            },
-            {
-                "kind": "complete",
-                "title": "模拟周期完成",
-                "detail": (
-                    f"共 {rule.quantity} 个，模拟盈亏 {raw_to_decimal(profit_raw):+.2f} GJN；规则实际状态未改变"
-                ),
-            },
-        ]
-        message = f"完整模拟演练 {drill_id}：{rule.title}，模拟盈亏 {raw_to_decimal(profit_raw):+.2f} GJN"
-        details = self._event_context(
-            rule,
-            sim_runtime,
-            "paper_drill",
-            message,
-            "info",
-            {
-                "drill_id": drill_id,
-                "drill_initial_best_sell": fmt_gjn(initial_best_sell) if initial_best_sell else "",
-                "drill_initial_best_buy": fmt_gjn(initial_best_buy) if initial_best_buy else "",
-                "drill_buy_quantity": rule.quantity,
-                "drill_live_buy_quantity": live_buy_quantity,
-                "drill_synthetic_buy_quantity": synthetic_buy_quantity,
-                "drill_buy_cost": fmt_gjn(total_buy_cost),
-                "drill_sell_quantity": rule.quantity,
-                "drill_live_sell_quantity": live_sell_quantity,
-                "drill_synthetic_sell_quantity": synthetic_sell_quantity,
-                "drill_sell_proceeds": fmt_gjn(total_sell_proceeds),
-                "drill_profit": f"{raw_to_decimal(profit_raw):+.2f}",
-                "trade_cost_basis": fmt_gjn(total_buy_cost),
-                "trade_profit": f"{raw_to_decimal(profit_raw):+.2f}",
-            },
-        )
-        event = TradeEvent(
-            timestamp=time.time(),
-            rule_id=rule.rule_id,
-            kind="paper_drill",
-            message=message,
-            details=details,
-        )
-        self.store.append_event(event)
-        return {
-            "drill_id": drill_id,
-            "rule_id": rule.rule_id,
-            "rule_title": rule.title,
-            "initial": {
-                "best_sell": fmt_gjn(initial_best_sell) if initial_best_sell else "",
-                "best_buy": fmt_gjn(initial_best_buy) if initial_best_buy else "",
-                "sell_depth": initial_sell_depth,
-                "buy_depth": initial_buy_depth,
-            },
-            "buy": {
-                "quantity": rule.quantity,
-                "live_quantity": live_buy_quantity,
-                "synthetic_quantity": synthetic_buy_quantity,
-                "average_price": fmt_gjn(average_buy_price),
-                "cost": fmt_gjn(total_buy_cost),
-            },
-            "sell": {
-                "quantity": rule.quantity,
-                "live_quantity": live_sell_quantity,
-                "synthetic_quantity": synthetic_sell_quantity,
-                "average_net_price": fmt_gjn(average_net_price),
-                "proceeds": fmt_gjn(total_sell_proceeds),
-            },
-            "summary": {
-                "profit": f"{raw_to_decimal(profit_raw):+.2f}",
-                "profit_per_unit": f"{raw_to_decimal(profit_raw) / Decimal(rule.quantity):+.2f}",
-                "logged": bool(event.event_id),
-            },
-            "steps": steps,
-        }
+    async def _fetch_paper_book(self, market_name: str, token: str) -> tuple[float, BookSnapshot]:
+        lock = self._paper_fetch_locks.setdefault(market_name, asyncio.Lock())
+        async with lock:
+            book = await self.client.fetch_book(market_name, token, appid=self.config.appid)
+            return time.time(), book
 
     @staticmethod
-    def _paper_book_payload(book: BookSnapshot) -> dict[str, Any]:
-        def levels(items: list[BookLevel]) -> list[dict[str, Any]]:
-            return [
-                {"price": fmt_gjn(level.price_raw), "price_raw": int(level.price_raw), "quantity": int(level.amount)}
-                for level in items
-            ]
+    def _require_commodity_book(book: BookSnapshot) -> None:
+        if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
+            raise TradeError("该物品不是可模拟的普通商品")
 
-        best_sell = book.best_sell
-        best_buy = book.best_buy
-        spread = fmt_gjn(best_sell - best_buy) if best_sell is not None and best_buy is not None else ""
-        return {
-            "market_name": book.market_name,
-            "sell_levels": levels(book.sell_levels),
-            "buy_levels": levels(book.buy_levels),
-            "best_sell": fmt_gjn(best_sell) if best_sell is not None else "",
-            "best_buy": fmt_gjn(best_buy) if best_buy is not None else "",
-            "sell_depth": sum(level.amount for level in book.sell_levels),
-            "buy_depth": sum(level.amount for level in book.buy_levels),
-            "spread": spread,
-        }
+    async def _evaluate_paper_rule(self, rule: TradeRule) -> None:
+        token = await self.auth.get_token()
+        await self._ensure_paper_limits(token)
+        observed_at, book = await self._fetch_paper_book(rule.market_name, token)
+        self._require_commodity_book(book)
+        await self._record_any_paper_fills(self.paper.advance_scenarios())
+        await self._record_any_paper_fills(self.paper.observe_market(book, observed_at=observed_at))
+        scenario = self.paper.active_scenario_for_rule(rule.rule_id)
+        if scenario is not None:
+            await self._execute_paper_rule(rule, scenario.scenario_id, update_runtime=False)
+        else:
+            await self._execute_paper_rule(rule, "", update_runtime=True)
 
-    def _workbench_payload(
-        self,
-        rule: TradeRule,
-        book: BookSnapshot,
-        source: str,
-    ) -> dict[str, Any]:
-        return {
-            "rule": self.rule_view(rule),
-            "runtime": self.store.get_runtime(rule.rule_id).to_dict(),
-            "book": self._paper_book_payload(book),
-            "book_source": source,
-            "paper_book_saved": self.store.get_paper_book(rule.rule_id) is not None,
-            "event_cursor": self.store.log_cursor,
-        }
-
-    async def workbench_view(self, rule_id: str) -> dict[str, Any]:
-        async with self._action_lock:
-            rule = self._require_rule(rule_id)
-            if rule.live:
-                raise TradeError("实盘规则不能打开模拟工作台")
-            saved = self.store.get_paper_book(rule.rule_id)
-            if saved is not None:
-                return self._workbench_payload(rule, saved.snapshot(rule.market_name), saved.source)
-            market_name = rule.market_name
-
-        # 外部盘口请求可能较慢，不能占用自动交易依赖的 action lock。
-        book = await self._fetch_live_paper_book(market_name)
-
-        async with self._action_lock:
-            rule = self._require_rule(rule_id)
-            if rule.live:
-                raise TradeError("实盘规则不能打开模拟工作台")
-            if rule.market_name != market_name:
-                raise TradeError("规则已变更，请刷新工作台")
-            saved = self.store.get_paper_book(rule.rule_id)
-            if saved is not None:
-                return self._workbench_payload(rule, saved.snapshot(rule.market_name), saved.source)
-            return self._workbench_payload(rule, book, "live")
-
-    async def workbench_action(
-        self,
-        rule_id: str,
-        action: str,
-        *,
-        sell_levels: Any = None,
-        buy_levels: Any = None,
-    ) -> dict[str, Any]:
-        async with self._action_lock:
-            rule = self._require_rule(rule_id)
-            if rule.live:
-                raise TradeError("实盘规则不能使用模拟盘口")
-            normalized = str(action or "").strip().lower()
-            if normalized == "load_live":
-                book = await self._fetch_live_paper_book(rule.market_name)
-                payload = self._workbench_payload(rule, book, "live")
-                payload["message"] = "已载入当前真实盘口；保存后才会作为模拟覆盖"
-                return payload
-            if normalized == "generate":
-                book = self._generate_paper_book(rule)
-                payload = self._workbench_payload(rule, book, "generated")
-                payload["message"] = "已按规则生成可成交盘口；保存并执行后生效"
-                return payload
-            if normalized == "follow_live":
-                book = await self._fetch_live_paper_book(rule.market_name)
-                removed = self.store.remove_paper_book(rule.rule_id)
-                if removed:
-                    await self._record(rule, "paper_book_follow_live", f"{rule.title} 已恢复跟随真实行情")
-                payload = self._workbench_payload(rule, book, "live")
-                payload["message"] = "已恢复跟随真实行情" if removed else "当前已在跟随真实行情"
-                return payload
-            if normalized != "save_apply":
-                raise TradeError("不支持的模拟盘口操作")
-
-            sells = self._parse_paper_levels(sell_levels, "卖单", reverse=False)
-            buys = self._parse_paper_levels(buy_levels, "买单", reverse=True)
-            if not sells and not buys:
-                raise TradeError("模拟盘口至少需要一个卖单或买单档位")
-            stored = TradePaperBook(
-                rule_id=rule.rule_id,
-                sell_levels=sells,
-                buy_levels=buys,
-                source="manual",
-                updated_at=time.time(),
-            )
-            self.store.set_paper_book(stored)
+    async def _record_paper_fills(self, rule: TradeRule, fills: list) -> None:
+        for fill in fills:
+            if fill.side == PAPER_SIDE_BUY:
+                kind = "paper_buy"
+                text = f"[模拟] {rule.title} 买入 {fill.quantity} 个，成交价 {fmt_gjn(fill.price_raw)} GJN"
+            else:
+                kind = "paper_sell"
+                text = (
+                    f"[模拟] {rule.title} 卖出 {fill.quantity} 个，成交价 {fmt_gjn(fill.price_raw)} GJN，"
+                    f"税后 {fmt_gjn(fill.net_raw)} GJN"
+                )
+            if fill.scenario_id:
+                text = "[场景] " + text
             await self._record(
                 rule,
-                "paper_book",
-                f"{rule.title} 模拟盘口已保存：卖单 {sum(level.amount for level in sells)}，"
-                f"买单 {sum(level.amount for level in buys)}",
-                details={"sell_levels": len(sells), "buy_levels": len(buys)},
+                kind,
+                text,
+                details={
+                    "trade_side": fill.side,
+                    "trade_price": fmt_gjn(fill.price_raw),
+                    "trade_quantity": fill.quantity,
+                    "trade_amount": fmt_gjn(fill.gross_raw),
+                    "trade_net_price": fmt_gjn(int(fill.net_raw / fill.quantity) if fill.quantity else 0),
+                },
             )
-            message = "模拟盘口已保存"
-            runtime = self.store.get_runtime(rule.rule_id)
-            if rule.enabled and runtime.phase in (PHASE_WAITING_BUY, PHASE_HOLDING, PHASE_LISTING):
-                try:
-                    await self._evaluate_paper_with_book(rule, stored.snapshot(rule.market_name))
-                    message = "模拟盘口已保存并执行一次检查"
-                except Exception as exc:  # noqa: BLE001 - persist book and surface failure in runtime
-                    await self._fail_rule(rule, exc)
-                    message = f"模拟盘口已保存，但执行检查失败：{exc}"
-            else:
-                message = "模拟盘口已保存；规则暂停或已结束，恢复后生效"
-            payload = self._workbench_payload(rule, stored.snapshot(rule.market_name), "manual")
-            payload["message"] = message
-            return payload
 
-    async def _fetch_live_paper_book(self, market_name: str) -> BookSnapshot:
-        token = await self.auth.get_token()
-        book = await self.client.fetch_book(market_name, token, appid=self.config.appid)
-        if str(book.kind or "").upper() not in ("", "COMMODITY") or book.auctionable:
-            raise TradeError("该物品不是可模拟的普通商品")
-        return book
-
-    @staticmethod
-    def _generate_paper_book(rule: TradeRule) -> BookSnapshot:
-        return BookSnapshot(
-            market_name=rule.market_name,
-            sell_levels=[BookLevel(price_raw=rule.buy_price_raw, amount=rule.quantity)],
-            buy_levels=[BookLevel(price_raw=rule.sell_gross_price_raw, amount=rule.quantity)],
-            kind="COMMODITY",
-        )
-
-    @staticmethod
-    def _parse_paper_levels(value: Any, label: str, *, reverse: bool) -> list[BookLevel]:
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise TradeError(f"{label}档位必须是数组")
-        if len(value) > MAX_PAPER_BOOK_LEVELS:
-            raise TradeError(f"{label}最多允许 {MAX_PAPER_BOOK_LEVELS} 档")
-        levels: list[BookLevel] = []
-        prices: set[int] = set()
-        for index, item in enumerate(value, start=1):
-            if not isinstance(item, dict):
-                raise TradeError(f"{label}第 {index} 档格式不正确")
-            raw_value = item.get("price_raw")
-            price_value = item.get("price")
+    async def _execute_paper_rule(self, rule: TradeRule, scenario_id: str, *, update_runtime: bool) -> None:
+        runtime = self.store.get_runtime(rule.rule_id)
+        cycle_id = runtime.paper_cycle_id or self.paper.new_cycle_id(rule.rule_id, runtime.cycle_count)
+        if update_runtime and not runtime.paper_cycle_id:
+            runtime.paper_cycle_id = cycle_id
+            self.store.save_runtime()
+        orders = self.paper.rule_orders(rule.rule_id, cycle_id, scenario_id=scenario_id)
+        fills = self.paper.rule_fills(rule.rule_id, cycle_id, scenario_id=scenario_id)
+        book = self.paper.current_book(rule.market_name, scenario_id=scenario_id)
+        if book is None:
+            return
+        buy_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_BUY)
+        sell_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_SELL)
+        open_buy = [order for order in orders if order.is_open and order.side == PAPER_SIDE_BUY]
+        open_sell = [order for order in orders if order.is_open and order.side == PAPER_SIDE_SELL]
+        remaining_buy = max(0, rule.quantity - buy_filled)
+        if not open_buy and remaining_buy > 0 and book.best_sell is not None and book.best_sell <= rule.buy_price_raw:
             try:
-                if raw_value not in (None, ""):
-                    price_raw = _paper_integer(raw_value, f"{label}第 {index} 档原始价格必须是整数")
-                    if price_raw <= 0:
-                        raise ValueError
-                else:
-                    amount = Decimal(str(price_value).strip())
-                    if not amount.is_finite() or amount <= 0:
-                        raise ValueError
-                    if amount.as_tuple().exponent < -2:
-                        raise TradeError(f"{label}第 {index} 档最多保留两位小数")
-                    price_raw = parse_gjn_raw(amount)
-            except TradeError:
-                raise
-            except Exception as exc:
-                raise TradeError(f"{label}第 {index} 档价格格式不正确") from exc
-            quantity_value = item.get("quantity", item.get("amount"))
-            quantity = _paper_integer(quantity_value, f"{label}第 {index} 档数量必须是整数")
-            if not 1 <= quantity <= MAX_PAPER_BOOK_QUANTITY:
-                raise TradeError(f"{label}第 {index} 档数量必须在 1 到 {MAX_PAPER_BOOK_QUANTITY} 之间")
-            if price_raw in prices:
-                raise TradeError(f"{label}存在重复价格 {fmt_gjn(price_raw)} GJN")
-            prices.add(price_raw)
-            levels.append(BookLevel(price_raw=price_raw, amount=quantity))
-        levels.sort(key=lambda item: item.price_raw, reverse=reverse)
-        return levels
-
-    async def _paper_buy(
-        self,
-        rule: TradeRule,
-        quote: Quote | None = None,
-        *,
-        book: BookSnapshot | None = None,
-    ) -> None:
-        supplied_book = book is not None
-        if book is None:
-            token = await self.auth.get_token()
-            book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
-        fill, cost = self._fillable_buy(book, rule.buy_price_raw, rule.quantity)
-        if fill <= 0:
+                self._check_paper_risk(rule, remaining_buy * rule.buy_price_raw)
+                _, new_fills = self.paper.place_order(
+                    market_name=rule.market_name,
+                    side=PAPER_SIDE_BUY,
+                    price_raw=rule.buy_price_raw,
+                    quantity=remaining_buy,
+                    source=PAPER_SOURCE_SCENARIO if scenario_id else PAPER_SOURCE_RULE,
+                    rule_id=rule.rule_id,
+                    cycle_id=cycle_id,
+                    client_order_id=(
+                        f"{cycle_id}:BUY:{buy_filled}:{sum(1 for item in orders if item.side == PAPER_SIDE_BUY)}"
+                    ),
+                    scenario_id=scenario_id,
+                )
+                await self._record_any_paper_fills(new_fills)
+            except (PaperError, TradeError) as exc:
+                self.logger.warning(f"[GJM Trade] 模拟买入 {rule.rule_id} 跳过: {exc}")
+        orders = self.paper.rule_orders(rule.rule_id, cycle_id, scenario_id=scenario_id)
+        fills = self.paper.rule_fills(rule.rule_id, cycle_id, scenario_id=scenario_id)
+        buy_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_BUY)
+        sell_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_SELL)
+        open_sell = [order for order in orders if order.is_open and order.side == PAPER_SIDE_SELL]
+        open_sell_quantity = sum(order.remaining_quantity for order in open_sell)
+        desired_sell = max(0, buy_filled - sell_filled - open_sell_quantity)
+        available_inventory = self.paper.available_inventory(rule.market_name, scenario_id=scenario_id)
+        if desired_sell > 0 and available_inventory >= desired_sell:
+            try:
+                _, new_fills = self.paper.place_order(
+                    market_name=rule.market_name,
+                    side=PAPER_SIDE_SELL,
+                    price_raw=rule.sell_gross_price_raw,
+                    quantity=desired_sell,
+                    source=PAPER_SOURCE_SCENARIO if scenario_id else PAPER_SOURCE_RULE,
+                    rule_id=rule.rule_id,
+                    cycle_id=cycle_id,
+                    client_order_id=(
+                        f"{cycle_id}:SELL:{sell_filled}:{sum(1 for item in orders if item.side == PAPER_SIDE_SELL)}"
+                    ),
+                    scenario_id=scenario_id,
+                )
+                await self._record_any_paper_fills(new_fills)
+            except PaperError as exc:
+                self.logger.warning(f"[GJM Trade] 模拟卖出 {rule.rule_id} 跳过: {exc}")
+        if not update_runtime:
             return
-        runtime = self.store.get_runtime(rule.rule_id)
-        runtime.held_quantity = fill
-        runtime.listed_quantity = 0
-        runtime.cost_basis_raw = cost
-        runtime.last_buy_price_raw = self._weighted_price(cost, fill)
-        runtime.phase = PHASE_HOLDING
+        orders = self.paper.rule_orders(rule.rule_id, cycle_id)
+        fills = self.paper.rule_fills(rule.rule_id, cycle_id)
+        buy_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_BUY)
+        sell_filled = sum(fill.quantity for fill in fills if fill.side == PAPER_SIDE_SELL)
+        open_buy = [order for order in orders if order.is_open and order.side == PAPER_SIDE_BUY]
+        open_sell = [order for order in orders if order.is_open and order.side == PAPER_SIDE_SELL]
+        runtime.held_quantity = max(0, buy_filled - sell_filled)
+        runtime.listed_quantity = sum(order.remaining_quantity for order in open_sell)
+        runtime.cost_basis_raw = sum(fill.gross_raw for fill in fills if fill.side == PAPER_SIDE_BUY)
+        runtime.proceeds_raw = sum(fill.net_raw for fill in fills if fill.side == PAPER_SIDE_SELL)
+        buy_fills = [fill for fill in fills if fill.side == PAPER_SIDE_BUY]
+        sell_fills = [fill for fill in fills if fill.side == PAPER_SIDE_SELL]
+        if buy_fills:
+            runtime.last_buy_price_raw = self._weighted_price(sum(fill.gross_raw for fill in buy_fills), buy_filled)
+        if sell_fills:
+            runtime.last_sell_price_raw = self._weighted_price(sum(fill.gross_raw for fill in sell_fills), sell_filled)
         runtime.updated_at = time.time()
-        self.store.save_runtime()
-        await self._record(
-            rule,
-            "paper_buy",
-            f"[模拟] {rule.title} 买入 {fill}/{rule.quantity} 个，成本 {fmt_gjn(cost)} GJN",
-            details={
-                "trade_side": "BUY",
-                "trade_price": fmt_gjn(runtime.last_buy_price_raw),
-                "trade_quantity": fill,
-                "trade_amount": fmt_gjn(cost),
-            },
-        )
-        await self._paper_sell(rule, quote, book=book if supplied_book else None)
-
-    async def _paper_sell(
-        self,
-        rule: TradeRule,
-        quote: Quote | None = None,
-        *,
-        book: BookSnapshot | None = None,
-    ) -> None:
-        if book is None:
-            token = await self.auth.get_token()
-            book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
-        runtime = self.store.get_runtime(rule.rule_id)
-        available = runtime.available_quantity
-        if available <= 0:
-            await self._complete_cycle(rule)
-            return
-        sold, proceeds, immediate = self._fillable_sell(book, rule.sell_net_price_raw, available)
-        runtime.proceeds_raw += proceeds
-        self._reduce_cost(runtime, sold)
-        runtime.held_quantity = max(0, runtime.held_quantity - sold)
-        runtime.last_sell_price_raw = rule.sell_gross_price_raw
-        if runtime.held_quantity > 0:
-            runtime.listed_quantity = runtime.held_quantity
-            runtime.phase = PHASE_LISTING
+        if open_buy and open_sell:
+            runtime.phase = PHASE_WORKING
+        elif open_buy:
+            runtime.phase = PHASE_BUYING
+        elif open_sell or sell_filled < buy_filled:
+            runtime.phase = PHASE_SELLING
         else:
-            runtime.listed_quantity = 0
+            runtime.phase = PHASE_WAITING_BUY if buy_filled <= 0 else PHASE_HOLDING
+        self.store.save_runtime()
+        if buy_filled >= rule.quantity and sell_filled >= rule.quantity and not open_buy and not open_sell:
+            await self._complete_paper_cycle(rule, runtime)
+
+    def _check_paper_risk(self, rule: TradeRule, order_cost_raw: int) -> None:
+        settings = self.store.settings
+        if not settings.enabled:
+            raise TradeError("自动交易总开关未开启")
+        if settings.max_quantity <= 0 or rule.quantity > settings.max_quantity:
+            raise TradeError("交易数量超过全局上限")
+        if settings.max_order_raw <= 0 or order_cost_raw > settings.max_order_raw:
+            raise TradeError("模拟买入额超过单笔上限")
+        if settings.daily_limit_raw <= 0:
+            raise TradeError("每日限额未配置")
+        if settings.total_budget_raw <= 0:
+            raise TradeError("总投入预算未配置")
+        self.paper.rollover_day()
+        daily_spent = self.paper.account.daily_buy_raw
+        if daily_spent + order_cost_raw > settings.daily_limit_raw:
+            raise TradeError("本次模拟买入将超过每日累计限额")
+        open_buy_reserved = sum(
+            order.remaining_quantity * order.price_raw
+            for order in self.paper.orders
+            if order.is_open and order.side == PAPER_SIDE_BUY
+        )
+        exposure = self.paper.account.inventory_cost_raw() + open_buy_reserved
+        if exposure + order_cost_raw > settings.total_budget_raw:
+            raise TradeError("本次模拟买入将超过全局总投入预算")
+
+    async def _complete_paper_cycle(self, rule: TradeRule, runtime) -> None:
+        runtime.cycle_count += 1
+        if rule.mode == TRADE_MODE_ONCE:
             runtime.phase = PHASE_COMPLETED
-        runtime.updated_at = time.time()
-        self.store.save_runtime()
-        if sold:
-            await self._record(
-                rule,
-                "paper_sell",
-                f"[模拟] {rule.title} 立即卖出 {sold} 个（求购覆盖 {immediate}），税后 {fmt_gjn(proceeds)} GJN",
-                details={
-                    "trade_side": "SELL",
-                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
-                    "trade_quantity": sold,
-                    "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
-                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
-                },
-            )
-        if runtime.held_quantity > 0:
-            await self._record(
-                rule,
-                "paper_listing",
-                f"[模拟] 剩余 {runtime.held_quantity} 个按 {fmt_gjn(rule.sell_gross_price_raw)} GJN 挂单",
-                details={
-                    "trade_side": "SELL",
-                    "trade_price": fmt_gjn(rule.sell_gross_price_raw),
-                    "trade_quantity": runtime.held_quantity,
-                    "trade_amount": fmt_gjn(runtime.held_quantity * rule.sell_gross_price_raw),
-                    "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
-                },
-            )
+            rule.enabled = False
+            runtime.held_quantity = 0
+            runtime.listed_quantity = 0
         else:
-            await self._complete_cycle(rule)
-
-    async def _paper_reconcile_listing(
-        self,
-        rule: TradeRule,
-        quote: Quote | None = None,
-        *,
-        book: BookSnapshot | None = None,
-    ) -> None:
-        if book is None:
-            token = await self.auth.get_token()
-            book = await self.client.fetch_book(rule.market_name, token, appid=self.config.appid)
-        runtime = self.store.get_runtime(rule.rule_id)
-        quantity = min(runtime.listed_quantity, runtime.held_quantity)
-        sold, proceeds, _ = self._fillable_sell(book, rule.sell_net_price_raw, quantity)
-        if sold <= 0:
-            return
-        runtime.proceeds_raw += proceeds
-        runtime.held_quantity = max(0, runtime.held_quantity - sold)
-        runtime.listed_quantity = max(0, runtime.listed_quantity - sold)
-        self._reduce_cost(runtime, sold)
-        runtime.updated_at = time.time()
+            runtime.reset_for_cycle()
+        rule.updated_at = time.time()
+        self.store.save_rules()
         self.store.save_runtime()
-        await self._record(
-            rule,
-            "paper_listing_fill",
-            f"[模拟] {rule.title} 挂单成交 {sold} 个，税后 {fmt_gjn(proceeds)} GJN",
-            details={
-                "trade_side": "SELL",
-                "trade_price": fmt_gjn(rule.sell_gross_price_raw),
-                "trade_quantity": sold,
-                "trade_amount": fmt_gjn(sold * rule.sell_gross_price_raw),
-                "trade_net_price": fmt_gjn(rule.sell_net_price_raw),
-            },
-        )
-        if runtime.held_quantity <= 0:
-            await self._complete_cycle(rule)
+        self._changed()
+        await self._record(rule, "cycle_complete", f"{rule.title} 模拟周期完成，轮次 {runtime.cycle_count}")
+
+    async def paper_overview(self, scenario_id: str = "") -> dict[str, Any]:
+        async with self._action_lock:
+            await self._record_any_paper_fills(self.paper.advance_scenarios())
+            return self.paper.overview(scenario_id=scenario_id)
+
+    async def paper_market(self, market_name: str, *, scenario_id: str = "") -> dict[str, Any]:
+        token = await self.auth.get_token()
+        await self._ensure_paper_limits(token)
+        observed_at, book = await self._fetch_paper_book(market_name, token)
+        self._require_commodity_book(book)
+        async with self._action_lock:
+            await self._record_any_paper_fills(self.paper.advance_scenarios())
+            await self._record_any_paper_fills(self.paper.observe_market(book, observed_at=observed_at))
+            return self.paper.market_view(market_name, scenario_id=scenario_id)
+
+    async def paper_place_order(
+        self,
+        *,
+        market_name: str,
+        side: str,
+        price_raw: int,
+        quantity: int,
+        client_order_id: str = "",
+        scenario_id: str = "",
+    ) -> dict[str, Any]:
+        if client_order_id:
+            async with self._action_lock:
+                existing = self.paper.lookup_client_order(
+                    client_order_id,
+                    market_name=market_name,
+                    side=side,
+                    price_raw=price_raw,
+                    quantity=quantity,
+                    scenario_id=scenario_id,
+                )
+                if existing is not None:
+                    return {
+                        "order": self.paper._order_view(existing),
+                        "fills": [],
+                        "overview": self.paper.overview(scenario_id=scenario_id),
+                    }
+        token = await self.auth.get_token()
+        await self._ensure_paper_limits(token)
+        observed_at, book = await self._fetch_paper_book(market_name, token)
+        self._require_commodity_book(book)
+        async with self._action_lock:
+            await self._record_any_paper_fills(self.paper.advance_scenarios())
+            await self._record_any_paper_fills(self.paper.observe_market(book, observed_at=observed_at))
+            order, fills = self.paper.place_order(
+                market_name=market_name,
+                side=side,
+                price_raw=price_raw,
+                quantity=quantity,
+                client_order_id=client_order_id,
+                scenario_id=scenario_id,
+            )
+            await self._record_any_paper_fills(fills)
+            return {
+                "order": self.paper._order_view(order),
+                "fills": [self.paper._fill_view(fill) for fill in fills],
+                "overview": self.paper.overview(scenario_id=scenario_id),
+            }
+
+    async def paper_cancel_order(self, order_id: str, *, scenario_id: str = "") -> dict[str, Any]:
+        async with self._action_lock:
+            order = self.paper.cancel_order(order_id, scenario_id=scenario_id)
+            return {
+                "order": self.paper._order_view(order),
+                "overview": self.paper.overview(scenario_id=scenario_id),
+            }
+
+    async def paper_create_scenario(
+        self,
+        *,
+        rule_id: str,
+        delay_seconds: float = 5.0,
+        duration_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        async with self._action_lock:
+            rule = self._require_rule(rule_id)
+            if rule.live:
+                raise TradeError("实盘规则不能生成模拟场景")
+            market_name = rule.market_name
+            buy_price_raw = rule.buy_price_raw
+            sell_net_price_raw = rule.sell_net_price_raw
+            quantity = rule.quantity
+            runtime = self.store.get_runtime(rule.rule_id)
+            cycle_id = runtime.paper_cycle_id or self.paper.new_cycle_id(rule.rule_id, runtime.cycle_count)
+        token = await self.auth.get_token()
+        await self._ensure_paper_limits(token)
+        observed_at, book = await self._fetch_paper_book(market_name, token)
+        self._require_commodity_book(book)
+        async with self._action_lock:
+            await self._record_any_paper_fills(self.paper.advance_scenarios())
+            await self._record_any_paper_fills(self.paper.observe_market(book, observed_at=observed_at))
+            scenario = self.paper.create_scenario(
+                rule_id=rule_id,
+                market_name=market_name,
+                buy_price_raw=buy_price_raw,
+                sell_net_price_raw=sell_net_price_raw,
+                quantity=quantity,
+                cycle_id=cycle_id,
+                delay_seconds=delay_seconds,
+                duration_seconds=duration_seconds,
+            )
+            return scenario
+
+    async def paper_close_scenario(self, scenario_id: str) -> dict[str, Any]:
+        async with self._action_lock:
+            return self.paper.close_scenario(scenario_id)
+
+    async def paper_reset(self, starting_cash_raw: int) -> dict[str, Any]:
+        async with self._action_lock:
+            account = self.paper.reset_account(int(starting_cash_raw))
+            for rule in self.store.rules:
+                if rule.live:
+                    continue
+                runtime = self.store.get_runtime(rule.rule_id)
+                runtime.reset_for_cycle()
+                runtime.proceeds_raw = 0
+                runtime.cycle_count = 0
+                runtime.last_buy_price_raw = 0
+                runtime.last_sell_price_raw = 0
+                runtime.last_error = ""
+            self.store.save_runtime()
+            self._changed()
+            return {"account": account, "overview": self.paper.overview()}
+
+    async def _record_any_paper_fills(self, fills: list) -> None:
+        for fill in fills:
+            rule = self.store.get_rule(fill.rule_id) if fill.rule_id else None
+            if rule is not None:
+                await self._record_paper_fills(rule, [fill])
+            else:
+                action = "买入" if fill.side == PAPER_SIDE_BUY else "卖出"
+                await self._record_system(
+                    "paper_manual_fill",
+                    f"[模拟手工{action}] {fill.market_name} {fill.quantity} 个，成交价 {fmt_gjn(fill.price_raw)} GJN",
+                    {
+                        "trade_side": fill.side,
+                        "trade_price": fmt_gjn(fill.price_raw),
+                        "trade_quantity": fill.quantity,
+                        "trade_amount": fmt_gjn(fill.gross_raw),
+                        "trade_net_price": fmt_gjn(int(fill.net_raw / fill.quantity) if fill.quantity else 0),
+                    },
+                )
+
+    async def _record_manual_paper_fills(self, fills: list) -> None:
+        await self._record_any_paper_fills(fills)
 
     async def _live_buy(self, rule: TradeRule, quote: Quote) -> None:
         price_raw = self._quote_raw(quote.sell_min)
@@ -1726,9 +1626,21 @@ class AutoTrader:
 
     async def _cancel_rule_orders(self, rule: TradeRule, *, pause: bool) -> None:
         runtime = self.store.get_runtime(rule.rule_id)
+        scenario = self.paper.active_scenario_for_rule(rule.rule_id)
+        paper_cancelled = self.paper.cancel_orders_for_rule(rule.rule_id)
+        scenario_cancelled: list = []
+        if scenario is not None:
+            scenario_cancelled = self.paper.cancel_orders_for_rule(rule.rule_id, scenario_id=scenario.scenario_id)
+            self.paper.close_scenario(scenario.scenario_id)
         if not runtime.orders:
-            if pause:
-                rule.enabled = False
+            runtime.listed_quantity = 0
+            runtime.phase = PHASE_HOLDING if runtime.held_quantity > 0 else PHASE_WAITING_BUY
+            rule.enabled = False if pause else rule.enabled
+            runtime.updated_at = time.time()
+            self.store.save_rules()
+            self.store.save_runtime()
+            if paper_cancelled or scenario_cancelled:
+                await self._record(rule, "orders_cancelled", f"规则 {rule.rule_id} 的模拟挂单已撤销")
             return
         token = await self.auth.get_token()
         errors: list[str] = []
@@ -2038,12 +1950,8 @@ class AutoTrader:
         "sell": "卖出成交",
         "paper_sell": "模拟卖出",
         "listing": "挂卖出单",
-        "paper_listing": "模拟挂单",
         "listing_fill": "挂单成交",
-        "paper_listing_fill": "模拟挂单成交",
-        "paper_drill": "完整模拟演练",
-        "paper_book": "模拟盘口更新",
-        "paper_book_follow_live": "恢复真实行情",
+        "paper_manual_fill": "模拟手工成交",
         "stop_all": "急停",
         "partial_bought": "部分买入",
         "sold": "卖出成交",

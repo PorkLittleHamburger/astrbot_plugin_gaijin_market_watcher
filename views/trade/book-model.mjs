@@ -24,7 +24,8 @@ export function sellerNet(price, quantity = 1) {
   const cents = priceToCents(price);
   const amount = Number(quantity);
   if (cents === null || !Number.isSafeInteger(amount) || amount <= 0) return 0;
-  const netCents = (cents * BigInt(amount) * USER_FEE_PERCENT) / 100n;
+  const unitNetCents = (cents * USER_FEE_PERCENT) / 100n;
+  const netCents = unitNetCents * BigInt(amount);
   return Number(netCents) / 100;
 }
 

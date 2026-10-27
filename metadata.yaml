@@ -12,11 +12,11 @@ desc: |
   - 价格折线图：自动推送最近 N 次最低售价与最高求购
   - 多平台适配：适配微信/qq平台
   - 自动交易：拥有者私聊或 WebUI 管理，默认模拟，全局门禁与二次确认后实盘
-  - 模拟工作台：双侧累计深度图、股票式盘口控制台和即时模拟执行
-  - 模拟演练：读取一次真实盘口后，在隔离状态中完整执行模拟买卖
+  - 模拟工作台：真实盘口影子撮合、共享模拟账户、限价订单、FIFO 库存和规则级行情场景
+  - 模拟挂单：支持部分成交、剩余挂单、撤单、冻结资金/库存和 15% 手续费结算
   - 交易安全：固定 15% 手续费、全局预算、每日限额、急停与订单对账
   - 增量日志：按上海日期追加 JSONL，控制台按游标只更新新增事件
-version: 2.21.1
+version: 2.22.0
 author: porklittlehamburger
 repo: https://github.com/PorkLittleHamburger/astrbot_plugin_gaijin_market_watcher
 astrbot_version: ">=4.29.0,<5"

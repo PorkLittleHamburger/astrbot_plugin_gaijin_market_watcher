@@ -223,6 +223,7 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         css = (root / "views/trade/style.css").read_text(encoding="utf-8")
         depth_chart = (root / "views/trade/depth-chart.mjs").read_text(encoding="utf-8")
         book_model = (root / "views/trade/book-model.mjs").read_text(encoding="utf-8")
+        paper_workbench = (root / "views/trade/paper-workbench.mjs").read_text(encoding="utf-8")
         for tab in ("monitor", "trade", "account", "output"):
             self.assertIn(f'data-tab="{tab}"', html)
         tab_positions = [html.index(f'data-tab="{tab}"') for tab in ("monitor", "trade", "output", "account")]
@@ -238,39 +239,68 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
             "output/overview",
             "output/save",
             "output/preview",
-            "trade/rules/drill",
-            "trade/rules/workbench",
+            "trade/overview",
+            "trade/settings",
+            "trade/rules/save",
+            "trade/rules/action",
             "trade/mode",
             "trade/logs",
         ):
             self.assertIn(endpoint, app)
-        self.assertIn("完整模拟演练", app)
+        self.assertNotIn("trade/rules/drill", app)
+        self.assertNotIn("trade/rules/workbench", app)
+        self.assertNotIn("完整模拟演练", app)
         self.assertIn("进入模拟盘", app)
         self.assertIn('role="switch"', html)
         self.assertIn("workbenchBackdrop", html)
         self.assertIn("depthChart", html)
-        self.assertIn("bookOrderForm", html)
-        self.assertIn("buyLevelList", html)
-        self.assertIn("sellLevelList", html)
-        self.assertIn("盘口控制台", html)
-        self.assertNotIn("bookSaveApply", html)
-        self.assertIn("按规则生成可成交盘口", html)
-        self.assertIn('action: "save_apply"', app)
-        self.assertIn("data-edit-level", app)
-        self.assertIn("data-delete-level", app)
-        self.assertIn("已恢复跟随真实行情", app)
+        self.assertNotIn("bookOrderForm", html)
+        self.assertNotIn("buyLevelList", html)
+        self.assertNotIn("sellLevelList", html)
+        self.assertNotIn("盘口控制台", html)
+        self.assertNotIn("按规则生成可成交盘口", html)
+        self.assertNotIn('action: "save_apply"', app)
+        self.assertNotIn("data-edit-level", app)
+        self.assertNotIn("data-delete-level", app)
+        self.assertNotIn("已恢复跟随真实行情", app)
         self.assertIn("buildDepthChartModel", depth_chart)
+        for endpoint in (
+            "trade/paper/overview",
+            "trade/paper/book",
+            "trade/paper/markets/search",
+            "trade/paper/orders",
+            "trade/paper/orders/${encodeURIComponent(orderId)}/cancel",
+            "trade/paper/scenarios",
+            "trade/paper/scenarios/${encodeURIComponent(scenarioId)}",
+            "trade/paper/reset",
+        ):
+            self.assertIn(endpoint, paper_workbench)
+        self.assertIn('from "./paper-workbench.mjs"', app)
+        self.assertIn("paperAccountGrid", html)
+        self.assertIn("paperTicketForm", html)
+        self.assertIn("paperOrdersList", html)
+        self.assertIn("paperFillsList", html)
+        self.assertIn("paperScenarioCreate", html)
+        self.assertIn("paperStartingCash", html)
+        self.assertIn(".paper-ticket-card", css)
+        self.assertIn(".paper-scenario-bar", css)
         self.assertIn("ResizeObserver", depth_chart)
         self.assertIn("function authIsValid", app)
         self.assertNotIn('auth.has_jwt ? "有效"', app)
         self.assertIn("function runWithBusy", app)
         self.assertIn("function runModeToggleBusy", app)
         self.assertIn("data-busy-label", html)
-        self.assertIn('from "./book-model.mjs"', app)
+        self.assertIn('from "./book-model.mjs"', paper_workbench)
         self.assertIn("export function sellerNet", book_model)
         self.assertIn("export function priceToRaw", book_model)
-        self.assertIn("findBookLevelIndex(target, editingBookLevel.priceRaw)", app)
-        self.assertIn("findBookLevelIndex(target, level.price_raw)", app)
+        self.assertNotIn("findBookLevelIndex", app)
+        self.assertIn("refreshSeq", paper_workbench)
+        self.assertIn("active_scenario_id", paper_workbench)
+        self.assertIn("pendingOrder.clientOrderId", paper_workbench)
+        self.assertIn("FIFO 批次", paper_workbench)
+        self.assertIn("workspaceSeq", paper_workbench)
+        self.assertIn("focusedCancel", paper_workbench)
+        self.assertIn("tradeOverviewSeq", app)
         self.assertIn('runModeToggleBusy($("globalModeSwitch")', app)
         self.assertIn("function focusSelector", app)
         self.assertIn("const focusReturn = focusSelector", app)
@@ -285,8 +315,6 @@ class ConsoleRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("width: 44px; height: 24px", css)
         self.assertIn(".workbench-layout", css)
         self.assertIn(".depth-chart-wrap", css)
-        self.assertIn(".order-console", css)
-        self.assertIn(".level-row.flash", css)
         self.assertIn("min-width: 0; width: 100%;", css)
         self.assertIn("insertAdjacentHTML", app)
         self.assertNotIn("renderEvents(data.events", app)

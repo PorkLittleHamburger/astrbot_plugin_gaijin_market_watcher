@@ -1,11 +1,4 @@
-import { createDepthChart } from "./depth-chart.mjs";
-import {
-  MAX_BOOK_LEVELS,
-  MAX_BOOK_QUANTITY,
-  findBookLevelIndex,
-  priceToRaw,
-  sellerNet,
-} from "./book-model.mjs";
+import { createPaperWorkbench } from "./paper-workbench.mjs";
 
 const bridge = window.AstrBotPluginView;
 const $ = (id) => document.getElementById(id);
@@ -21,17 +14,9 @@ let outputDirty = false;
 let accountDirty = false;
 let tradeLogCursor = 0;
 const tradeLogIds = new Set();
+let tradeOverviewSeq = 0;
 let workbenchRuleId = "";
-let workbenchData = null;
-let workbenchReturnFocus = null;
-let workbenchPollBusy = false;
-let workbenchChart = null;
-let bookConsoleSide = "buy";
-let editingBookLevel = null;
-let highlightedBookLevel = null;
-let bookHighlightTimer = null;
-let bookOperationBusy = false;
-const workbenchBook = { sell: [], buy: [] };
+let paperWorkbench = null;
 
 async function runWithBusy(button, label, task) {
   if (!button || button.dataset.busy === "1") return undefined;
@@ -101,7 +86,10 @@ function formSubmitter(event) {
 
 const phaseLabels = {
   waiting_buy: "等待买点",
+  buying: "买入中",
   holding: "持有待卖",
+  selling: "卖出中",
+  working: "买卖并行",
   listing: "挂单等待成交",
   completed: "已完成",
   paused: "已暂停",
@@ -653,198 +641,26 @@ $("resetTradeBtn").addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------- 模拟工作台
-function numberText(value) {
-  return Number(value || 0).toLocaleString("zh-CN");
-}
-
-function renderWorkbenchStatus(data) {
-  workbenchData = data;
-  const rule = data.rule || {};
-  const runtime = data.runtime || rule.runtime || {};
-  $("workbenchSubtitle").textContent = `${rule.title || rule.market_name || "--"} · ${rule.rule_id || "--"} · ${rule.mode || "--"}`;
-  $("workbenchPhase").textContent = phaseLabels[runtime.phase] || runtime.phase || "未知";
-  const items = [
-    ["模拟/实盘", rule.live ? "实盘" : "模拟盘"],
-    ["规则状态", rule.enabled ? "启用" : "暂停"],
-    ["持仓", `${numberText(runtime.held_quantity)} / ${numberText(rule.quantity)}`],
-    ["已挂售", numberText(runtime.listed_quantity)],
-    ["当前成本", `${(Number(runtime.cost_basis_raw || 0) / 10000).toFixed(2)} GJN`],
-    ["累计到账", `${(Number(runtime.proceeds_raw || 0) / 10000).toFixed(2)} GJN`],
-    ["完成轮次", numberText(runtime.cycle_count)],
-    ["最后错误", runtime.last_error || "无"],
-  ];
-  $("workbenchStatusGrid").innerHTML = items
-    .map(([label, value]) => `<div class="status-item"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`)
-    .join("");
-  $("workbenchPause").disabled = !rule.enabled;
-  $("workbenchResume").disabled = Boolean(rule.enabled);
-}
-
-function bookSourceText(source) {
-  return {
-    live: "当前跟随真实行情；任意盘口修改都会立即保存为模拟覆盖。",
-    manual: "已保存的模拟盘口；该规则只使用这份盘口。",
-    generated: "按规则参数生成的盘口；已保存为当前模拟覆盖。",
-  }[source] || "盘口状态";
-}
-
-function setBookActionStatus(message, detail = "", kind = "") {
-  const strip = document.querySelector(".book-action-strip");
-  strip.classList.remove("success", "error");
-  if (kind) strip.classList.add(kind);
-  $("bookActionStatus").textContent = message;
-  $("bookActionDetail").textContent = detail || "正在等待新操作…";
-}
-
-function normalizeBookLevel(level) {
-  const raw = Number(level?.price_raw);
-  return {
-    price: String(level?.price ?? ""),
-    price_raw: Number.isFinite(raw) && raw > 0 ? raw : priceToRaw(level?.price) ?? 0,
-    quantity: String(level?.quantity ?? ""),
-  };
-}
-
-function renderLevelList(side) {
-  const list = $(side === "sell" ? "sellLevelList" : "buyLevelList");
-  const levels = workbenchBook[side];
-  if (!levels.length) {
-    list.innerHTML = '<p class="level-empty">暂无档位</p>';
-    return;
+function getPaperWorkbench() {
+  if (!paperWorkbench) {
+    paperWorkbench = createPaperWorkbench({
+      $,
+      apiGet,
+      apiPost,
+      showToast,
+      openModal,
+      runWithBusy,
+      escapeHtml,
+      getRule: (ruleId) => lastOverview?.rules?.find((item) => item.rule_id === ruleId) || null,
+      refreshTrade,
+    });
   }
-  let cumulative = 0;
-  list.innerHTML = levels.map((level, index) => {
-    const quantity = Number(level.quantity || 0);
-    cumulative += Number.isFinite(quantity) ? Math.max(0, quantity) : 0;
-    const flash = highlightedBookLevel?.side === side && highlightedBookLevel?.priceRaw === level.price_raw;
-    return `<div class="level-row ${flash ? "flash" : ""}" role="listitem" data-level-side="${side}" data-level-index="${index}" data-price-raw="${escapeHtml(level.price_raw)}">
-      <button class="level-main" type="button" data-edit-level="${side}" data-index="${index}" aria-label="编辑${side === "buy" ? "买单" : "卖单"} ${escapeHtml(level.price)} GJN，数量 ${escapeHtml(level.quantity)}">
-        <b>${escapeHtml(level.price)} GJN</b><strong>× ${escapeHtml(level.quantity)}</strong>
-        <span>累计 ${numberText(cumulative)}</span><span>约 ${(Number(level.price || 0) * quantity).toFixed(2)} GJN</span>
-      </button>
-      <button class="level-delete" type="button" data-delete-level="${side}" data-index="${index}" aria-label="删除${side === "buy" ? "买单" : "卖单"} ${escapeHtml(level.price)} GJN">×</button>
-    </div>`;
-  }).join("");
-}
-
-function renderBook(book) {
-  workbenchBook.sell = (book?.sell_levels || []).map(normalizeBookLevel).sort((a, b) => Number(a.price) - Number(b.price));
-  workbenchBook.buy = (book?.buy_levels || []).map(normalizeBookLevel).sort((a, b) => Number(b.price) - Number(a.price));
-  renderLevelList("sell");
-  renderLevelList("buy");
-  $("bestSell").textContent = book?.best_sell ? `${book.best_sell} GJN` : "无";
-  $("bestBuy").textContent = book?.best_buy ? `${book.best_buy} GJN` : "无";
-  $("bookSpread").textContent = book?.spread ? `${book.spread} GJN` : "无";
-  $("sellDepth").textContent = `${workbenchBook.sell.length} 档 / 深度 ${numberText(book?.sell_depth)}`;
-  $("buyDepth").textContent = `${workbenchBook.buy.length} 档 / 深度 ${numberText(book?.buy_depth)}`;
-  $("bookSource").textContent = bookSourceText(workbenchData?.book_source);
-  if (workbenchChart) workbenchChart.render(book || {}, workbenchData?.rule || {}, { highlight: highlightedBookLevel });
-}
-
-function updateOrderPreview() {
-  const priceText = $("orderPrice").value.trim();
-  const price = Number(priceText || 0);
-  const quantity = Math.max(0, Number($("orderQuantity").value || 0));
-  const total = price * quantity;
-  if (bookConsoleSide === "sell") {
-    $("orderPreviewLabel").textContent = "预计到手（税后）";
-    $("orderPreviewValue").textContent = `${sellerNet(priceText, quantity).toFixed(2)} GJN`;
-    $("orderPreviewHint").textContent = `挂单总额 ${total.toFixed(2)} GJN，固定扣除 15% 手续费。`;
-  } else {
-    $("orderPreviewLabel").textContent = "预计支出";
-    $("orderPreviewValue").textContent = `${total.toFixed(2)} GJN`;
-    $("orderPreviewHint").textContent = "买入档位会增加模拟市场的求购深度。";
-  }
-}
-
-function syncOrderConsole() {
-  const isBuy = bookConsoleSide === "buy";
-  $("orderSideBuy").classList.toggle("active", isBuy);
-  $("orderSideSell").classList.toggle("active", !isBuy);
-  $("orderSideBuy").setAttribute("aria-pressed", isBuy ? "true" : "false");
-  $("orderSideSell").setAttribute("aria-pressed", isBuy ? "false" : "true");
-  $("orderConsoleMode").textContent = editingBookLevel ? "编辑" : "新增";
-  $("bookOrderCancelEdit").hidden = !editingBookLevel;
-  $("bookOrderSubmit").textContent = editingBookLevel
-    ? `更新${isBuy ? "买单" : "卖单"}`
-    : `添加${isBuy ? "买单" : "卖单"}`;
-  updateOrderPreview();
-}
-
-function defaultOrderPrice(side) {
-  if (side === "buy") {
-    return workbenchBook.buy[0]?.price || workbenchData?.rule?.buy_price || "";
-  }
-  return workbenchBook.sell[0]?.price || workbenchData?.rule?.sell_gross_price || "";
-}
-
-function resetOrderConsole() {
-  editingBookLevel = null;
-  $("orderPrice").value = defaultOrderPrice(bookConsoleSide);
-  $("orderQuantity").value = String(workbenchData?.rule?.quantity || 1);
-  showInlineMessage("bookOrderMessage", "", "");
-  syncOrderConsole();
-}
-
-function setConsoleSide(side, { reset = true } = {}) {
-  bookConsoleSide = side === "sell" ? "sell" : "buy";
-  if (reset) {
-    editingBookLevel = null;
-    $("orderPrice").value = defaultOrderPrice(bookConsoleSide);
-    $("orderQuantity").value = String(workbenchData?.rule?.quantity || 1);
-    showInlineMessage("bookOrderMessage", "", "");
-  }
-  syncOrderConsole();
-}
-
-function beginEditLevel(side, index) {
-  const level = workbenchBook[side]?.[Number(index)];
-  if (!level) return;
-  editingBookLevel = { side, priceRaw: Number(level.price_raw) };
-  bookConsoleSide = side;
-  $("orderPrice").value = level.price;
-  $("orderQuantity").value = level.quantity;
-  showInlineMessage("bookOrderMessage", "", "");
-  syncOrderConsole();
-  setBookActionStatus("正在编辑盘口档位", `${side === "buy" ? "买单" : "卖单"} ${level.price} GJN × ${level.quantity}`);
-  $("orderConsoleTitle").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  setTimeout(() => $("orderPrice").focus(), 0);
-}
-
-function ensureWorkbenchChart() {
-  if (workbenchChart) return workbenchChart;
-  workbenchChart = createDepthChart({
-    svg: $("depthChart"),
-    tooltip: $("depthChartTooltip"),
-    empty: $("depthChartEmpty"),
-    summary: $("depthChartSummary"),
-  });
-  return workbenchChart;
-}
-
-function renderWorkbench(data) {
-  workbenchData = data;
-  renderWorkbenchStatus(data);
-  renderBook(data.book || {});
-  if (data.message) {
-    const failed = Boolean(data.runtime?.last_error);
-    setBookActionStatus(data.message, failed ? data.runtime.last_error : "盘口状态已同步", failed ? "error" : "success");
-    showInlineMessage("workbenchMessage", data.message, failed ? "error" : "ok");
-  }
+  return paperWorkbench;
 }
 
 async function refreshWorkbench() {
-  if (!workbenchRuleId || $("workbenchBackdrop").hidden || workbenchPollBusy) return;
-  workbenchPollBusy = true;
-  try {
-    const data = await apiGet("trade/rules/workbench", { rule_id: workbenchRuleId });
-    renderWorkbench(data);
-  } catch (error) {
-    setBookActionStatus("读取盘口失败", apiError(error), "error");
-    showInlineMessage("workbenchMessage", apiError(error), "error");
-  } finally {
-    workbenchPollBusy = false;
-  }
+  if (!workbenchRuleId || $("workbenchBackdrop").hidden) return;
+  return getPaperWorkbench().refresh();
 }
 
 async function openWorkbench(ruleId, trigger = null) {
@@ -858,34 +674,12 @@ async function openWorkbench(ruleId, trigger = null) {
     return;
   }
   workbenchRuleId = ruleId;
-  workbenchReturnFocus = trigger || document.activeElement;
-  editingBookLevel = null;
-  highlightedBookLevel = null;
-  clearTimeout(bookHighlightTimer);
-  $("workbenchBackdrop").hidden = false;
-  $("workbenchTitle").textContent = `${rule.title} · 模拟交易工作台`;
-  $("workbenchSubtitle").textContent = `${rule.rule_id} · 正在读取盘口…`;
-  $("workbenchStatusGrid").innerHTML = '<p class="muted">读取中…</p>';
-  showInlineMessage("workbenchMessage", "", "");
-  setBookActionStatus("正在等待新操作…", "通过下方控制台调整模拟盘口，每次修改都会立即执行纸面检查。");
-  ensureWorkbenchChart();
-  document.body.classList.add("workbench-open");
-  setTimeout(() => $("workbenchClose").focus(), 0);
-  await refreshWorkbench();
-  setConsoleSide("buy");
+  await getPaperWorkbench().open(ruleId, trigger || document.activeElement);
 }
 
 function closeWorkbench() {
-  if ($("workbenchBackdrop").hidden) return;
-  $("workbenchBackdrop").hidden = true;
-  document.body.classList.remove("workbench-open");
-  const returning = workbenchReturnFocus;
-  workbenchReturnFocus = null;
+  if (paperWorkbench) paperWorkbench.close();
   workbenchRuleId = "";
-  editingBookLevel = null;
-  highlightedBookLevel = null;
-  clearTimeout(bookHighlightTimer);
-  if (returning?.isConnected) setTimeout(() => returning.focus(), 0);
 }
 
 async function runWorkbenchRuleAction(action, button) {
@@ -902,243 +696,10 @@ async function runWorkbenchRuleAction(action, button) {
   await (button ? runWithBusy(button, "处理中…", run) : run());
 }
 
-function collectBookSide(side, source = workbenchBook[side]) {
-  return source
-    .map((level) => ({ price: String(level.price || "").trim(), quantity: String(level.quantity || "").trim() }))
-    .filter((level) => level.price || level.quantity);
-}
-
-function sortBookLevels(side, levels) {
-  return [...levels].sort((a, b) => side === "buy" ? Number(b.price) - Number(a.price) : Number(a.price) - Number(b.price));
-}
-
-function setBookBusy(busy) {
-  bookOperationBusy = Boolean(busy);
-  const root = document.querySelector(".workbench-market");
-  root.querySelectorAll("button, input").forEach((element) => {
-    if (busy) {
-      element.dataset.bookWasDisabled = element.disabled ? "1" : "0";
-      element.disabled = true;
-    } else {
-      element.disabled = element.dataset.bookWasDisabled === "1";
-      delete element.dataset.bookWasDisabled;
-    }
-  });
-  if (busy) $("bookOrderSubmit").textContent = "执行中…";
-  else syncOrderConsole();
-}
-
-function clearBookHighlightSoon() {
-  clearTimeout(bookHighlightTimer);
-  if (!highlightedBookLevel) return;
-  bookHighlightTimer = setTimeout(() => {
-    highlightedBookLevel = null;
-    renderLevelList("buy");
-    renderLevelList("sell");
-    if (workbenchChart) workbenchChart.render(workbenchData?.book || {}, workbenchData?.rule || {}, { highlight: null });
-  }, 1600);
-}
-
-async function runBookMutation(task, { successMessage, detail = "", highlight = null } = {}) {
-  if (bookOperationBusy) return null;
-  setBookBusy(true);
-  showInlineMessage("bookOrderMessage", "", "");
-  try {
-    highlightedBookLevel = highlight;
-    const data = await task();
-    renderWorkbench(data);
-    setBookActionStatus(successMessage || data.message || "盘口已更新", detail || "已立即执行一次模拟检查", "success");
-    showToast(successMessage || data.message || "盘口已更新", "success");
-    resetOrderConsole();
-    await refreshTrade();
-    clearBookHighlightSoon();
-    return data;
-  } catch (error) {
-    const message = apiError(error);
-    setBookActionStatus("盘口操作失败", message, "error");
-    showInlineMessage("bookOrderMessage", message, "error");
-    showToast(message, "error");
-    return null;
-  } finally {
-    setBookBusy(false);
-  }
-}
-
-function saveBookPayload(buyLevels, sellLevels, message, detail, highlight = null) {
-  return runBookMutation(
-    () => apiPost("trade/rules/workbench", {
-      rule_id: workbenchRuleId,
-      action: "save_apply",
-      buy_levels: collectBookSide("buy", buyLevels),
-      sell_levels: collectBookSide("sell", sellLevels),
-    }),
-    { successMessage: message, detail, highlight },
-  );
-}
-
-function showBookOrderError(message) {
-  showInlineMessage("bookOrderMessage", message, "error");
-  setBookActionStatus("盘口操作未执行", message, "error");
-  showToast(message, "error");
-}
-
-async function submitBookOrder(event) {
-  event.preventDefault();
-  if (bookOperationBusy) return;
-  const side = bookConsoleSide;
-  const rawPrice = $("orderPrice").value.trim();
-  const rawQuantity = $("orderQuantity").value.trim();
-  if (!/^\d+(\.\d{1,2})?$/.test(rawPrice) || Number(rawPrice) <= 0) {
-    showBookOrderError("价格必须大于 0，且最多保留两位小数");
-    $("orderPrice").focus();
-    return;
-  }
-  if (!/^\d+$/.test(rawQuantity) || Number(rawQuantity) < 1 || Number(rawQuantity) > MAX_BOOK_QUANTITY) {
-    showBookOrderError(`数量必须是 1 到 ${MAX_BOOK_QUANTITY} 之间的整数`);
-    $("orderQuantity").focus();
-    return;
-  }
-  const price = Number(rawPrice);
-  const quantity = Number(rawQuantity);
-  const priceRaw = priceToRaw(rawPrice);
-  if (priceRaw === null) {
-    showBookOrderError("价格必须大于 0，且最多保留两位小数");
-    $("orderPrice").focus();
-    return;
-  }
-  const nextBuy = workbenchBook.buy.map((level) => ({ ...level }));
-  const nextSell = workbenchBook.sell.map((level) => ({ ...level }));
-  const target = side === "buy" ? nextBuy : nextSell;
-  const verb = editingBookLevel ? "更新" : "添加";
-  if (editingBookLevel) {
-    const editIndex = findBookLevelIndex(target, editingBookLevel.priceRaw);
-    if (editIndex < 0) {
-      showBookOrderError("当前档位已刷新，请重新选择要修改的档位");
-      return;
-    }
-    target.splice(editIndex, 1);
-  }
-  if (target.length >= MAX_BOOK_LEVELS) {
-    showBookOrderError(`单侧最多允许 ${MAX_BOOK_LEVELS} 个档位`);
-    return;
-  }
-  if (target.some((level) => Number(level.price_raw) === priceRaw)) {
-    showBookOrderError(`同侧已存在 ${price.toFixed(2)} GJN 的档位`);
-    $("orderPrice").focus();
-    return;
-  }
-  target.push({ price: price.toFixed(2), price_raw: priceRaw, quantity: String(quantity) });
-  if (side === "buy") nextBuy.splice(0, nextBuy.length, ...sortBookLevels("buy", target));
-  else nextSell.splice(0, nextSell.length, ...sortBookLevels("sell", target));
-  const sideText = side === "buy" ? "买单" : "卖单";
-  const message = `已${verb}${sideText}一档 ${price.toFixed(2)} GJN × ${quantity}`;
-  await saveBookPayload(nextBuy, nextSell, message, "每次盘口变更都会立即执行模拟检查", { side, priceRaw });
-}
-
-async function deleteBookLevel(side, index) {
-  if (bookOperationBusy) return;
-  const level = workbenchBook[side]?.[Number(index)];
-  if (!level) return;
-  const sideText = side === "buy" ? "买单" : "卖单";
-  const confirmed = await openModal({
-    title: `删除${sideText}档位`,
-    message: `确认删除${sideText} ${level.price} GJN × ${level.quantity}？删除后会立即执行模拟检查。`,
-  });
-  if (confirmed === null) return;
-  const nextBuy = workbenchBook.buy.map((item) => ({ ...item }));
-  const nextSell = workbenchBook.sell.map((item) => ({ ...item }));
-  const target = side === "buy" ? nextBuy : nextSell;
-  const currentIndex = findBookLevelIndex(target, level.price_raw);
-  if (currentIndex < 0) {
-    showBookOrderError("当前档位已刷新，请重新选择要删除的档位");
-    return;
-  }
-  target.splice(currentIndex, 1);
-  await saveBookPayload(
-    nextBuy,
-    nextSell,
-    `已删除${sideText}一档 ${level.price} GJN × ${level.quantity}`,
-    "删除操作已立即执行模拟检查",
-  );
-}
-
-async function workbenchBookAction(action, button) {
-  if (bookOperationBusy) return;
-  let confirmed = "";
-  if (action === "follow_live") {
-    confirmed = await openModal({
-      title: "恢复跟随真实行情",
-      message: "这会删除当前规则保存的模拟盘口，之后自动检查将重新使用真实行情。",
-    });
-    if (confirmed === null) return;
-  }
-  if (action === "follow_live") {
-    await runBookMutation(
-      () => apiPost("trade/rules/workbench", { rule_id: workbenchRuleId, action }),
-      { successMessage: "已恢复跟随真实行情", detail: "下一次检查将使用真实市场盘口" },
-    );
-    return;
-  }
-  await runBookMutation(async () => {
-    const preview = await apiPost("trade/rules/workbench", { rule_id: workbenchRuleId, action });
-    return apiPost("trade/rules/workbench", {
-      rule_id: workbenchRuleId,
-      action: "save_apply",
-      buy_levels: collectBookSide("buy", preview.book?.buy_levels || []),
-      sell_levels: collectBookSide("sell", preview.book?.sell_levels || []),
-    });
-  }, {
-    successMessage: action === "load_live" ? "已载入真实盘口并执行模拟检查" : "已生成可成交盘口并执行模拟检查",
-    detail: action === "load_live" ? "真实盘口已保存为当前模拟覆盖" : "盘口已按规则阈值生成并保存",
-  });
-}
-
 $("workbenchClose").addEventListener("click", closeWorkbench);
 $("workbenchPause").addEventListener("click", () => void runWorkbenchRuleAction("pause", $("workbenchPause")));
 $("workbenchResume").addEventListener("click", () => void runWorkbenchRuleAction("resume", $("workbenchResume")));
 $("workbenchRefresh").addEventListener("click", () => void runWithBusy($("workbenchRefresh"), "刷新中…", refreshWorkbench));
-$("bookLoadLive").addEventListener("click", () => void workbenchBookAction("load_live", $("bookLoadLive")));
-$("bookGenerate").addEventListener("click", () => void workbenchBookAction("generate", $("bookGenerate")));
-$("bookFollowLive").addEventListener("click", () => void workbenchBookAction("follow_live", $("bookFollowLive")));
-$("orderSideBuy").addEventListener("click", () => setConsoleSide("buy"));
-$("orderSideSell").addEventListener("click", () => setConsoleSide("sell"));
-$("bookOrderCancelEdit").addEventListener("click", resetOrderConsole);
-$("bookOrderForm").addEventListener("submit", (event) => void submitBookOrder(event));
-$("orderPrice").addEventListener("input", updateOrderPreview);
-$("orderQuantity").addEventListener("input", updateOrderPreview);
-$("orderPriceDown").addEventListener("click", () => {
-  const value = Math.max(0.01, Number($("orderPrice").value || 0) - 0.01);
-  $("orderPrice").value = value.toFixed(2);
-  updateOrderPreview();
-});
-$("orderPriceUp").addEventListener("click", () => {
-  const value = Math.max(0.01, Number($("orderPrice").value || 0) + 0.01);
-  $("orderPrice").value = value.toFixed(2);
-  updateOrderPreview();
-});
-document.querySelectorAll("[data-quantity]").forEach((button) => {
-  button.addEventListener("click", () => {
-    const quantity = button.dataset.quantity === "rule" ? workbenchData?.rule?.quantity || 1 : Number(button.dataset.quantity);
-    $("orderQuantity").value = String(quantity);
-    updateOrderPreview();
-  });
-});
-document.querySelector(".level-board").addEventListener("click", (event) => {
-  const open = event.target.closest("button[data-open-order]");
-  if (open) {
-    setConsoleSide(open.dataset.openOrder);
-    $("orderConsoleTitle").scrollIntoView({ behavior: "smooth", block: "nearest" });
-    setTimeout(() => $("orderPrice").focus(), 0);
-    return;
-  }
-  const edit = event.target.closest("button[data-edit-level]");
-  if (edit) {
-    beginEditLevel(edit.dataset.editLevel, Number(edit.dataset.index));
-    return;
-  }
-  const remove = event.target.closest("button[data-delete-level]");
-  if (remove) void deleteBookLevel(remove.dataset.deleteLevel, Number(remove.dataset.index));
-});
 
 // ---------------------------------------------------------------- 自动交易
 function renderGlobalMode(data) {
@@ -1200,7 +761,6 @@ function renderRules(rules) {
         <span class="toggle-track"><span class="toggle-thumb"></span></span><b>${rule.live ? "实盘" : "模拟盘"}</b>
       </button>`,
       !rule.live ? actionButton("进入模拟盘", "workbench", rule.rule_id, "primary") : "",
-      !rule.live ? actionButton("完整模拟演练", "drill", rule.rule_id, "secondary") : "",
       hasOrders ? actionButton("撤销自动订单", "cancel_orders", rule.rule_id, "danger") : "",
       actionButton("删除", "delete", rule.rule_id, "ghost"),
     ].join("");
@@ -1298,11 +858,14 @@ function renderTrade(data) {
 }
 
 async function refreshTrade({ resetLogs = false } = {}) {
+  const requestId = ++tradeOverviewSeq;
   try {
-    renderTrade(await apiGet("trade/overview"));
+    const data = await apiGet("trade/overview");
+    if (requestId !== tradeOverviewSeq) return;
+    renderTrade(data);
     await loadTradeLogs({ reset: resetLogs });
   } catch (error) {
-    showToast(apiError(error), "error");
+    if (requestId === tradeOverviewSeq) showToast(apiError(error), "error");
   }
 }
 
@@ -1351,34 +914,10 @@ async function armRule(ruleId, button = null) {
   await (button ? runWithBusy(button, "处理中…", run) : run());
 }
 
-async function drillRule(ruleId, button = null) {
-  const run = async () => {
-    try {
-      const result = await apiPost("trade/rules/drill", { rule_id: ruleId });
-      const lines = [
-        `演练编号：${result.drill_id}`,
-        `规则：${result.rule_title}（${result.rule_id}）`,
-        ...(result.steps || []).map((step) => `${step.title}：${step.detail}`),
-        `模拟盈亏：${result.summary?.profit || "0.00"} GJN`,
-      ];
-      await openModal({
-        title: "完整模拟演练结果",
-        message: lines.join("\n"),
-        confirmText: "关闭",
-      });
-      await refreshTrade();
-    } catch (error) {
-      showToast(apiError(error), "error");
-    }
-  };
-  await (button ? runWithBusy(button, "演练中…", run) : run());
-}
-
 async function runRuleAction(action, ruleId, button = null) {
   if (action === "edit") return editRule(ruleId);
   if (action === "workbench") return openWorkbench(ruleId, button);
   if (action === "arm") return armRule(ruleId, button);
-  if (action === "drill") return drillRule(ruleId, button);
   if (action === "disarm") {
     const confirmed = await openModal({
       title: "切换到模拟盘",

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from core.api_client import GaijinMarketClient, MarketApiError
-from core.auth import LoginRequiredError
 from core.models import Quote
 from core.storage import PluginStorage
 from core.trade_models import (
@@ -20,7 +19,6 @@ from core.trade_models import (
     TradeAssetAllocation,
     TradeEvent,
     TradeOrder,
-    TradePaperBook,
     TradeRule,
     TradeSettings,
     fmt_gjn,
@@ -185,6 +183,8 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fmt_gjn(85_000), "8.50")
         self.assertEqual(gross_for_net_raw(85_000), 100_000)
         self.assertEqual(gross_for_net_raw(85_001), 100_200)
+        with self.assertRaisesRegex(ValueError, "两位小数"):
+            parse_gjn_raw("1.005")
 
     async def test_create_rule_rejects_non_profitable_rule(self) -> None:
         with self.assertRaises(TradeError):
@@ -195,109 +195,6 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
                 sell_net_price="10.00",
                 mode="once",
             )
-
-    async def test_paper_buy_partial_then_list_and_complete(self) -> None:
-        self.client.books.extend(
-            [
-                self._book(sells=[(70_000, 2), (80_000, 1)], buys=[]),
-                self._book(sells=[], buys=[(120_000, 2)]),
-                self._book(sells=[], buys=[(120_000, 3)]),
-            ]
-        )
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=3,
-            sell_net_price="9.00",
-            mode="once",
-        )
-        runtime = self.trader.store.get_runtime(rule.rule_id)
-        await self.trader._paper_buy(rule, self.client.quote)
-        self.assertEqual(runtime.phase, PHASE_LISTING)
-        self.assertEqual(runtime.held_quantity, 1)
-        self.assertEqual(runtime.listed_quantity, 1)
-        await self.trader._paper_reconcile_listing(rule, self.client.quote)
-        self.assertEqual(runtime.phase, PHASE_COMPLETED)
-        self.assertFalse(rule.enabled)
-        self.assertEqual(runtime.cycle_count, 1)
-
-    async def test_paper_drill_uses_initial_book_and_is_isolated(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=3,
-            sell_net_price="9.00",
-            mode="loop",
-        )
-        runtime = self.trader.store.get_runtime(rule.rule_id)
-        runtime.phase = PHASE_LISTING
-        runtime.held_quantity = 2
-        runtime.listed_quantity = 2
-        runtime.cost_basis_raw = 170_000
-        runtime.proceeds_raw = 123_000
-        before = runtime.to_dict()
-        self.client.books = [
-            self._book(
-                sells=[(80_000, 1)],
-                buys=[(120_000, 1)],
-            )
-        ]
-
-        result = await self.trader.drill_paper_cycle(rule.rule_id)
-
-        self.assertEqual(self.client.books, [])
-        self.assertEqual(self.client.buy_calls, [])
-        self.assertEqual(self.client.sell_calls, [])
-        self.assertEqual(runtime.to_dict(), before)
-        self.assertEqual(result["initial"]["best_sell"], "8.00")
-        self.assertEqual(result["initial"]["best_buy"], "12.00")
-        self.assertEqual(result["buy"]["live_quantity"], 1)
-        self.assertEqual(result["buy"]["synthetic_quantity"], 2)
-        self.assertEqual(result["buy"]["cost"], "24.00")
-        self.assertEqual(result["sell"]["live_quantity"], 1)
-        self.assertEqual(result["sell"]["synthetic_quantity"], 2)
-        self.assertEqual(result["sell"]["proceeds"], "28.20")
-        self.assertEqual(result["summary"]["profit"], "+4.20")
-
-        log_files = list((Path(self.tmp.name) / "logs").glob("trade-*.jsonl"))
-        self.assertEqual(len(log_files), 1)
-        events = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
-        drill_events = [event for event in events if event["kind"] == "paper_drill"]
-        self.assertEqual(len(drill_events), 1)
-        self.assertGreater(drill_events[0]["event_id"], 0)
-        self.assertEqual(drill_events[0]["details"]["drill_profit"], "+4.20")
-        self.assertEqual(drill_events[0]["details"]["trade_profit"], "+4.20")
-        reloaded = TradeStore(self.storage, _Logger())
-        self.assertTrue(any(event.kind == "paper_drill" for event in reloaded.events))
-
-    async def test_paper_drill_rejects_live_rule(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=1,
-            sell_net_price="9.00",
-            mode="once",
-        )
-        rule.live = True
-        with self.assertRaises(TradeError):
-            await self.trader.drill_paper_cycle(rule.rule_id)
-
-    async def test_paper_drill_requires_market_login(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=1,
-            sell_net_price="9.00",
-            mode="once",
-        )
-
-        class _NoAuth:
-            async def get_token(self, **_kwargs):
-                raise LoginRequiredError("未登录")
-
-        self.trader.auth = _NoAuth()
-        with self.assertRaises(LoginRequiredError):
-            await self.trader.drill_paper_cycle(rule.rule_id)
 
     async def test_reconcile_buy_cancels_remainder_and_tracks_inventory_delta(self) -> None:
         self.client.orders = [[{"id": "new-buy", "pairId": "pair", "type": "BUY", "market": "item", "amount": 3}]]
@@ -782,94 +679,6 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertFalse(rule.enabled)
 
-    async def test_trade_store_paper_book_round_trip_and_delete_cleanup(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=2,
-            sell_net_price="9.00",
-            mode="once",
-        )
-        self.trader.store.set_paper_book(
-            TradePaperBook(
-                rule_id=rule.rule_id,
-                sell_levels=[BookLevel(80_000, 3)],
-                buy_levels=[BookLevel(106_000, 2)],
-                source="manual",
-            )
-        )
-        reloaded = TradeStore(self.storage, _Logger())
-        book = reloaded.get_paper_book(rule.rule_id)
-        self.assertIsNotNone(book)
-        self.assertEqual(book.sell_levels[0].price_raw, 80_000)
-        self.assertEqual(book.buy_levels[0].amount, 2)
-
-        await self.trader.action(rule.rule_id, "delete")
-        after_delete = TradeStore(self.storage, _Logger())
-        self.assertIsNone(after_delete.get_paper_book(rule.rule_id))
-
-    async def test_workbench_generate_and_save_apply_use_only_paper_book(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=2,
-            sell_net_price="9.00",
-            mode="loop",
-        )
-        generated = await self.trader.workbench_action(rule.rule_id, "generate")
-        self.assertEqual(generated["book_source"], "generated")
-        self.assertIn("生成", generated["message"])
-        self.assertEqual(generated["book"]["best_sell"], "8.00")
-        self.assertEqual(generated["book"]["best_buy"], fmt_gjn(rule.sell_gross_price_raw))
-
-        result = await self.trader.workbench_action(
-            rule.rule_id,
-            "save_apply",
-            sell_levels=generated["book"]["sell_levels"],
-            buy_levels=generated["book"]["buy_levels"],
-        )
-        runtime = self.trader.store.get_runtime(rule.rule_id)
-        self.assertEqual(result["book_source"], "manual")
-        self.assertEqual(runtime.phase, "waiting_buy")
-        self.assertEqual(runtime.cycle_count, 1)
-        self.assertEqual(runtime.held_quantity, 0)
-        self.assertEqual(runtime.proceeds_raw, 180_000)
-        self.assertEqual(self.client.buy_calls, [])
-        self.assertEqual(self.client.sell_calls, [])
-        self.assertEqual(self.client.books, [])
-        self.assertIsNotNone(TradeStore(self.storage, _Logger()).get_paper_book(rule.rule_id))
-        self.client.books = [self._book(sells=[(90_000, 1)], buys=[(100_000, 1)])]
-        followed = await self.trader.workbench_action(rule.rule_id, "follow_live")
-        self.assertEqual(followed["book_source"], "live")
-        self.assertIn("恢复跟随真实行情", followed["message"])
-        self.assertIsNone(self.trader.store.get_paper_book(rule.rule_id))
-
-    async def test_workbench_rejects_live_rule_and_invalid_order_books(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=1,
-            sell_net_price="9.00",
-            mode="once",
-        )
-        with self.assertRaisesRegex(TradeError, "最多保留两位小数"):
-            await self.trader.workbench_action(
-                rule.rule_id,
-                "save_apply",
-                sell_levels=[{"price": "8.001", "quantity": 1}],
-                buy_levels=[],
-            )
-        with self.assertRaisesRegex(TradeError, "重复价格"):
-            await self.trader.workbench_action(
-                rule.rule_id,
-                "save_apply",
-                sell_levels=[{"price": "8.00", "quantity": 1}, {"price": "8.00", "quantity": 2}],
-                buy_levels=[],
-            )
-        rule.live = True
-        with self.assertRaisesRegex(TradeError, "实盘规则"):
-            await self.trader.workbench_action(rule.rule_id, "generate")
-
     async def test_global_mode_batch_switches_eligible_and_skips_blocked(self) -> None:
         first = await self.trader.create_rule(
             url="https://trade.gaijin.net/market/1067/item-a",
@@ -920,6 +729,230 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.trader.store.settings.live_mode_enabled)
         self.assertEqual([item["rule_id"] for item in back["skipped"]], [first.rule_id])
         self.assertTrue(next(rule for rule in self.trader.store.rules if rule.rule_id == first.rule_id).live)
+
+    async def test_paper_reset_clears_account_and_rule_cycle_state(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=2,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+        self.client.books = [self._book(sells=[(75_000, 1)], buys=[])]
+        await self.trader._evaluate_rule(rule, Quote("item", sell_min=75.0, buy_max=0.0, kind="COMMODITY"))
+        await self.trader.paper_reset(500_000)
+        runtime = self.trader.store.get_runtime(rule.rule_id)
+        self.assertEqual(runtime.phase, "waiting_buy")
+        self.assertEqual(runtime.paper_cycle_id, "")
+        self.assertEqual(self.trader.paper.overview()["orders"], [])
+        self.assertEqual(self.trader.paper.account_view()["cash_total_raw"], 500_000)
+
+    async def test_paper_scenario_uses_current_cycle_buy_gap(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=3,
+            sell_net_price="9.00",
+            mode="loop",
+        )
+        self.client.books = [self._book(sells=[(90_000, 1)], buys=[(70_000, 1)])]
+        scenario = await self.trader.paper_create_scenario(rule_id=rule.rule_id, delay_seconds=5, duration_seconds=30)
+        self.assertEqual(scenario["target_side"], "BUY")
+        self.assertEqual(scenario["target_quantity"], 3)
+        self.assertTrue(scenario["cycle_id"].startswith(rule.rule_id))
+        self.assertEqual(scenario["book"]["sell_levels"][0]["amount"], 3)
+        self.assertLess(scenario["book"]["buy_levels"][0]["price_raw"], scenario["book"]["sell_levels"][0]["price_raw"])
+
+    async def test_paper_rule_respects_risk_limits(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=2,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=100_000,
+            daily_limit_raw=100_000,
+            max_order_raw=100_000,
+            max_quantity=10,
+        )
+        self.client.books = [self._book(sells=[(75_000, 2)], buys=[])]
+        await self.trader._evaluate_rule(rule, Quote("item", sell_min=75.0, buy_max=0.0, kind="COMMODITY"))
+        self.assertFalse(any(order.is_open for order in self.trader.paper.rule_orders(rule.rule_id)))
+        self.assertEqual(self.trader.paper.overview()["fills"], [])
+
+    async def test_cancel_rule_orders_cancels_paper_orders_and_releases_reserve(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=2,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+        self.client.books = [self._book(sells=[(75_000, 1)], buys=[])]
+        await self.trader._evaluate_rule(rule, Quote("item", sell_min=75.0, buy_max=0.0, kind="COMMODITY"))
+        self.assertTrue(any(order.is_open for order in self.trader.paper.rule_orders(rule.rule_id)))
+        await self.trader.action(rule.rule_id, "cancel_orders")
+        self.assertFalse(any(order.is_open for order in self.trader.paper.rule_orders(rule.rule_id)))
+        self.assertEqual(self.trader.paper.account_view()["cash_reserved_raw"], 0)
+        self.assertFalse(rule.enabled)
+
+    async def test_cancelled_paper_rule_order_can_be_reopened_on_next_tick(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=2,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+        quote = Quote("item", sell_min=75.0, buy_max=120.0, kind="COMMODITY")
+        self.client.books = [self._book(sells=[(75_000, 1)], buys=[])]
+        await self.trader._evaluate_rule(rule, quote)
+        open_buy = next(
+            order for order in self.trader.paper.rule_orders(rule.rule_id) if order.is_open and order.side == "BUY"
+        )
+        await self.trader.paper_cancel_order(open_buy.order_id)
+
+        self.client.books = [self._book(sells=[(74_000, 1)], buys=[])]
+        await self.trader._evaluate_rule(rule, quote)
+
+        buy_orders = [order for order in self.trader.paper.rule_orders(rule.rule_id) if order.side == "BUY"]
+        self.assertGreaterEqual(len(buy_orders), 2)
+        self.assertEqual(buy_orders[-1].status, "FILLED")
+
+    async def test_rule_mutation_is_blocked_while_paper_order_is_open(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=1,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.paper.place_order(
+            market_name=rule.market_name,
+            side="BUY",
+            price_raw=80_000,
+            quantity=1,
+            source="RULE",
+            rule_id=rule.rule_id,
+            cycle_id="manual-test-cycle",
+        )
+        with self.assertRaisesRegex(TradeError, "挂单"):
+            await self.trader.update_rule(rule.rule_id, buy_price="8.10")
+        with self.assertRaisesRegex(TradeError, "挂单"):
+            await self.trader.action(rule.rule_id, "delete")
+
+    async def test_manual_paper_order_and_cancel_use_shared_account(self) -> None:
+        self.client.books = [self._book(sells=[(80_000, 1)], buys=[])]
+        result = await self.trader.paper_place_order(
+            market_name="item", side="BUY", price_raw=81_000, quantity=1, client_order_id="manual-1"
+        )
+        self.assertEqual(result["order"]["status"], "FILLED")
+        self.assertEqual(result["overview"]["account"]["inventory"][0]["quantity"], 1)
+        self.assertEqual(result["overview"]["account"]["daily_buy_raw"], 0)
+        self.client.books = [self._book(sells=[(90_000, 1)], buys=[])]
+        pending = await self.trader.paper_place_order(
+            market_name="item", side="BUY", price_raw=75_000, quantity=1, client_order_id="manual-2"
+        )
+        self.assertEqual(pending["order"]["status"], "OPEN")
+        self.assertGreater(pending["overview"]["account"]["cash_reserved_raw"], 0)
+        cancelled = await self.trader.paper_cancel_order(pending["order"]["order_id"])
+        self.assertEqual(cancelled["order"]["status"], "CANCELLED")
+        self.assertEqual(cancelled["overview"]["account"]["cash_reserved_raw"], 0)
+
+    async def test_manual_paper_retry_is_idempotent_before_market_fetch(self) -> None:
+        self.client.books = [self._book(sells=[(80_000, 1)], buys=[])]
+        first = await self.trader.paper_place_order(
+            market_name="item",
+            side="BUY",
+            price_raw=81_000,
+            quantity=1,
+            client_order_id="retry-no-network",
+        )
+
+        async def fail_fetch(*_args, **_kwargs):
+            raise AssertionError("idempotent retry must not fetch the market")
+
+        self.client.fetch_book = fail_fetch
+        second = await self.trader.paper_place_order(
+            market_name="item",
+            side="BUY",
+            price_raw=81_000,
+            quantity=1,
+            client_order_id="retry-no-network",
+        )
+        self.assertEqual(second["order"]["order_id"], first["order"]["order_id"])
+        self.assertEqual(second["fills"], [])
+
+    async def test_manual_paper_endpoints_reject_auction_books(self) -> None:
+        auction = BookSnapshot(
+            market_name="item",
+            sell_levels=[BookLevel(80_000, 1)],
+            buy_levels=[BookLevel(70_000, 1)],
+            kind="AUCTION",
+        )
+        self.client.books = [auction, auction]
+        with self.assertRaisesRegex(TradeError, "普通商品"):
+            await self.trader.paper_market("item")
+        with self.assertRaisesRegex(TradeError, "普通商品"):
+            await self.trader.paper_place_order(market_name="item", side="BUY", price_raw=80_000, quantity=1)
+
+    async def test_paper_rule_partial_buy_keeps_remainder_and_sells_acquired_quantity(self) -> None:
+        rule = await self.trader.create_rule(
+            url="https://trade.gaijin.net/market/1067/item",
+            buy_price="8.00",
+            quantity=2,
+            sell_net_price="9.00",
+            mode="once",
+        )
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
+        )
+        self.client.books = [
+            self._book(sells=[(75_000, 1)], buys=[]),
+            self._book(sells=[(75_000, 1)], buys=[(120_000, 1)]),
+            self._book(sells=[], buys=[(120_000, 2)]),
+        ]
+        quote = Quote("item", sell_min=75.0, buy_max=120.0, kind="COMMODITY")
+        await self.trader._evaluate_rule(rule, quote)
+        self.assertEqual(self.trader.store.get_runtime(rule.rule_id).phase, "working")
+        self.assertTrue(self.trader._is_rule_tradable(rule))
+        self.assertEqual(self.trader.paper.overview()["account"]["inventory"][0]["quantity"], 1)
+        await self.trader._evaluate_rule(rule, quote)
+        self.assertEqual(self.trader.store.get_runtime(rule.rule_id).phase, "selling")
+        self.assertEqual(self.trader.paper.overview()["account"]["inventory"][0]["quantity"], 1)
+        await self.trader._evaluate_rule(rule, quote)
+        self.assertEqual(self.trader.store.get_runtime(rule.rule_id).cycle_count, 1)
+        self.assertEqual(self.trader.paper.overview()["account"]["inventory"], [])
+        self.assertEqual(self.client.buy_calls, [])
+        self.assertEqual(self.client.sell_calls, [])
 
     async def test_global_mode_preserves_paused_and_completed_rules(self) -> None:
         eligible = await self.trader.create_rule(
@@ -1031,7 +1064,7 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
         self.trader.store.get_runtime(rule.rule_id).phase = "holding"
         self.assertTrue(self.trader._is_rule_tradable(rule))
 
-    async def test_workbench_view_loads_live_preview_without_persisting(self) -> None:
+    async def test_paper_overview_advances_expired_scenario(self) -> None:
         rule = await self.trader.create_rule(
             url="https://trade.gaijin.net/market/1067/item",
             buy_price="8.00",
@@ -1039,14 +1072,29 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
             sell_net_price="9.00",
             mode="once",
         )
-        self.client.books = [self._book(sells=[(70_000, 2)], buys=[(100_000, 1)])]
-        view = await self.trader.workbench_view(rule.rule_id)
-        self.assertEqual(view["book_source"], "live")
-        self.assertFalse(view["paper_book_saved"])
-        self.assertEqual(view["book"]["best_sell"], "7.00")
-        self.assertIsNone(self.trader.store.get_paper_book(rule.rule_id))
+        now = time.time()
+        self.trader.paper.observe_market(
+            self._book(sells=[(90_000, 1)], buys=[(70_000, 1)]),
+            observed_at=now,
+        )
+        scenario = self.trader.paper.create_scenario(
+            rule_id=rule.rule_id,
+            market_name=rule.market_name,
+            buy_price_raw=rule.buy_price_raw,
+            sell_net_price_raw=rule.sell_net_price_raw,
+            quantity=rule.quantity,
+            delay_seconds=5,
+            duration_seconds=30,
+            now=now,
+        )
+        expires_at = self.trader.paper.scenarios[scenario["scenario_id"]].expires_at
+        with patch("core.paper_engine.time.time", return_value=expires_at + 1):
+            overview = await self.trader.paper_overview(scenario["scenario_id"])
+        self.assertEqual(overview["active_scenario_id"], "")
+        self.assertEqual(overview["scenarios"], [])
+        self.assertEqual(overview["account"]["cash_total_raw"], 1_000 * 10_000)
 
-    async def test_workbench_view_releases_action_lock_during_live_fetch(self) -> None:
+    async def test_real_book_drives_shared_paper_account_without_real_orders(self) -> None:
         rule = await self.trader.create_rule(
             url="https://trade.gaijin.net/market/1067/item",
             buy_price="8.00",
@@ -1054,109 +1102,24 @@ class TradeTests(unittest.IsolatedAsyncioTestCase):
             sell_net_price="9.00",
             mode="once",
         )
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def slow_fetch(*_args, **_kwargs):
-            started.set()
-            await release.wait()
-            return self._book(sells=[(90_000, 1)], buys=[(100_000, 1)])
-
-        self.client.fetch_book = slow_fetch
-        view_task = asyncio.create_task(self.trader.workbench_view(rule.rule_id))
-        await asyncio.wait_for(started.wait(), timeout=1)
-        lock_free = False
-        try:
-            await asyncio.wait_for(self.trader._action_lock.acquire(), timeout=0.5)
-            lock_free = True
-        finally:
-            if lock_free:
-                self.trader._action_lock.release()
-            release.set()
-
-        view = await asyncio.wait_for(view_task, timeout=1)
-        self.assertTrue(lock_free)
-        self.assertEqual(view["book_source"], "live")
-
-    def test_corrupt_paper_book_file_is_ignored(self) -> None:
-        rule = TradeRule(
-            rule_id="T1",
-            market_name="item",
-            buy_price_raw=80_000,
-            quantity=1,
-            sell_net_price_raw=90_000,
+        self.trader.store.settings = TradeSettings(
+            enabled=True,
+            total_budget_raw=1_000_000,
+            daily_limit_raw=1_000_000,
+            max_order_raw=1_000_000,
+            max_quantity=10,
         )
-        store = TradeStore(self.storage, _Logger())
-        store.rules = [rule]
-        store.save_rules()
-        (Path(self.tmp.name) / "trade_paper_books.json").write_text("{broken", encoding="utf-8")
-        reloaded = TradeStore(self.storage, _Logger())
-        self.assertIsNone(reloaded.get_paper_book(rule.rule_id))
-
-    async def test_custom_paper_book_drives_rule_without_real_book_fetch(self) -> None:
-        rule = await self.trader.create_rule(
-            url="https://trade.gaijin.net/market/1067/item",
-            buy_price="8.00",
-            quantity=1,
-            sell_net_price="9.00",
-            mode="once",
-        )
-        self.trader.store.set_paper_book(
-            TradePaperBook(
-                rule_id=rule.rule_id,
-                sell_levels=[BookLevel(75_000, 1)],
-                buy_levels=[BookLevel(120_000, 1)],
-                source="manual",
-            )
-        )
-        self.client.books = []
+        self.client.books = [self._book(sells=[(75_000, 1)], buys=[(120_000, 1)])]
         await self.trader._evaluate_rule(
             rule,
-            Quote("item", sell_min=99.0, buy_max=1.0, kind="COMMODITY"),
+            Quote("item", sell_min=75.0, buy_max=120.0, kind="COMMODITY"),
         )
-        self.assertEqual(self.client.books, [])
         self.assertEqual(self.client.buy_calls, [])
         self.assertEqual(self.client.sell_calls, [])
         self.assertEqual(self.trader.store.get_runtime(rule.rule_id).cycle_count, 1)
-
-    def test_paper_book_level_limit_sorting_and_duplicate_validation(self) -> None:
-        levels = [{"price": f"{7 + index / 100:.2f}", "quantity": 1} for index in range(100)]
-        sells = AutoTrader._parse_paper_levels(levels, "卖单", reverse=False)
-        buys = AutoTrader._parse_paper_levels(levels, "买单", reverse=True)
-        self.assertEqual(len(sells), 100)
-        self.assertLess(sells[0].price_raw, sells[-1].price_raw)
-        self.assertGreater(buys[0].price_raw, buys[-1].price_raw)
-        with self.assertRaisesRegex(TradeError, "最多允许 100 档"):
-            AutoTrader._parse_paper_levels(
-                [{"price": f"{7 + index / 100:.2f}", "quantity": 1} for index in range(101)],
-                "卖单",
-                reverse=False,
-            )
-        with self.assertRaisesRegex(TradeError, "重复价格"):
-            AutoTrader._parse_paper_levels(
-                [{"price": "8.00", "quantity": 1}, {"price": "8.00", "quantity": 2}],
-                "卖单",
-                reverse=False,
-            )
-        with self.assertRaisesRegex(TradeError, "数量必须是整数"):
-            AutoTrader._parse_paper_levels(
-                [{"price": "8.00", "quantity": 1.9}],
-                "卖单",
-                reverse=False,
-            )
-        with self.assertRaisesRegex(TradeError, "原始价格必须是整数"):
-            AutoTrader._parse_paper_levels(
-                [{"price_raw": 80_000.9, "quantity": 1}],
-                "卖单",
-                reverse=False,
-            )
-        parsed = AutoTrader._parse_paper_levels(
-            [{"price_raw": "80000", "quantity": 1.0}],
-            "卖单",
-            reverse=False,
-        )
-        self.assertEqual(parsed[0].price_raw, 80_000)
-        self.assertEqual(parsed[0].amount, 1)
+        paper = self.trader.paper.overview()
+        self.assertEqual(len(paper["fills"]), 2)
+        self.assertGreater(paper["account"]["cash_total_raw"], 1_000 * 10_000)
 
     async def test_global_mode_persists_after_store_reload(self) -> None:
         await self.trader.set_global_mode("live", "LIVE")

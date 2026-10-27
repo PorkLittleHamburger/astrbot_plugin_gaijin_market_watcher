@@ -52,9 +52,11 @@ try:  # 常规：AstrBot 以包的形式加载插件
     from .core.models import Subscription
     from .core.notifier import Notifier
     from .core.output_store import DEFAULT_QUOTE_PAYLOAD, DEFAULT_TRADE_PAYLOAD, OutputStore
+    from .core.paper_engine import PaperError
     from .core.resolver import extract_link_reference, prettify_market_name
     from .core.storage import PluginStorage
     from .core.subscriptions import REJECT_HINT, SubscriptionStore, parse_legacy_subscriptions
+    from .core.trade_models import parse_gjn_raw
     from .core.trader import AutoTrader, TradeError
     from .core.watcher import MarketWatcher
 except ImportError:  # 兜底：以文件路径方式加载时
@@ -73,9 +75,11 @@ except ImportError:  # 兜底：以文件路径方式加载时
     from core.models import Subscription
     from core.notifier import Notifier
     from core.output_store import DEFAULT_QUOTE_PAYLOAD, DEFAULT_TRADE_PAYLOAD, OutputStore
+    from core.paper_engine import PaperError
     from core.resolver import extract_link_reference, prettify_market_name
     from core.storage import PluginStorage
     from core.subscriptions import REJECT_HINT, SubscriptionStore, parse_legacy_subscriptions
+    from core.trade_models import parse_gjn_raw
     from core.trader import AutoTrader, TradeError
     from core.watcher import MarketWatcher
 
@@ -197,6 +201,71 @@ def _can_cleanup_legacy_config(
     return bool(legacy_values_present and migration_ok and data_files_ready)
 
 
+PAPER_REBUILD_SCHEMA_FILE = "paper_rebuild_schema.json"
+PAPER_REBUILD_SCHEMA_VERSION = 2
+PAPER_LEGACY_TRADE_FILES = (
+    "trade_rules.json",
+    "trade_runtime.json",
+    "trade_paper_books.json",
+    "trade_ledger.json",
+    "trade_events.json",
+    "trade_logs_meta.json",
+    "paper_state.json",
+)
+
+
+def _migrate_paper_rebuild(storage, logger) -> bool:
+    """一次性清空旧交易运行数据，保留账户、订阅、模板和交易设置。"""
+    current = storage.load_aux_json(PAPER_REBUILD_SCHEMA_FILE, {})
+    try:
+        version = int(current.get("schema_version") or 0) if isinstance(current, dict) else 0
+    except (TypeError, ValueError):
+        version = 0
+    if version >= PAPER_REBUILD_SCHEMA_VERSION:
+        return False
+    failures: list[str] = []
+    for filename in PAPER_LEGACY_TRADE_FILES:
+        path = storage.data_path(filename)
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            failures.append(f"{filename}: {exc}")
+            logger.warning(f"[GJM Paper] 清理旧交易文件 {filename} 失败: {exc}")
+    log_dir = Path(storage.data_path("logs"))
+    if log_dir.exists():
+        for path in log_dir.glob("trade-*.jsonl"):
+            try:
+                path.unlink()
+            except OSError as exc:
+                failures.append(f"{path.name}: {exc}")
+                logger.warning(f"[GJM Paper] 清理旧交易日志失败: {exc}")
+    if failures:
+        raise RuntimeError("模拟盘重建清理旧交易数据失败：" + "；".join(failures))
+    if not storage.save_aux_json(
+        PAPER_REBUILD_SCHEMA_FILE,
+        {"schema_version": PAPER_REBUILD_SCHEMA_VERSION, "migrated_at": time.time()},
+    ):
+        raise RuntimeError("模拟盘重建迁移标记写入失败，停止启动以避免重复清空新账户")
+    return True
+
+
+def _strict_integer(value, label: str) -> int:
+    """接受整数或整数值字符串，拒绝会被 int() 静默截断的小数。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{label}必须是整数")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        raise ValueError(f"{label}必须是整数")
+    text = str(value or "").strip()
+    if not re.fullmatch(r"[+-]?\d+", text):
+        raise ValueError(f"{label}必须是整数")
+    return int(text)
+
+
 def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
     """取出指令之后的自由文本参数。
 
@@ -219,7 +288,7 @@ def _args_after(event: AstrMessageEvent, *command_path: str) -> str:
         "Gaijin 市场行情监控插件升级版，使用 /gjm 指令命名空间；"
         "支持行情订阅、账户登录、双输出模板，以及默认模拟的自动交易。"
     ),
-    "2.21.1",
+    "2.22.0",
 )
 class GaijinMarketWatcher(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -235,6 +304,7 @@ class GaijinMarketWatcher(Star):
             self.data_dir = Path(__file__).resolve().parent / "data"
         self.storage = PluginStorage(self.data_dir, self.logger)
         self._migrate_former_autotrader_data()
+        _migrate_paper_rebuild(self.storage, self.logger)
 
         # ---------- 账户 / 输出 / 订阅：插件视图的权威数据源 ----------
         migrating = self.storage.get_ui_schema_version() < 1
@@ -630,8 +700,14 @@ class GaijinMarketWatcher(Star):
             ("trade/settings", self._trade_web_settings, ["POST"]),
             ("trade/rules/save", self._trade_web_save_rule, ["POST"]),
             ("trade/rules/action", self._trade_web_action, ["POST"]),
-            ("trade/rules/drill", self._trade_web_drill, ["POST"]),
-            ("trade/rules/workbench", self._trade_web_workbench, ["GET", "POST"]),
+            ("trade/paper/overview", self._trade_web_paper_overview, ["GET"]),
+            ("trade/paper/book", self._trade_web_paper_book, ["GET"]),
+            ("trade/paper/markets/search", self._trade_web_paper_search, ["GET"]),
+            ("trade/paper/orders", self._trade_web_paper_order, ["POST"]),
+            ("trade/paper/orders/<order_id>/cancel", self._trade_web_paper_cancel, ["POST"]),
+            ("trade/paper/scenarios", self._trade_web_paper_scenario, ["POST"]),
+            ("trade/paper/scenarios/<scenario_id>", self._trade_web_paper_scenario_close, ["DELETE", "POST"]),
+            ("trade/paper/reset", self._trade_web_paper_reset, ["POST"]),
             ("trade/mode", self._trade_web_mode, ["POST"]),
             ("trade/stop-all", self._trade_web_stop_all, ["POST"]),
             ("trade/logs", self._trade_web_logs, ["GET"]),
@@ -959,51 +1035,144 @@ class GaijinMarketWatcher(Star):
         self.logger.info(f"[GJM Trade] WebUI 操作 {action} / {rule_id} / {self._trade_web_actor()}")
         return json_response({"rule": self.trader.rule_view(rule)})
 
-    async def _trade_web_drill(self):
+    async def _trade_web_paper_overview(self):
+        scenario_id = str(request.query.get("scenario_id") or "").strip()
+        try:
+            return json_response(await self.trader.paper_overview(scenario_id))
+        except (TradeError, PaperError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 读取模拟账户失败: {exc}")
+            return error_response("读取模拟账户失败", status_code=500)
+
+    async def _trade_web_paper_book(self):
+        market_name = str(request.query.get("market_name") or "").strip()
+        scenario_id = str(request.query.get("scenario_id") or "").strip()
+        if not market_name:
+            return error_response("缺少 market_name", status_code=400)
+        try:
+            return json_response(await self.trader.paper_market(market_name, scenario_id=scenario_id))
+        except (TradeError, PaperError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 读取模拟盘口失败: {exc}")
+            return error_response("读取模拟盘口失败", status_code=500)
+
+    async def _trade_web_paper_search(self):
+        query = str(request.query.get("query") or "").strip()
+        if not query:
+            return json_response({"assets": []})
+        try:
+            token = await self.auth.get_token()
+            assets = await self.client.search_items(query, token, appid=self.cfg.appid, limit=20)
+            return json_response({"assets": assets})
+        except (AuthExpiredError, LoginRequiredError) as exc:
+            return error_response(f"登录已失效：{exc}", status_code=401)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 搜索商品失败: {exc}")
+            return error_response("搜索商品失败", status_code=500)
+
+    async def _trade_web_paper_order(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return error_response("请求体必须是 JSON 对象", status_code=400)
-        rule_id = str(payload.get("rule_id") or "").strip()
+        market_name = str(payload.get("market_name") or "").strip()
+        side = str(payload.get("side") or "").strip().upper()
+        scenario_id = str(payload.get("scenario_id") or "").strip()
+        client_order_id = str(payload.get("client_order_id") or "").strip()
         try:
-            result = await self.trader.drill_paper_cycle(rule_id)
-        except (TradeError, ValueError) as exc:
+            quantity = _strict_integer(payload.get("quantity"), "数量")
+            if payload.get("price_raw") not in (None, ""):
+                price_raw = _strict_integer(payload.get("price_raw"), "原始价格")
+            else:
+                price_raw = parse_gjn_raw(payload.get("price"))
+            result = await self.trader.paper_place_order(
+                market_name=market_name,
+                side=side,
+                price_raw=price_raw,
+                quantity=quantity,
+                client_order_id=client_order_id,
+                scenario_id=scenario_id,
+            )
+        except (TradeError, PaperError, ValueError, TypeError) as exc:
             return error_response(str(exc), status_code=400)
         except (AuthExpiredError, LoginRequiredError) as exc:
             return error_response(f"登录已失效：{exc}", status_code=401)
         except Exception as exc:
-            self.logger.error(f"[GJM Trade] 模拟演练失败: {exc}")
-            return error_response("模拟演练失败", status_code=500)
-        self.logger.info(f"[GJM Trade] WebUI 模拟演练 {rule_id} / {self._trade_web_actor()}")
+            self.logger.error(f"[GJM Paper] 手工下单失败: {exc}")
+            return error_response("模拟下单失败", status_code=500)
+        self.logger.info(f"[GJM Paper] WebUI 模拟下单 {market_name} {side} / {self._trade_web_actor()}")
         return json_response(result)
 
-    async def _trade_web_workbench(self):
-        method = str(getattr(request, "method", "GET") or "GET").upper()
+    async def _trade_web_paper_cancel(self, order_id: str):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        order_id = str(order_id or "").strip()
+        scenario_id = str(request.query.get("scenario_id") or payload.get("scenario_id") or "").strip()
         try:
-            if method == "GET":
-                rule_id = str(request.query.get("rule_id") or "").strip()
-                if not rule_id:
-                    return error_response("缺少 rule_id", status_code=400)
-                return json_response(await self.trader.workbench_view(rule_id))
+            result = await self.trader.paper_cancel_order(order_id, scenario_id=scenario_id)
+        except (TradeError, PaperError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 撤销模拟订单失败: {exc}")
+            return error_response("撤销模拟订单失败", status_code=500)
+        return json_response(result)
 
-            payload = await request.json(default={})
-            if not isinstance(payload, dict):
-                return error_response("请求体必须是 JSON 对象", status_code=400)
-            rule_id = str(payload.get("rule_id") or "").strip()
-            action = str(payload.get("action") or "").strip()
-            result = await self.trader.workbench_action(
-                rule_id,
-                action,
-                sell_levels=payload.get("sell_levels"),
-                buy_levels=payload.get("buy_levels"),
+    async def _trade_web_paper_scenario(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        try:
+            result = await self.trader.paper_create_scenario(
+                rule_id=str(payload.get("rule_id") or "").strip(),
+                delay_seconds=float(payload.get("delay_seconds") or 5),
+                duration_seconds=float(payload.get("duration_seconds") or 30),
             )
-        except (TradeError, ValueError) as exc:
+        except (TradeError, PaperError, ValueError) as exc:
             return error_response(str(exc), status_code=400)
         except (AuthExpiredError, LoginRequiredError) as exc:
             return error_response(f"登录已失效：{exc}", status_code=401)
         except Exception as exc:
-            self.logger.error(f"[GJM Trade] WebUI 模拟工作台失败: {exc}")
-            return error_response("模拟工作台操作失败", status_code=500)
-        self.logger.info(f"[GJM Trade] WebUI 模拟工作台 {action} / {rule_id} / {self._trade_web_actor()}")
+            self.logger.error(f"[GJM Paper] 创建场景失败: {exc}")
+            return error_response("创建场景失败", status_code=500)
+        return json_response(result)
+
+    async def _trade_web_paper_scenario_close(self, scenario_id: str):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        scenario_id = str(scenario_id or request.query.get("scenario_id") or payload.get("scenario_id") or "").strip()
+        try:
+            result = await self.trader.paper_close_scenario(scenario_id)
+        except (TradeError, PaperError, ValueError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 结束场景失败: {exc}")
+            return error_response("结束场景失败", status_code=500)
+        return json_response(result)
+
+    async def _trade_web_paper_reset(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        confirmation = str(payload.get("confirmation") or "").strip().upper()
+        if confirmation != "RESET":
+            return error_response("重置模拟账户必须输入 RESET 确认", status_code=400)
+        try:
+            if payload.get("starting_cash_raw") not in (None, ""):
+                starting_cash_raw = _strict_integer(payload.get("starting_cash_raw"), "初始现金")
+            else:
+                starting_cash_raw = parse_gjn_raw(payload.get("starting_cash") or "1000")
+            result = await self.trader.paper_reset(starting_cash_raw)
+        except (TradeError, PaperError, ValueError, TypeError) as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception as exc:
+            self.logger.error(f"[GJM Paper] 重置模拟账户失败: {exc}")
+            return error_response("重置模拟账户失败", status_code=500)
+        self.logger.warning(f"[GJM Paper] WebUI 重置模拟账户 / {self._trade_web_actor()}")
         return json_response(result)
 
     async def _trade_web_mode(self):
@@ -1455,7 +1624,6 @@ class GaijinMarketWatcher(Star):
                 f"{'启用' if rule.enabled else '停用'}  {runtime.phase}\n"
                 f"  {rule.title}｜买 {rule.buy_price_raw / 10000:.2f}｜数量 {rule.quantity}｜"
                 f"税后卖 {rule.sell_net_price_raw / 10000:.2f}｜{rule.mode}"
-                f"{'｜独立模拟盘口' if self.trader.store.get_paper_book(rule.rule_id) else ''}"
             )
             if runtime.last_error:
                 lines.append(f"  错误：{runtime.last_error}")

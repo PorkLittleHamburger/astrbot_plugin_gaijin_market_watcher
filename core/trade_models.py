@@ -25,7 +25,10 @@ TRADE_MODE_LOOP = "loop"
 TRADE_MODES = (TRADE_MODE_ONCE, TRADE_MODE_LOOP)
 
 PHASE_WAITING_BUY = "waiting_buy"
+PHASE_BUYING = "buying"
 PHASE_HOLDING = "holding"
+PHASE_SELLING = "selling"
+PHASE_WORKING = "working"
 PHASE_LISTING = "listing"
 PHASE_COMPLETED = "completed"
 PHASE_PAUSED = "paused"
@@ -40,6 +43,8 @@ def parse_gjn_raw(value: Any) -> int:
         raise ValueError("价格格式不正确") from exc
     if not amount.is_finite() or amount <= 0:
         raise ValueError("价格必须大于 0")
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("价格最多保留两位小数")
     cents = (amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return int(cents) * CENT_RAW
 
@@ -107,55 +112,6 @@ class BookSnapshot:
     @property
     def best_buy(self) -> int | None:
         return self.buy_levels[0].price_raw if self.buy_levels else None
-
-
-@dataclass(slots=True)
-class TradePaperBook:
-    """Persisted paper-only order book override for one trade rule."""
-
-    rule_id: str
-    sell_levels: list[BookLevel] = field(default_factory=list)
-    buy_levels: list[BookLevel] = field(default_factory=list)
-    source: str = "manual"
-    updated_at: float = field(default_factory=time.time)
-
-    def snapshot(self, market_name: str) -> BookSnapshot:
-        return BookSnapshot(
-            market_name=market_name,
-            sell_levels=[BookLevel(level.price_raw, level.amount) for level in self.sell_levels],
-            buy_levels=[BookLevel(level.price_raw, level.amount) for level in self.buy_levels],
-            kind="COMMODITY",
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "rule_id": self.rule_id,
-            "sell_levels": [level.to_dict() for level in self.sell_levels],
-            "buy_levels": [level.to_dict() for level in self.buy_levels],
-            "source": self.source,
-            "updated_at": float(self.updated_at),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TradePaperBook:
-        def levels(value: Any) -> list[BookLevel]:
-            result: list[BookLevel] = []
-            for item in value if isinstance(value, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                price_raw = max(0, int(item.get("price_raw") or 0))
-                amount = max(0, int(item.get("amount") or 0))
-                if price_raw > 0 and amount > 0:
-                    result.append(BookLevel(price_raw=price_raw, amount=amount))
-            return result
-
-        return cls(
-            rule_id=str(data.get("rule_id") or ""),
-            sell_levels=levels(data.get("sell_levels")),
-            buy_levels=levels(data.get("buy_levels")),
-            source=str(data.get("source") or "manual"),
-            updated_at=float(data.get("updated_at") or time.time()),
-        )
 
 
 @dataclass(slots=True)
@@ -316,6 +272,7 @@ class TradeRuntime:
     cost_basis_raw: int = 0
     proceeds_raw: int = 0
     cycle_count: int = 0
+    paper_cycle_id: str = ""
     assets: list[TradeAssetAllocation] = field(default_factory=list)
     orders: list[TradeOrder] = field(default_factory=list)
     last_error: str = ""
@@ -335,6 +292,7 @@ class TradeRuntime:
         self.assets = []
         self.orders = []
         self.last_error = ""
+        self.paper_cycle_id = ""
         self.updated_at = time.time()
 
     def to_dict(self) -> dict[str, Any]:
@@ -346,6 +304,7 @@ class TradeRuntime:
             "cost_basis_raw": int(self.cost_basis_raw),
             "proceeds_raw": int(self.proceeds_raw),
             "cycle_count": int(self.cycle_count),
+            "paper_cycle_id": self.paper_cycle_id,
             "assets": [asset.to_dict() for asset in self.assets],
             "orders": [order.to_dict() for order in self.orders],
             "last_error": self.last_error,
@@ -364,6 +323,7 @@ class TradeRuntime:
             cost_basis_raw=max(0, int(data.get("cost_basis_raw") or 0)),
             proceeds_raw=max(0, int(data.get("proceeds_raw") or 0)),
             cycle_count=max(0, int(data.get("cycle_count") or 0)),
+            paper_cycle_id=str(data.get("paper_cycle_id") or ""),
             assets=[
                 TradeAssetAllocation.from_dict(item) for item in (data.get("assets") or []) if isinstance(item, dict)
             ],

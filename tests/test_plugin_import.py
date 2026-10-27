@@ -135,19 +135,39 @@ class PluginImportTests(unittest.TestCase):
             "_output_web_overview",
             "_output_web_save",
             "_output_web_preview",
-            "_trade_web_drill",
-            "_trade_web_workbench",
             "_trade_web_mode",
+            "_trade_web_paper_overview",
+            "_trade_web_paper_book",
+            "_trade_web_paper_search",
+            "_trade_web_paper_order",
+            "_trade_web_paper_cancel",
+            "_trade_web_paper_scenario",
+            "_trade_web_paper_scenario_close",
+            "_trade_web_paper_reset",
         ):
             self.assertTrue(hasattr(self.module.GaijinMarketWatcher, handler), handler)
         metadata = yaml.safe_load((Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8"))
         self.assertEqual(metadata["name"], "astrbot_plugin_gaijin_market_watcher")
         self.assertEqual(metadata["display_name"], "Gaijin 市场行情监控")
         self.assertEqual(metadata["astrbot_version"], ">=4.29.0,<5")
-        self.assertEqual(metadata["version"], "2.21.1")
+        self.assertEqual(metadata["version"], "2.22.0")
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
         self.assertIn('@filter.command_group("gjm"', source)
         self.assertIn('"/gjma"', source)
+        self.assertIn("trade/paper/orders/<order_id>/cancel", source)
+        self.assertIn("trade/paper/scenarios/<scenario_id>", source)
+        self.assertNotIn('"trade/paper/orders/cancel"', source)
+        self.assertNotIn('"trade/paper/scenarios/close"', source)
+
+    def test_strict_integer_rejects_truncatable_decimals(self) -> None:
+        self.assertEqual(self.module._strict_integer("12", "数量"), 12)
+        self.assertEqual(self.module._strict_integer(12.0, "数量"), 12)
+        with self.assertRaisesRegex(ValueError, "必须是整数"):
+            self.module._strict_integer(1.9, "数量")
+        with self.assertRaisesRegex(ValueError, "必须是整数"):
+            self.module._strict_integer("1.9", "数量")
+        with self.assertRaisesRegex(ValueError, "必须是整数"):
+            self.module._strict_integer(True, "数量")
 
     def test_trade_help_has_explicit_usage_examples_and_risk_notes(self) -> None:
         required = {
@@ -174,6 +194,32 @@ class PluginImportTests(unittest.TestCase):
             self.assertTrue(item["risk"], name)
         self.assertIn("新建模拟规则", self.module.GaijinMarketWatcher.gjm_trade_add.__doc__ or "")
         self.assertIn("切换实盘", self.module.GaijinMarketWatcher.gjm_trade_arm.__doc__ or "")
+
+    def test_paper_rebuild_migration_clears_only_trade_runtime_data(self) -> None:
+        class _Logger:
+            def warning(self, *_args, **_kwargs) -> None:
+                pass
+
+            def info(self, *_args, **_kwargs) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = PluginStorage(Path(tmp), _Logger())
+            for filename in self.module.PAPER_LEGACY_TRADE_FILES:
+                storage.save_aux_json(filename, {"legacy": True})
+            storage.save_aux_json("trade_settings.json", {"enabled": True})
+            log_dir = Path(storage.data_path("logs"))
+            log_dir.mkdir()
+            (log_dir / "trade-2026-10-27.jsonl").write_text("{}\n", encoding="utf-8")
+            changed = self.module._migrate_paper_rebuild(storage, _Logger())
+            self.assertTrue(changed)
+            for filename in self.module.PAPER_LEGACY_TRADE_FILES:
+                self.assertFalse(storage.data_path(filename).exists(), filename)
+            self.assertFalse((log_dir / "trade-2026-10-27.jsonl").exists())
+            self.assertTrue(storage.data_path("trade_settings.json").exists())
+            marker = storage.load_aux_json(self.module.PAPER_REBUILD_SCHEMA_FILE, {})
+            self.assertEqual(marker.get("schema_version"), self.module.PAPER_REBUILD_SCHEMA_VERSION)
+            self.assertFalse(self.module._migrate_paper_rebuild(storage, _Logger()))
 
     def test_trade_access_requires_owner_and_friend_session(self) -> None:
         watcher_class = self.module.GaijinMarketWatcher

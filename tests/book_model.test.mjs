@@ -19,7 +19,7 @@ test("price conversion uses exact integer raw units", () => {
 test("seller net matches backend rounding for all ordinary inputs", () => {
   assert.equal(sellerNet("199.40", 7).toFixed(2), "1186.43");
   assert.equal(sellerNet("8.00", 1).toFixed(2), "6.80");
-  assert.equal(sellerNet("0.10", 3).toFixed(2), "0.25");
+  assert.equal(sellerNet("0.10", 3).toFixed(2), "0.24");
   assert.equal(sellerNet("8.00", 1.9), 0);
 });
 

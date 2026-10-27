@@ -1,11 +1,11 @@
 # 行情 / 交易输出模板 · 字段清单
 
-> 插件版本 `v2.21.1`
+> 插件版本 `v2.22.0`
 
 插件控制台的“输出模板”标签页提供两套独立模板：
 
 - **行情推送模板**：用于订阅行情推送，默认值与旧 `payload` 完全一致；清空 = 回到默认可读文本。
-- **交易事件模板**：用于规则管理、设置、买入、卖出、挂单、周期完成、模拟演练和异常通知。
+- **交易事件模板**：用于规则管理、设置、买入、卖出、挂单、周期完成、纸面成交、行情场景和异常通知。
 
 下面是行情模板的字段及拼装规则。
 
@@ -151,7 +151,7 @@ F-16XL（美国）行情报告
 
 | 字段 | 说明 |
 | --- | --- |
-| `$trade_kind` | 事件类型标识，如 `buy`、`sell`、`cycle_complete`、`paper_book`、`mode_changed` |
+| `$trade_kind` | 事件类型标识，如 `buy`、`sell`、`cycle_complete`、`paper_buy`、`paper_sell`、`paper_manual_fill`、`mode_changed` |
 | `$trade_kind_text` | 事件中文名称 |
 | `$trade_level` | `info` / `warning` / `error` |
 | `$trade_message` | 事件正文 |
