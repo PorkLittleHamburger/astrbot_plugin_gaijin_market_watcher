@@ -1,14 +1,14 @@
 # Gaijin 市场插件 2.22.0 本地实现验收报告
 
 > 日期：2026-10-27
-> 状态：**LOCAL CODE PASS / DEPLOY ACCEPTANCE PENDING**
+> 状态：**LOCAL CODE + DEPLOY PASS / LIVE TRADING NOT TESTED**
 > 范围：真实盘口影子撮合、共享模拟账户、FIFO、纸面订单、场景盘口、工作台重建
 > 安全边界：未调用真实下单接口，未修改真实市场，未启用实盘资金
 
 ## 总体结论
 
-本地代码、撮合单元测试、Python 回归测试、Node 图表/价格测试和隔离浏览器 Mock Bridge 烟测通过。
-2.22.0 尚未部署到本地 AstrBot 实例，真实 Dashboard iframe、插件重载、账户数据和 QQ 通知仍需部署后复验。
+本地代码、撮合单元测试、Python 回归测试、Node 图表/价格测试、隔离浏览器 Mock Bridge 烟测和本地 AstrBot 2.22.0 覆盖部署均通过。
+部署后插件唯一、启用、版本正确、失败插件为 0；账户、订阅、模板和风险设置文件保留，旧交易运行数据已清理。
 
 ## 自动化检查
 
@@ -20,6 +20,9 @@
 | `ruff format --check .` | 30 files already formatted |
 | Python compile/import 检查 | 通过 |
 | `git diff --check` | 通过 |
+| 本地 AstrBot 插件 | 2.22.0，唯一，`activated=true`，失败插件 0 |
+| 静态资源 | 页面、`app.js`、`paper-workbench.mjs`、`book-model.mjs`、`depth-chart.mjs`、CSS 均 HTTP 200 |
+| 数据迁移 | `paper_rebuild_schema.json` v2；旧规则/运行态/静态盘口/账本/事件/交易日志已清理；账户/订阅/模板/风险设置保留 |
 
 新增覆盖：
 
@@ -50,16 +53,24 @@
 | 接口 | 撤单调用 `/orders/<id>/cancel`，结束场景调用 `/scenarios/<id>` |
 | 前端异常 | 无未捕获 JavaScript 异常 |
 
+## 部署记录
+
+- 部署包仅由已提交的 `HEAD` 使用 `git archive` 生成。
+- 功能实现提交：`c421acd feat: 重建贴近真实市场的模拟盘 (2.22.0)`。
+- 上传接口：`POST /api/v1/plugins/install/upload`，返回“安装成功”。
+- 插件目录唯一，版本 `2.22.0`，`activated=true`；`GET /api/v1/plugins/failed` 返回空。
+- 安装后 `trade_logs_meta.json` 由新日志存储重新生成，旧 `logs/trade-*.jsonl` 数量为 0，因此不是迁移残留。
+
 ## 未覆盖与残余风险
 
-- 尚未部署到 AstrBot，因此未验证真实 Dashboard 会话、iframe、静态 `.mjs` HTTP 响应和插件重载。
+- 未使用真实 Dashboard 登录会话执行 iframe 内点击；使用真实页面、模块和 Mock Bridge 做了浏览器验收。
 - 尚未执行真实账户登录、QQ 私聊/群聊验收；没有创建任何真实订单。
 - 场景并发遵循当前设计：场景只影响当前规则，其他规则继续使用真实盘口；当前规则基础挂单在场景期间休眠，场景账户是规则快照。
 - 15% 手续费为产品固定口径，可能与站点动态全局/商品费率不完全一致。
 
-## 部署后门禁
+## 部署后门禁结果
 
-1. 覆盖部署 2.22.0，确认插件唯一、启用、失败插件为 0。
-2. 验证 `paper-workbench.mjs`、`book-model.mjs`、`depth-chart.mjs` 静态资源 HTTP 200。
-3. 创建模拟规则，验证账户、盘口、限价单、部分成交、撤单、FIFO 和场景倒计时。
-4. 验证旧交易文件清理、账户/订阅/模板保留，全程保持全局实盘关闭。
+1. 覆盖部署 2.22.0：通过；插件唯一、启用、失败插件为 0。
+2. `paper-workbench.mjs`、`book-model.mjs`、`depth-chart.mjs` 和页面/CSS/JS：全部 HTTP 200。
+3. 模拟账户、盘口、订单、FIFO、场景与交互：单元测试和真实浏览器 Mock Bridge 通过。
+4. 旧交易文件清理及账户/订阅/模板/风险设置保留：通过；未启用全局实盘，也未发送真实订单。
